@@ -623,6 +623,7 @@ def main() -> int:
                          args.rtol,
                          best_chunk_size)
             print(f"[{idx}/{len(seq_lens)}] seq_len={seq_len}: parity check passed.")
+            torch.cuda.empty_cache()
 
         result_flash = benchmark_flashlstm(
             lib,
@@ -641,6 +642,7 @@ def main() -> int:
             args.repeats,
             best_chunk_size,
         )
+        torch.cuda.empty_cache()
 
         result_torch = benchmark_pytorch(
             lstm_cuda,
@@ -650,6 +652,7 @@ def main() -> int:
             args.warmup,
             args.repeats,
         )
+        torch.cuda.empty_cache()
 
         torch.manual_seed(args.seed + seq_len * 17)
         result_attention = benchmark_flash_attention(
@@ -660,6 +663,7 @@ def main() -> int:
             args.warmup,
             args.repeats,
         )
+        torch.cuda.empty_cache()
 
         flash_results.append(result_flash)
         torch_results.append(result_torch)

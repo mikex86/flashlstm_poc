@@ -91,3 +91,5 @@ endif()
 
 target_include_directories(run_lstm PRIVATE ${CUDNN_INCLUDE_DIR})
 target_link_libraries(run_lstm PRIVATE flashlstm ${CUDNN_LIBRARY} ${CUBLAS_LIBRARY} ${CUBLASLT_LIBRARY})
+
+add_subdirectory(flashlstm_v2)

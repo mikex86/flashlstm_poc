@@ -169,7 +169,9 @@ int main() {
         db_hh_device,
         dh0_out_device,
         dc0_out_device,
-        compute_stream
+        compute_stream,
+        h2d_stream,
+        d2h_stream
     );
     CheckCuda(cudaDeviceSynchronize(), "backward synchronize");
 

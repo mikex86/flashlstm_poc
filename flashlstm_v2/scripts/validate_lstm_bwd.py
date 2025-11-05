@@ -96,6 +96,8 @@ def _prepare_functions(lib: ctypes.CDLL) -> None:
         ctypes.c_void_p,  # dc0 device
 
         ctypes.c_void_p,  # compute stream
+        ctypes.c_void_p,  # h2d stream
+        ctypes.c_void_p,  # d2h stream
     ]
 
 
@@ -268,6 +270,17 @@ def _run_case_backward(lib: ctypes.CDLL, cfg: LstmConfig):
     dc0_dev   = torch.zeros(cfg.batch_size, cfg.hidden_size, device=device, dtype=torch.float32)
 
     # === Call custom backward ===
+    compute_stream = torch.cuda.Stream()
+    h2d_stream = torch.cuda.Stream()
+    d2h_stream = torch.cuda.Stream()
+    stream_handles = {
+        compute_stream.cuda_stream,
+        h2d_stream.cuda_stream,
+        d2h_stream.cuda_stream,
+    }
+    if len(stream_handles) != 3:
+        raise RuntimeError("Streaming LSTM backward requires three distinct CUDA streams")
+
     lib.flstm_StreamingLstmBackward(
         ctypes.c_size_t(cfg.time_steps),
         ctypes.c_size_t(cfg.batch_size),
@@ -291,7 +304,9 @@ def _run_case_backward(lib: ctypes.CDLL, cfg: LstmConfig):
         _as_void_p(db_hh_dev),
         _as_void_p(dh0_dev),
         _as_void_p(dc0_dev),
-        ctypes.c_void_p(0),
+        ctypes.c_void_p(compute_stream.cuda_stream),
+        ctypes.c_void_p(h2d_stream.cuda_stream),
+        ctypes.c_void_p(d2h_stream.cuda_stream),
     )
     torch.cuda.synchronize()
 

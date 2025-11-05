@@ -61,6 +61,10 @@ void StreamingLstmForward(
  *   - dx_tensor_host:   gradients w.r.t. inputs written in host half precision
  *   - dW_ih / dW_hh / db_ih / db_hh: parameter gradients (FP32, device)
  *   - dh0_out / dc0_out: gradients for initial states (FP32, device)
+ *   - compute_stream / h2d_stream / d2h_stream: distinct CUDA streams used for
+ *         GEMMs and kernels, host→device transfers, and device→host transfers
+ *         respectively. All three stream handles must be different to enable
+ *         full-overlap streaming behaviour.
  */
 void StreamingLstmBackward(
     size_t time_steps,
@@ -89,7 +93,9 @@ void StreamingLstmBackward(
     float *dh0_out,
     float *dc0_out,
 
-    cudaStream_t stream
+    cudaStream_t compute_stream,
+    cudaStream_t h2d_stream,
+    cudaStream_t d2h_stream
 );
 
 } // namespace flstm
@@ -147,7 +153,9 @@ void flstm_StreamingLstmBackward(
     float *dh0_out,
     float *dc0_out,
 
-    cudaStream_t stream
+    cudaStream_t compute_stream,
+    cudaStream_t h2d_stream,
+    cudaStream_t d2h_stream
 );
 
 } // extern "C"

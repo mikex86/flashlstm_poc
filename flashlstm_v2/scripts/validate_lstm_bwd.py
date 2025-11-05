@@ -60,7 +60,6 @@ def _prepare_functions(lib: ctypes.CDLL) -> None:
         ctypes.c_void_p,  # bias_ih
         ctypes.c_void_p,  # bias_hh
         ctypes.c_void_p,  # y host
-        ctypes.c_void_p,  # z cache host
         ctypes.c_void_p,  # gate cache host
         ctypes.c_void_p,  # compute stream
         ctypes.c_void_p,  # h2d stream
@@ -75,12 +74,14 @@ def _prepare_functions(lib: ctypes.CDLL) -> None:
         ctypes.c_size_t,  # input
         ctypes.c_size_t,  # hidden
 
-        ctypes.c_void_p,  # z cache host
+        ctypes.c_void_p,  # x host
+        ctypes.c_void_p,  # y host
         ctypes.c_void_p,  # gate cache host
 
         ctypes.c_void_p,  # dY host
         ctypes.c_void_p,  # dHN device (nullable)
         ctypes.c_void_p,  # dCN device (nullable)
+        ctypes.c_void_p,  # h0 device
         ctypes.c_void_p,  # c0 device
 
         ctypes.c_void_p,  # weight_ih
@@ -160,8 +161,6 @@ def _run_case_forward_only(lib: ctypes.CDLL, cfg: LstmConfig):
     bias_hh = lstm.bias_hh_l0.detach().clone().contiguous().to(device)
 
     y_host = torch.empty(cfg.time_steps, cfg.batch_size, cfg.hidden_size, dtype=torch.float16).contiguous().pin_memory()
-    z_cache = torch.empty(cfg.input_size + cfg.hidden_size, cfg.time_steps * cfg.batch_size,
-                          dtype=torch.float16).contiguous().pin_memory()
     gate_cache = torch.empty(cfg.time_steps, cfg.batch_size, 4 * cfg.hidden_size,
                              dtype=torch.float16).contiguous().pin_memory()
 
@@ -190,7 +189,6 @@ def _run_case_forward_only(lib: ctypes.CDLL, cfg: LstmConfig):
         _as_void_p(bias_ih),
         _as_void_p(bias_hh),
         _as_void_p(y_host),
-        _as_void_p(z_cache),
         _as_void_p(gate_cache),
         ctypes.c_void_p(compute_stream.cuda_stream),
         ctypes.c_void_p(h2d_stream.cuda_stream),
@@ -235,7 +233,7 @@ def _run_case_forward_only(lib: ctypes.CDLL, cfg: LstmConfig):
     return (y_delta, h_delta, c_delta, h_state_delta, c_state_delta,
             x_host, h0_device, c0_device, weight_ih, weight_hh, bias_ih, bias_hh,
             y_host,
-            z_cache, gate_cache)
+            gate_cache)
 
 
 def _run_case_backward(lib: ctypes.CDLL, cfg: LstmConfig):
@@ -243,7 +241,7 @@ def _run_case_backward(lib: ctypes.CDLL, cfg: LstmConfig):
     (y_diff, h_diff, c_diff, hs_diff, cs_diff,
      x_host, h0_device, c0_device, weight_ih, weight_hh, bias_ih, bias_hh,
      y_host,
-     z_cache, gate_cache) = _run_case_forward_only(lib, cfg)
+     gate_cache) = _run_case_forward_only(lib, cfg)
 
     device = torch.device("cuda")
 
@@ -276,11 +274,13 @@ def _run_case_backward(lib: ctypes.CDLL, cfg: LstmConfig):
         ctypes.c_size_t(cfg.input_size),
         ctypes.c_size_t(cfg.hidden_size),
 
-        _as_void_p(z_cache),
+        _as_void_p(x_host),
+        _as_void_p(y_host),
         _as_void_p(gate_cache),
         _as_void_p(dY_host),
         _as_void_p(dHN_dev),
         _as_void_p(dCN_dev),
+        _as_void_p(h0_device),
         _as_void_p(c0_device),
         _as_void_p(weight_ih),
         _as_void_p(weight_hh),

@@ -55,6 +55,20 @@ struct DeviceBuffer {
     }
 };
 
+struct CudaEvent {
+    cudaEvent_t evt{nullptr};
+    CudaEvent() {
+        CheckCuda(cudaEventCreateWithFlags(&evt, cudaEventDisableTiming), "cudaEventCreate");
+    }
+    CudaEvent(const CudaEvent &) = delete;
+    CudaEvent &operator=(const CudaEvent &) = delete;
+    ~CudaEvent() {
+        if (evt != nullptr) {
+            cudaEventDestroy(evt);
+        }
+    }
+};
+
 struct CublasHandle {
     cublasHandle_t handle{nullptr};
     CublasHandle() = default;
@@ -209,13 +223,41 @@ __global__ void ConvertDxToHalfKernel(
     dx_half[idx] = __float2half(value);
 }
 
-__global__ void ReconstructCellStatesKernel(
-    const float *gate_cache,   // (T, B, 4H) row-major
-    size_t time_steps,
+__global__ void ConvertInputToZCacheFloatKernel(
+    const __half *x_src,           // (chunk_steps, B, I)
+    float *z_cache_col,            // (I+H, T*B) column-major
+    size_t time_offset,
+    size_t chunk_steps,
+    size_t batch_size,
+    size_t input_size,
+    size_t hidden_size
+) {
+    const size_t total = chunk_steps * batch_size * input_size;
+    const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) {
+        return;
+    }
+    size_t tmp = idx;
+    const size_t input_idx = tmp % input_size;
+    tmp /= input_size;
+    const size_t batch_idx = tmp % batch_size;
+    const size_t step_idx = tmp / batch_size;
+    const size_t time_idx = time_offset + step_idx;
+
+    const size_t column = time_idx * batch_size + batch_idx;
+    const size_t z_rows = input_size + hidden_size;
+    z_cache_col[input_idx + column * z_rows] = __half2float(x_src[idx]);
+}
+
+__global__ void ReconstructChunkKernel(
+    const float *gate_chunk,   // (chunk_steps, B, 4H) row-major
+    const __half *y_chunk,     // (chunk_steps, B, H) row-major
+    size_t chunk_start,
+    size_t chunk_steps,
     size_t batch_size,
     size_t hidden_size,
-    const float *c0,           // (B, H) row-major
-    float *c_cache             // (T+1, B, H) row-major
+    float *c_cache,            // (T+1, B, H) row-major
+    float *h_cache             // (T+1, B, H) row-major (nullable)
 ) {
     const size_t bh_elements = batch_size * hidden_size;
     const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -227,18 +269,58 @@ __global__ void ReconstructCellStatesKernel(
     const size_t hidden_idx = idx % hidden_size;
     const size_t gate_dim = 4 * hidden_size;
 
-    float c_prev = c0[idx];
-    c_cache[idx] = c_prev;
-
     const size_t gate_base = batch_idx * gate_dim + hidden_idx;
-    for (size_t t = 0; t < time_steps; ++t) {
-        const float *gate_step = gate_cache + t * batch_size * gate_dim;
+    const float *gate_ptr = gate_chunk;
+    for (size_t step = 0; step < chunk_steps; ++step) {
+        const size_t t = chunk_start + step;
+        const float *gate_step = gate_ptr + step * batch_size * gate_dim;
         const float i_gate = gate_step[gate_base + 0 * hidden_size];
         const float f_gate = gate_step[gate_base + 1 * hidden_size];
         const float g_gate = gate_step[gate_base + 2 * hidden_size];
-        c_prev = f_gate * c_prev + i_gate * g_gate;
-        c_cache[(t + 1) * bh_elements + idx] = c_prev;
+        const float o_gate = gate_step[gate_base + 3 * hidden_size];
+        const __half *y_step = y_chunk + (step * batch_size + batch_idx) * hidden_size;
+        float h_t = __half2float(y_step[hidden_idx]);
+        const float denom_o = fabsf(o_gate) < 1e-6f ? (o_gate >= 0 ? 1e-6f : -1e-6f) : o_gate;
+        float tanh_c = h_t / denom_o;
+        tanh_c = fmaxf(fminf(tanh_c, 1.0f - 1e-6f), -1.0f + 1e-6f);
+        float c_t = atanhf(tanh_c);
+        const size_t out_index = (t + 1) * bh_elements + idx;
+        c_cache[out_index] = c_t;
+        if (h_cache != nullptr) {
+            h_cache[out_index] = h_t;
+        }
+        const float denom_f = fabsf(f_gate) < 1e-6f ? (f_gate >= 0 ? 1e-6f : -1e-6f) : f_gate;
+        float c_prev = (c_t - i_gate * g_gate) / denom_f;
+        c_cache[t * bh_elements + idx] = c_prev;
     }
+}
+
+__global__ void FillHiddenPartFromHCacheKernel(
+    const float *h_cache,
+    float *z_cache,
+    size_t time_steps,
+    size_t batch_size,
+    size_t input_size,
+    size_t hidden_size
+) {
+    const size_t bh_elements = batch_size * hidden_size;
+    const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t total = time_steps * bh_elements;
+    if (idx >= total) {
+        return;
+    }
+
+    size_t tmp = idx;
+    const size_t hidden_idx = tmp % hidden_size;
+    tmp /= hidden_size;
+    const size_t batch_idx = tmp % batch_size;
+    const size_t time_idx = tmp / batch_size;
+
+    const size_t column = time_idx * batch_size + batch_idx;
+    const size_t z_rows = input_size + hidden_size;
+    const size_t h_offset = time_idx * bh_elements + batch_idx * hidden_size + hidden_idx;
+    const float h_prev = h_cache[h_offset];
+    z_cache[input_size + hidden_idx + column * z_rows] = h_prev;
 }
 
 __global__ void FillOnesKernel(float *dst, size_t count) {
@@ -258,12 +340,14 @@ void StreamingLstmBackward(
     size_t input_size,
     size_t hidden_size,
 
-    const __half *z_cache_host,
+    const __half *x_tensor_host,
+    const __half *y_tensor_host,
     const __half *gate_cache_host,
 
     const __half *dY_tensor_host,
     const __half *d_hn_device,
     const __half *d_cn_device,
+    const __half *h0_device,
     const __half *c0_device,
 
     const float *weights_ih,
@@ -283,7 +367,8 @@ void StreamingLstmBackward(
     if (time_steps == 0 || batch_size == 0 || input_size == 0 || hidden_size == 0) {
         return;
     }
-    if (z_cache_host == nullptr || gate_cache_host == nullptr || c0_device == nullptr) {
+    if (x_tensor_host == nullptr || y_tensor_host == nullptr || gate_cache_host == nullptr ||
+        dY_tensor_host == nullptr || h0_device == nullptr || c0_device == nullptr) {
         throw std::runtime_error("StreamingLstmBackward requires forward caches");
     }
 
@@ -292,21 +377,20 @@ void StreamingLstmBackward(
     const size_t bh_elements = batch_size * hidden_size;
     const size_t total_tb = time_steps * batch_size;
     const size_t y_elements = time_steps * bh_elements;
+    constexpr size_t kChunkSteps = 32;
 
-    DeviceBuffer<__half> dY_half_device;
-    DeviceBuffer<float> dY_float;
     DeviceBuffer<float> d_hn_float;
     DeviceBuffer<float> d_cn_float;
     DeviceBuffer<float> dh_cur;
     DeviceBuffer<float> dh_tmp;
     DeviceBuffer<float> dc_cur;
     DeviceBuffer<float> dc_tmp;
-    DeviceBuffer<__half> z_cache_device;
     DeviceBuffer<float> z_cache_float;
     DeviceBuffer<float> c_cache_float;
+    DeviceBuffer<float> h_cache_float;
     DeviceBuffer<float> c0_float;
+    DeviceBuffer<float> h0_float;
     DeviceBuffer<float> gate_cache_float;
-    DeviceBuffer<__half> gate_cache_device;
     DeviceBuffer<float> dG_cache_col;
     DeviceBuffer<float> weight_cat_col;
     DeviceBuffer<float> dWcat_col;
@@ -316,20 +400,7 @@ void StreamingLstmBackward(
     DeviceBuffer<float> db_buffer;
     DeviceBuffer<__half> dx_half_device;
 
-    CheckCuda(cudaMalloc(&dY_half_device.ptr, y_elements * sizeof(__half)), "cudaMalloc dY_half");
-    CheckCuda(cudaMemcpyAsync(
-                  dY_half_device.ptr,
-                  dY_tensor_host,
-                  y_elements * sizeof(__half),
-                  cudaMemcpyHostToDevice,
-                  stream),
-              "copy dY -> device");
-
-    CheckCuda(cudaMalloc(&dY_float.ptr, y_elements * sizeof(float)), "cudaMalloc dY_float");
     const int threads = 256;
-    const int y_blocks = static_cast<int>((y_elements + threads - 1) / threads);
-    HalfToFloatKernel<<<y_blocks, threads, 0, stream>>>(dY_half_device.ptr, dY_float.ptr, y_elements);
-    CheckCuda(cudaGetLastError(), "HalfToFloatKernel dY");
 
     CheckCuda(cudaMalloc(&d_hn_float.ptr, bh_elements * sizeof(float)), "cudaMalloc d_hn_float");
     CheckCuda(cudaMalloc(&d_cn_float.ptr, bh_elements * sizeof(float)), "cudaMalloc d_cn_float");
@@ -356,49 +427,32 @@ void StreamingLstmBackward(
     CheckCuda(cudaMemcpyAsync(dc_cur.ptr, d_cn_float.ptr, bh_elements * sizeof(float), cudaMemcpyDeviceToDevice, stream),
               "copy d_cn");
 
-    const size_t z_cache_elements = z_rows * total_tb;
-    CheckCuda(cudaMalloc(&z_cache_device.ptr, z_cache_elements * sizeof(__half)), "cudaMalloc z_cache_device");
-    CheckCuda(cudaMemcpyAsync(
-                  z_cache_device.ptr,
-                  z_cache_host,
-                  z_cache_elements * sizeof(__half),
-                  cudaMemcpyHostToDevice,
-                  stream),
-              "copy z_cache host->device");
-    CheckCuda(cudaMalloc(&z_cache_float.ptr, z_cache_elements * sizeof(float)), "cudaMalloc z_cache_float");
-    const int z_cache_blocks = static_cast<int>((z_cache_elements + threads - 1) / threads);
-    HalfToFloatKernel<<<z_cache_blocks, threads, 0, stream>>>(z_cache_device.ptr, z_cache_float.ptr, z_cache_elements);
-    CheckCuda(cudaGetLastError(), "HalfToFloatKernel z_cache");
-
     const size_t gate_cache_elements = time_steps * batch_size * gate_dim;
-    CheckCuda(cudaMalloc(&gate_cache_device.ptr, gate_cache_elements * sizeof(__half)), "cudaMalloc gate_cache_device");
-    CheckCuda(cudaMemcpyAsync(
-                  gate_cache_device.ptr,
-                  gate_cache_host,
-                  gate_cache_elements * sizeof(__half),
-                  cudaMemcpyHostToDevice,
-                  stream),
-              "copy gate_cache host->device");
     CheckCuda(cudaMalloc(&gate_cache_float.ptr, gate_cache_elements * sizeof(float)), "cudaMalloc gate_cache_float");
-    const int gate_cache_blocks = static_cast<int>((gate_cache_elements + threads - 1) / threads);
-    HalfToFloatKernel<<<gate_cache_blocks, threads, 0, stream>>>(gate_cache_device.ptr, gate_cache_float.ptr, gate_cache_elements);
-    CheckCuda(cudaGetLastError(), "HalfToFloatKernel gate_cache");
 
     const size_t state_cache_elements = static_cast<size_t>(time_steps + 1) * bh_elements;
     CheckCuda(cudaMalloc(&c0_float.ptr, bh_elements * sizeof(float)), "cudaMalloc c0_float");
     HalfToFloatKernel<<<bh_blocks, threads, 0, stream>>>(c0_device, c0_float.ptr, bh_elements);
     CheckCuda(cudaGetLastError(), "HalfToFloatKernel c0");
+    CheckCuda(cudaMalloc(&h0_float.ptr, bh_elements * sizeof(float)), "cudaMalloc h0_float");
+    HalfToFloatKernel<<<bh_blocks, threads, 0, stream>>>(h0_device, h0_float.ptr, bh_elements);
+    CheckCuda(cudaGetLastError(), "HalfToFloatKernel h0");
     CheckCuda(cudaMalloc(&c_cache_float.ptr, state_cache_elements * sizeof(float)), "cudaMalloc c_cache_float");
-    const int reconstruct_blocks = static_cast<int>((bh_elements + threads - 1) / threads);
-    ReconstructCellStatesKernel<<<reconstruct_blocks, threads, 0, stream>>>(
-        gate_cache_float.ptr,
-        time_steps,
-        batch_size,
-        hidden_size,
-        c0_float.ptr,
-        c_cache_float.ptr
-    );
-    CheckCuda(cudaGetLastError(), "ReconstructCellStatesKernel");
+    CheckCuda(cudaMalloc(&h_cache_float.ptr, state_cache_elements * sizeof(float)), "cudaMalloc h_cache_float");
+    CheckCuda(cudaMemcpyAsync(
+                  c_cache_float.ptr,
+                  c0_float.ptr,
+                  bh_elements * sizeof(float),
+                  cudaMemcpyDeviceToDevice,
+                  stream),
+              "seed c cache");
+    CheckCuda(cudaMemcpyAsync(
+                  h_cache_float.ptr,
+                  h0_float.ptr,
+                  bh_elements * sizeof(float),
+                  cudaMemcpyDeviceToDevice,
+                  stream),
+              "seed h cache");
 
     CheckCuda(cudaMalloc(&dG_cache_col.ptr, gate_dim * total_tb * sizeof(float)), "cudaMalloc dG_cache");
     CheckCuda(cudaMalloc(&weight_cat_col.ptr, z_rows * gate_dim * sizeof(float)), "cudaMalloc weight_cat_col");
@@ -430,55 +484,271 @@ void StreamingLstmBackward(
     const float alpha = 1.0f;
     const float beta_zero = 0.0f;
     const float beta_one = 1.0f;
-
     const int point_blocks = static_cast<int>((bh_elements + threads - 1) / threads);
 
-    for (int t = static_cast<int>(time_steps) - 1; t >= 0; --t) {
-        const size_t column_offset = static_cast<size_t>(t) * batch_size;
-        float *dG_step = dG_cache_col.ptr + column_offset * gate_dim;
-        float *dh_out = dh_tmp.ptr;
-        float *dc_out = dc_tmp.ptr;
+    const size_t z_cache_elements = z_rows * total_tb;
+    CheckCuda(cudaMalloc(&z_cache_float.ptr, z_cache_elements * sizeof(float)), "cudaMalloc z_cache_float");
 
-        const float *dY_t = dY_float.ptr + static_cast<size_t>(t) * bh_elements;
-        const float *gate_step = gate_cache_float.ptr + static_cast<size_t>(t) * batch_size * gate_dim;
-        const float *c_t = c_cache_float.ptr + static_cast<size_t>(t + 1) * bh_elements;
-        const float *c_prev = c_cache_float.ptr + static_cast<size_t>(t) * bh_elements;
+    const size_t chunk_capacity = kChunkSteps;
+    const size_t chunk_gate_capacity = chunk_capacity * batch_size * gate_dim;
+    const size_t chunk_input_capacity = chunk_capacity * batch_size * input_size;
+    const size_t chunk_output_capacity = chunk_capacity * batch_size * hidden_size;
 
-        BackwardPointwiseKernel<<<point_blocks, threads, 0, stream>>>(
-            dY_t,
-            dh_cur.ptr,
-            dc_cur.ptr,
-            gate_step,
-            c_t,
-            c_prev,
-            dG_step,
-            dh_out,
-            dc_out,
+    cudaStream_t h2d_stream{};
+    CheckCuda(cudaStreamCreateWithFlags(&h2d_stream, cudaStreamNonBlocking), "cudaStreamCreate h2d");
+
+    DeviceBuffer<__half> gate_chunk_half[2];
+    DeviceBuffer<__half> x_chunk_half[2];
+    DeviceBuffer<__half> y_chunk_half[2];
+    DeviceBuffer<__half> dY_chunk_half[2];
+    DeviceBuffer<float> dY_chunk_float[2];
+    for (int i = 0; i < 2; ++i) {
+        if (chunk_gate_capacity > 0) {
+            CheckCuda(cudaMalloc(&gate_chunk_half[i].ptr, chunk_gate_capacity * sizeof(__half)),
+                      "cudaMalloc gate_chunk_half");
+        }
+        if (chunk_input_capacity > 0) {
+            CheckCuda(cudaMalloc(&x_chunk_half[i].ptr, chunk_input_capacity * sizeof(__half)),
+                      "cudaMalloc x_chunk_half");
+        }
+        if (chunk_output_capacity > 0) {
+            CheckCuda(cudaMalloc(&y_chunk_half[i].ptr, chunk_output_capacity * sizeof(__half)),
+                      "cudaMalloc y_chunk_half");
+            CheckCuda(cudaMalloc(&dY_chunk_half[i].ptr, chunk_output_capacity * sizeof(__half)),
+                      "cudaMalloc dY_chunk_half");
+            CheckCuda(cudaMalloc(&dY_chunk_float[i].ptr, chunk_output_capacity * sizeof(float)),
+                      "cudaMalloc dY_chunk_float");
+        }
+    }
+    CudaEvent h2d_ready[2];
+    CudaEvent compute_done[2];
+    bool compute_done_valid[2] = {false, false};
+    size_t chunk_steps[2] = {0, 0};
+    size_t chunk_ids[2] = {static_cast<size_t>(-1), static_cast<size_t>(-1)};
+
+    const size_t total_chunks = (time_steps + chunk_capacity - 1) / chunk_capacity;
+
+    auto issue_chunk_copy = [&](ssize_t chunk_id, int slot) -> size_t {
+        if (chunk_id < 0) {
+            chunk_ids[slot] = static_cast<size_t>(-1);
+            return 0;
+        }
+        const size_t chunk_start = static_cast<size_t>(chunk_id) * chunk_capacity;
+        if (chunk_start >= time_steps) {
+            chunk_ids[slot] = static_cast<size_t>(-1);
+            return 0;
+        }
+        if (compute_done_valid[slot]) {
+            CheckCuda(cudaStreamWaitEvent(h2d_stream, compute_done[slot].evt, 0), "wait compute_done before reuse");
+            compute_done_valid[slot] = false;
+        }
+        const size_t steps = std::min(chunk_capacity, time_steps - chunk_start);
+        const size_t gate_elems = steps * batch_size * gate_dim;
+        if (gate_elems > 0 && gate_chunk_half[slot].ptr != nullptr) {
+            CheckCuda(cudaMemcpyAsync(
+                          gate_chunk_half[slot].ptr,
+                          gate_cache_host + chunk_start * batch_size * gate_dim,
+                          gate_elems * sizeof(__half),
+                          cudaMemcpyHostToDevice,
+                          h2d_stream),
+                      "copy gate chunk");
+        }
+        const size_t x_elems = steps * batch_size * input_size;
+        if (x_elems > 0 && x_chunk_half[slot].ptr != nullptr) {
+            CheckCuda(cudaMemcpyAsync(
+                          x_chunk_half[slot].ptr,
+                          x_tensor_host + chunk_start * batch_size * input_size,
+                          x_elems * sizeof(__half),
+                          cudaMemcpyHostToDevice,
+                          h2d_stream),
+                      "copy x chunk");
+        }
+        const size_t y_elems = steps * batch_size * hidden_size;
+        if (y_elems > 0 && y_chunk_half[slot].ptr != nullptr) {
+            CheckCuda(cudaMemcpyAsync(
+                          y_chunk_half[slot].ptr,
+                          y_tensor_host + chunk_start * batch_size * hidden_size,
+                          y_elems * sizeof(__half),
+                          cudaMemcpyHostToDevice,
+                          h2d_stream),
+                      "copy y chunk");
+        }
+        if (y_elems > 0 && dY_chunk_half[slot].ptr != nullptr) {
+            CheckCuda(cudaMemcpyAsync(
+                          dY_chunk_half[slot].ptr,
+                          dY_tensor_host + chunk_start * batch_size * hidden_size,
+                          y_elems * sizeof(__half),
+                          cudaMemcpyHostToDevice,
+                          h2d_stream),
+                      "copy dY chunk");
+        }
+        CheckCuda(cudaEventRecord(h2d_ready[slot].evt, h2d_stream), "record h2d_ready");
+        chunk_ids[slot] = static_cast<size_t>(chunk_id);
+        return steps;
+    };
+
+    ssize_t next_chunk = static_cast<ssize_t>(total_chunks) - 1;
+    for (int pre = 0; pre < static_cast<int>(std::min<size_t>(total_chunks, 2)); ++pre) {
+        const int slot = pre % 2;
+        chunk_steps[slot] = issue_chunk_copy(next_chunk, slot);
+        --next_chunk;
+    }
+
+    size_t processed_chunks = 0;
+    while (processed_chunks < total_chunks) {
+        int slot = -1;
+        if (chunk_ids[0] != static_cast<size_t>(-1) && chunk_ids[1] != static_cast<size_t>(-1)) {
+            slot = (chunk_ids[0] > chunk_ids[1]) ? 0 : 1;
+        } else if (chunk_ids[0] != static_cast<size_t>(-1)) {
+            slot = 0;
+        } else if (chunk_ids[1] != static_cast<size_t>(-1)) {
+            slot = 1;
+        } else {
+            break;
+        }
+
+        const size_t steps_in_chunk = chunk_steps[slot];
+        if (steps_in_chunk == 0) {
+            chunk_ids[slot] = static_cast<size_t>(-1);
+            continue;
+        }
+
+        CheckCuda(cudaStreamWaitEvent(stream, h2d_ready[slot].evt, 0), "wait h2d_ready");
+
+        const size_t chunk_start_step = chunk_ids[slot] * chunk_capacity;
+        const size_t gate_elems = steps_in_chunk * batch_size * gate_dim;
+        if (gate_elems > 0 && gate_chunk_half[slot].ptr != nullptr) {
+            const int gate_blocks = static_cast<int>((gate_elems + threads - 1) / threads);
+            HalfToFloatKernel<<<gate_blocks, threads, 0, stream>>>(
+                gate_chunk_half[slot].ptr,
+                gate_cache_float.ptr + chunk_start_step * batch_size * gate_dim,
+                gate_elems
+            );
+            CheckCuda(cudaGetLastError(), "HalfToFloatKernel gate chunk");
+        }
+
+        const size_t chunk_hidden_elems = steps_in_chunk * bh_elements;
+        if (chunk_hidden_elems > 0 && dY_chunk_half[slot].ptr != nullptr) {
+            const int dY_blocks = static_cast<int>((chunk_hidden_elems + threads - 1) / threads);
+            HalfToFloatKernel<<<dY_blocks, threads, 0, stream>>>(
+                dY_chunk_half[slot].ptr,
+                dY_chunk_float[slot].ptr,
+                chunk_hidden_elems
+            );
+            CheckCuda(cudaGetLastError(), "HalfToFloatKernel dY chunk");
+        }
+
+        const size_t chunk_input_elems = steps_in_chunk * batch_size * input_size;
+        if (chunk_input_elems > 0 && x_chunk_half[slot].ptr != nullptr) {
+            const int convert_blocks = static_cast<int>((chunk_input_elems + threads - 1) / threads);
+            ConvertInputToZCacheFloatKernel<<<convert_blocks, threads, 0, stream>>>(
+                x_chunk_half[slot].ptr,
+                z_cache_float.ptr,
+                chunk_start_step,
+                steps_in_chunk,
+                batch_size,
+                input_size,
+                hidden_size
+            );
+            CheckCuda(cudaGetLastError(), "ConvertInputToZCacheFloatKernel");
+        }
+
+        if (gate_elems > 0) {
+            ReconstructChunkKernel<<<bh_blocks, threads, 0, stream>>>(
+                gate_cache_float.ptr + chunk_start_step * batch_size * gate_dim,
+                y_chunk_half[slot].ptr,
+                chunk_start_step,
+                steps_in_chunk,
+                batch_size,
+                hidden_size,
+                c_cache_float.ptr,
+                h_cache_float.ptr
+            );
+            CheckCuda(cudaGetLastError(), "ReconstructChunkKernel");
+        }
+
+        float *dY_chunk_base = dY_chunk_float[slot].ptr;
+        if (chunk_hidden_elems > 0 && dY_chunk_base == nullptr) {
+            throw std::runtime_error("dY chunk buffer not allocated");
+        }
+
+        for (int step = static_cast<int>(steps_in_chunk) - 1; step >= 0; --step) {
+            const size_t t = chunk_start_step + static_cast<size_t>(step);
+            const size_t column_offset = t * batch_size;
+            float *dG_step = dG_cache_col.ptr + column_offset * gate_dim;
+            float *dh_out = dh_tmp.ptr;
+            float *dc_out = dc_tmp.ptr;
+
+            const float *dY_t = dY_chunk_base + static_cast<size_t>(step) * bh_elements;
+            const float *gate_step = gate_cache_float.ptr + t * batch_size * gate_dim;
+            const float *c_t = c_cache_float.ptr + (t + 1) * bh_elements;
+            const float *c_prev = c_cache_float.ptr + t * bh_elements;
+
+            BackwardPointwiseKernel<<<point_blocks, threads, 0, stream>>>(
+                dY_t,
+                dh_cur.ptr,
+                dc_cur.ptr,
+                gate_step,
+                c_t,
+                c_prev,
+                dG_step,
+                dh_out,
+                dc_out,
+                batch_size,
+                hidden_size
+            );
+            CheckCuda(cudaGetLastError(), "BackwardPointwiseKernel");
+
+            const float *W_hh_block = weight_cat_col.ptr + input_size;
+            CheckCublas(cublasSgemm(
+                            cublas.handle,
+                            CUBLAS_OP_N,
+                            CUBLAS_OP_N,
+                            static_cast<int>(hidden_size),
+                            static_cast<int>(batch_size),
+                            static_cast<int>(gate_dim),
+                            &alpha,
+                            W_hh_block,
+                            static_cast<int>(z_rows),
+                            dG_step,
+                            static_cast<int>(gate_dim),
+                            &beta_one,
+                            dh_out,
+                            static_cast<int>(hidden_size)),
+                        "cublasSgemm dh_prev");
+
+            std::swap(dh_cur.ptr, dh_tmp.ptr);
+            std::swap(dc_cur.ptr, dc_tmp.ptr);
+        }
+
+        CheckCuda(cudaEventRecord(compute_done[slot].evt, stream), "record compute_done");
+        compute_done_valid[slot] = true;
+        ++processed_chunks;
+
+        if (next_chunk >= 0) {
+            chunk_steps[slot] = issue_chunk_copy(next_chunk, slot);
+            --next_chunk;
+        } else {
+            chunk_steps[slot] = 0;
+            chunk_ids[slot] = static_cast<size_t>(-1);
+        }
+    }
+
+    CheckCuda(cudaStreamSynchronize(h2d_stream), "final h2d sync");
+    CheckCuda(cudaStreamDestroy(h2d_stream), "cudaStreamDestroy h2d");
+
+    if (time_steps > 0 && hidden_size > 0) {
+        const size_t hidden_entries = time_steps * bh_elements;
+        const int hidden_blocks = static_cast<int>((hidden_entries + threads - 1) / threads);
+        FillHiddenPartFromHCacheKernel<<<hidden_blocks, threads, 0, stream>>>(
+            h_cache_float.ptr,
+            z_cache_float.ptr,
+            time_steps,
             batch_size,
+            input_size,
             hidden_size
         );
-        CheckCuda(cudaGetLastError(), "BackwardPointwiseKernel");
-
-        const float *W_hh_block = weight_cat_col.ptr + input_size;
-        CheckCublas(cublasSgemm(
-                        cublas.handle,
-                        CUBLAS_OP_N,
-                        CUBLAS_OP_N,
-                        static_cast<int>(hidden_size),
-                        static_cast<int>(batch_size),
-                        static_cast<int>(gate_dim),
-                        &alpha,
-                        W_hh_block,
-                        static_cast<int>(z_rows),
-                        dG_step,
-                        static_cast<int>(gate_dim),
-                        &beta_one,
-                        dh_out,
-                        static_cast<int>(hidden_size)),
-                    "cublasSgemm dh_prev");
-
-        std::swap(dh_cur.ptr, dh_tmp.ptr);
-        std::swap(dc_cur.ptr, dc_tmp.ptr);
+        CheckCuda(cudaGetLastError(), "FillHiddenPartFromHCacheKernel");
     }
 
     // Parameter gradients
@@ -622,12 +892,14 @@ extern "C" void flstm_StreamingLstmBackward(
     size_t input_size,
     size_t hidden_size,
 
-    const __half *z_cache_host,
+    const __half *x_tensor_host,
+    const __half *y_tensor_host,
     const __half *gate_cache_host,
 
     const __half *dY_tensor_host,
     const __half *d_hn_device,
     const __half *d_cn_device,
+    const __half *h0_device,
     const __half *c0_device,
 
     const float *weights_ih,
@@ -649,11 +921,13 @@ extern "C" void flstm_StreamingLstmBackward(
             batch_size,
             input_size,
             hidden_size,
-            z_cache_host,
+            x_tensor_host,
+            y_tensor_host,
             gate_cache_host,
             dY_tensor_host,
             d_hn_device,
             d_cn_device,
+            h0_device,
             c0_device,
             weights_ih,
             weights_hh,

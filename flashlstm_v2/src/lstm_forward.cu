@@ -322,7 +322,6 @@ void StreamingLstmForward(
 
     __half *y_tensor_host,
 
-    __half *z_cache_host,
     __half *gate_cache_host,
 
     cudaStream_t compute_stream,
@@ -349,7 +348,6 @@ void StreamingLstmForward(
     const size_t chunk_capacity = kChunkSteps;
     const size_t chunk_input_capacity = chunk_capacity * batch_size * input_size;
     const size_t chunk_output_capacity = chunk_capacity * bh_elements;
-    const bool store_z_cache = (z_cache_host != nullptr);
     const bool store_gate_cache = (gate_cache_host != nullptr);
     const bool needs_y_fallback = (y_tensor_host != nullptr);
 
@@ -358,7 +356,6 @@ void StreamingLstmForward(
 
     HostRegistration x_host_registration;
     HostRegistration y_host_registration;
-    HostRegistration z_host_registration;
     HostRegistration gate_host_registration;
 
     x_host_registration.reset(
@@ -371,13 +368,6 @@ void StreamingLstmForward(
             y_tensor_host,
             time_steps * y_step_bytes,
             "cudaHostRegister y_tensor_host"
-        );
-    }
-    if (store_z_cache) {
-        z_host_registration.reset(
-            z_cache_host,
-            z_cache_elements * sizeof(__half),
-            "cudaHostRegister z_cache_host"
         );
     }
     if (store_gate_cache) {
@@ -642,21 +632,6 @@ void StreamingLstmForward(
 
         CheckCuda(cudaStreamWaitEvent(d2h_stream, compute_done[slot].evt, 0), "wait compute_done on d2h");
 
-        if (store_z_cache) {
-            const size_t columns = steps_in_chunk * batch_size;
-            if (columns > 0) {
-                const size_t column_offset = chunk_start_step * batch_size;
-                __half *dst = z_cache_host + column_offset * z_rows;
-                const __half *src = z_cache_device + column_offset * z_rows;
-                CheckCuda(cudaMemcpyAsync(
-                              dst,
-                              src,
-                              columns * z_rows * sizeof(__half),
-                              cudaMemcpyDeviceToHost,
-                              d2h_stream),
-                          "copy z cache chunk");
-            }
-        }
         if (store_gate_cache) {
             const size_t elements = steps_in_chunk * batch_size * gate_dim;
             if (elements > 0) {
@@ -724,7 +699,6 @@ extern "C" void flstm_StreamingLstmForward(
 
     __half *y_tensor_host,
 
-    __half *z_cache_host,
     __half *gate_cache_host,
 
     cudaStream_t compute_stream,
@@ -745,7 +719,6 @@ extern "C" void flstm_StreamingLstmForward(
             bias_ih,
             bias_hh,
             y_tensor_host,
-            z_cache_host,
             gate_cache_host,
             compute_stream,
             h2d_stream,

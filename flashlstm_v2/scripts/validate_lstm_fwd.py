@@ -59,7 +59,6 @@ def _prepare_function(lib: ctypes.CDLL) -> None:
         ctypes.c_void_p,  # bias_ih
         ctypes.c_void_p,  # bias_hh
         ctypes.c_void_p,  # y host
-        ctypes.c_void_p,  # z cache host
         ctypes.c_void_p,  # gate cache host
         ctypes.c_void_p,  # compute stream
         ctypes.c_void_p,  # h2d stream
@@ -129,8 +128,6 @@ def _run_case(lib: ctypes.CDLL, cfg: LstmConfig):
 
     y_host = torch.empty(cfg.time_steps, cfg.batch_size, cfg.hidden_size, dtype=torch.float16).contiguous().pin_memory()
 
-    z_cache = torch.empty(cfg.input_size + cfg.hidden_size, cfg.time_steps * cfg.batch_size,
-                          dtype=torch.float16).contiguous().pin_memory()
     gate_cache = torch.empty(cfg.time_steps, cfg.batch_size, 4 * cfg.hidden_size,
                              dtype=torch.float16).contiguous().pin_memory()
 
@@ -158,7 +155,6 @@ def _run_case(lib: ctypes.CDLL, cfg: LstmConfig):
         _as_void_p(bias_ih),
         _as_void_p(bias_hh),
         _as_void_p(y_host),
-        _as_void_p(z_cache),
         _as_void_p(gate_cache),
         ctypes.c_void_p(0),
         ctypes.c_void_p(h2d_stream.cuda_stream),

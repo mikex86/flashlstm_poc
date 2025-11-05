@@ -41,13 +41,11 @@ int main() {
     constexpr size_t input_size = 1024;
     constexpr size_t hidden_size = 1024;
     constexpr size_t gate_dim = 4 * hidden_size;
-    constexpr size_t z_rows = input_size + hidden_size;
 
     const size_t x_elements = time_steps * batch_size * input_size;
     const size_t y_elements = time_steps * batch_size * hidden_size;
     const size_t gate_elements = time_steps * batch_size * gate_dim;
     const size_t state_elements = batch_size * hidden_size;
-    const size_t cache_z_elements = z_rows * time_steps * batch_size;
 
     std::mt19937 rng(0);
     std::normal_distribution<float> normal_dist(0.0f, 1.0f);
@@ -79,7 +77,6 @@ int main() {
     float *bias_ih_device = CudaMallocDevice<float>(bias_ih_host.size(), "cudaMalloc bias_ih");
     float *bias_hh_device = CudaMallocDevice<float>(bias_hh_host.size(), "cudaMalloc bias_hh");
 
-    __half *z_cache_host = CudaMallocHost<__half>(cache_z_elements, "cudaMallocHost z_cache");
     __half *gate_cache_host = CudaMallocHost<__half>(gate_elements, "cudaMallocHost gate_cache");
 
     CheckCuda(cudaMemcpy(h0_device, h0_host.data(), state_elements * sizeof(__half), cudaMemcpyHostToDevice),
@@ -115,7 +112,6 @@ int main() {
         bias_ih_device,
         bias_hh_device,
         y_host,
-        z_cache_host,
         gate_cache_host,
         compute_stream,
         h2d_stream,
@@ -156,11 +152,13 @@ int main() {
         batch_size,
         input_size,
         hidden_size,
-        z_cache_host,
+        x_host,
+        y_host,
         gate_cache_host,
         dY_host,
         dHN_device,
         dCN_device,
+        h0_device,
         c0_device,
         weight_ih_device,
         weight_hh_device,
@@ -203,7 +201,6 @@ int main() {
     cudaFreeHost(dY_host);
     cudaFreeHost(y_host);
     cudaFreeHost(gate_cache_host);
-    cudaFreeHost(z_cache_host);
     cudaFreeHost(x_host);
     cudaFree(dW_ih_device);
     cudaFree(dW_hh_device);

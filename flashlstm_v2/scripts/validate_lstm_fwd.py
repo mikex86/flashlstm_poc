@@ -59,10 +59,9 @@ def _prepare_function(lib: ctypes.CDLL) -> None:
         ctypes.c_void_p,  # bias_ih
         ctypes.c_void_p,  # bias_hh
         ctypes.c_void_p,  # y host
-        ctypes.c_void_p,  # z cache device
-        ctypes.c_void_p,  # h cache device
-        ctypes.c_void_p,  # c cache device
-        ctypes.c_void_p,  # gate cache device
+        ctypes.c_void_p,  # z cache host
+        ctypes.c_void_p,  # c cache host
+        ctypes.c_void_p,  # gate cache host
         ctypes.c_void_p,  # compute stream
         ctypes.c_void_p,  # h2d stream
         ctypes.c_void_p,  # d2h stream
@@ -133,8 +132,6 @@ def _run_case(lib: ctypes.CDLL, cfg: LstmConfig):
 
     z_cache = torch.empty(cfg.input_size + cfg.hidden_size, cfg.time_steps * cfg.batch_size,
                           dtype=torch.float16).contiguous().pin_memory()
-    h_cache = torch.empty(cfg.time_steps + 1, cfg.batch_size, cfg.hidden_size,
-                          dtype=torch.float16).contiguous().pin_memory()
     c_cache = torch.empty(cfg.time_steps + 1, cfg.batch_size, cfg.hidden_size,
                           dtype=torch.float16).contiguous().pin_memory()
     gate_cache = torch.empty(cfg.time_steps, cfg.batch_size, 4 * cfg.hidden_size,
@@ -165,7 +162,6 @@ def _run_case(lib: ctypes.CDLL, cfg: LstmConfig):
         _as_void_p(bias_hh),
         _as_void_p(y_host),
         _as_void_p(z_cache),
-        _as_void_p(h_cache),
         _as_void_p(c_cache),
         _as_void_p(gate_cache),
         ctypes.c_void_p(0),
@@ -177,7 +173,7 @@ def _run_case(lib: ctypes.CDLL, cfg: LstmConfig):
 
     y_ref_cpu = y_ref.cpu()
     y_custom = y_host.to(dtype=torch.float32)
-    h_states_custom = h_cache[1:].to(dtype=torch.float32).cpu()
+    h_states_custom = y_custom
     c_states_custom = c_cache[1:].to(dtype=torch.float32).cpu()
     h_states_ref_cpu = h_states_ref.cpu()
     c_states_ref_cpu = c_states_ref.cpu()

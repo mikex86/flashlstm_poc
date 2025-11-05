@@ -227,7 +227,6 @@ void StreamingLstmBackward(
     size_t hidden_size,
 
     const __half *z_cache_host,
-    const __half *h_cache_host,
     const __half *c_cache_host,
     const __half *gate_cache_host,
 
@@ -252,8 +251,7 @@ void StreamingLstmBackward(
     if (time_steps == 0 || batch_size == 0 || input_size == 0 || hidden_size == 0) {
         return;
     }
-    if (z_cache_host == nullptr || h_cache_host == nullptr ||
-        c_cache_host == nullptr || gate_cache_host == nullptr) {
+    if (z_cache_host == nullptr || c_cache_host == nullptr || gate_cache_host == nullptr) {
         throw std::runtime_error("StreamingLstmBackward requires forward caches");
     }
 
@@ -268,15 +266,14 @@ void StreamingLstmBackward(
     DeviceBuffer<float> d_hn_float;
     DeviceBuffer<float> d_cn_float;
     DeviceBuffer<float> dh_cur;
-   DeviceBuffer<float> dh_tmp;
-   DeviceBuffer<float> dc_cur;
-   DeviceBuffer<float> dc_tmp;
+    DeviceBuffer<float> dh_tmp;
+    DeviceBuffer<float> dc_cur;
+    DeviceBuffer<float> dc_tmp;
     DeviceBuffer<__half> z_cache_device;
-   DeviceBuffer<float> z_cache_float;
-    DeviceBuffer<__half> h_cache_device;
-   DeviceBuffer<float> c_cache_float;
+    DeviceBuffer<float> z_cache_float;
+    DeviceBuffer<float> c_cache_float;
     DeviceBuffer<__half> c_cache_device;
-   DeviceBuffer<float> gate_cache_float;
+    DeviceBuffer<float> gate_cache_float;
     DeviceBuffer<__half> gate_cache_device;
     DeviceBuffer<float> dG_cache_col;
     DeviceBuffer<float> weight_cat_col;
@@ -341,17 +338,9 @@ void StreamingLstmBackward(
     HalfToFloatKernel<<<z_cache_blocks, threads, 0, stream>>>(z_cache_device.ptr, z_cache_float.ptr, z_cache_elements);
     CheckCuda(cudaGetLastError(), "HalfToFloatKernel z_cache");
 
-    const size_t h_cache_elements = static_cast<size_t>(time_steps + 1) * bh_elements;
-    CheckCuda(cudaMalloc(&h_cache_device.ptr, h_cache_elements * sizeof(__half)), "cudaMalloc h_cache_device");
-    CheckCuda(cudaMemcpyAsync(
-                  h_cache_device.ptr,
-                  h_cache_host,
-                  h_cache_elements * sizeof(__half),
-                  cudaMemcpyHostToDevice,
-                  stream),
-              "copy h_cache host->device");
+    const size_t state_cache_elements = static_cast<size_t>(time_steps + 1) * bh_elements;
 
-    const size_t c_cache_elements = h_cache_elements;
+    const size_t c_cache_elements = state_cache_elements;
     CheckCuda(cudaMalloc(&c_cache_device.ptr, c_cache_elements * sizeof(__half)), "cudaMalloc c_cache_device");
     CheckCuda(cudaMemcpyAsync(
                   c_cache_device.ptr,
@@ -602,7 +591,6 @@ extern "C" void flstm_StreamingLstmBackward(
     size_t hidden_size,
 
     const __half *z_cache_host,
-    const __half *h_cache_host,
     const __half *c_cache_host,
     const __half *gate_cache_host,
 
@@ -630,7 +618,6 @@ extern "C" void flstm_StreamingLstmBackward(
             input_size,
             hidden_size,
             z_cache_host,
-            h_cache_host,
             c_cache_host,
             gate_cache_host,
             dY_tensor_host,

@@ -335,10 +335,10 @@ void StreamingLstmForward(
 
     __half *y_tensor_host,
 
-    __half *z_cache_device,
-    __half *h_cache_device,
-    __half *c_cache_device,
-    __half *gate_cache_device,
+    __half *z_cache_host,
+    __half *h_cache_host,
+    __half *c_cache_host,
+    __half *gate_cache_host,
 
     cudaStream_t compute_stream,
     cudaStream_t h2d_stream,
@@ -355,19 +355,31 @@ void StreamingLstmForward(
     const size_t gate_dim = 4 * hidden_size;
     const size_t z_rows = input_size + hidden_size;
     const size_t bh_elements = batch_size * hidden_size;
+    const size_t total_tb = time_steps * batch_size;
+    const size_t z_cache_elements = z_rows * total_tb;
+    const size_t state_cache_elements = (time_steps + 1) * bh_elements;
+    const size_t gate_cache_elements = time_steps * batch_size * gate_dim;
     const size_t x_step_bytes = batch_size * input_size * sizeof(__half);
     const size_t y_step_bytes = bh_elements * sizeof(__half);
     constexpr size_t kChunkSteps = 32;
     const size_t chunk_capacity = kChunkSteps;
     const size_t chunk_input_capacity = chunk_capacity * batch_size * input_size;
     const size_t chunk_output_capacity = chunk_capacity * bh_elements;
-    const bool needs_y_fallback = (y_tensor_host != nullptr && h_cache_device == nullptr);
+    const bool store_z_cache = (z_cache_host != nullptr);
+    const bool store_h_cache = (h_cache_host != nullptr);
+    const bool store_c_cache = (c_cache_host != nullptr);
+    const bool store_gate_cache = (gate_cache_host != nullptr);
+    const bool needs_y_fallback = (y_tensor_host != nullptr && !store_h_cache);
 
     const int threads = 256;
     const int bh_blocks = static_cast<int>((bh_elements + threads - 1) / threads);
 
     HostRegistration x_host_registration;
     HostRegistration y_host_registration;
+    HostRegistration z_host_registration;
+    HostRegistration h_host_registration;
+    HostRegistration c_host_registration;
+    HostRegistration gate_host_registration;
 
     x_host_registration.reset(
         x_tensor_host,
@@ -381,6 +393,59 @@ void StreamingLstmForward(
             "cudaHostRegister y_tensor_host"
         );
     }
+    if (store_z_cache) {
+        z_host_registration.reset(
+            z_cache_host,
+            z_cache_elements * sizeof(__half),
+            "cudaHostRegister z_cache_host"
+        );
+    }
+    if (store_h_cache) {
+        h_host_registration.reset(
+            h_cache_host,
+            state_cache_elements * sizeof(__half),
+            "cudaHostRegister h_cache_host"
+        );
+    }
+    if (store_c_cache) {
+        c_host_registration.reset(
+            c_cache_host,
+            state_cache_elements * sizeof(__half),
+            "cudaHostRegister c_cache_host"
+        );
+    }
+    if (store_gate_cache) {
+        gate_host_registration.reset(
+            gate_cache_host,
+            gate_cache_elements * sizeof(__half),
+            "cudaHostRegister gate_cache_host"
+        );
+    }
+
+    DeviceBuffer<__half> z_cache_device_buffer;
+    CheckCuda(cudaMalloc(&z_cache_device_buffer.ptr, z_cache_elements * sizeof(__half)), "cudaMalloc z_cache");
+    __half *z_cache_device = z_cache_device_buffer.ptr;
+
+    DeviceBuffer<__half> h_cache_device_buffer;
+    if (store_h_cache) {
+        CheckCuda(cudaMalloc(&h_cache_device_buffer.ptr, state_cache_elements * sizeof(__half)),
+                  "cudaMalloc h_cache");
+    }
+    __half *h_cache_device = h_cache_device_buffer.ptr;
+
+    DeviceBuffer<__half> c_cache_device_buffer;
+    if (store_c_cache) {
+        CheckCuda(cudaMalloc(&c_cache_device_buffer.ptr, state_cache_elements * sizeof(__half)),
+                  "cudaMalloc c_cache");
+    }
+    __half *c_cache_device = c_cache_device_buffer.ptr;
+
+    DeviceBuffer<__half> gate_cache_device_buffer;
+    if (store_gate_cache) {
+        CheckCuda(cudaMalloc(&gate_cache_device_buffer.ptr, gate_cache_elements * sizeof(__half)),
+                  "cudaMalloc gate_cache");
+    }
+    __half *gate_cache_device = gate_cache_device_buffer.ptr;
 
     DeviceBuffer<float> h0_float;
     DeviceBuffer<float> c0_float;
@@ -444,6 +509,13 @@ void StreamingLstmForward(
             hidden_size
         );
         CheckCuda(cudaGetLastError(), "StoreInitialStateKernel h_cache");
+        CheckCuda(cudaMemcpyAsync(
+                      h_cache_host,
+                      h_cache_device,
+                      bh_elements * sizeof(__half),
+                      cudaMemcpyDeviceToHost,
+                      compute_stream),
+                  "copy h0 cache -> host");
     }
     if (c_cache_device != nullptr) {
         StoreInitialStateKernel<<<bh_blocks, threads, 0, compute_stream>>>(
@@ -453,6 +525,13 @@ void StreamingLstmForward(
             hidden_size
         );
         CheckCuda(cudaGetLastError(), "StoreInitialStateKernel c_cache");
+        CheckCuda(cudaMemcpyAsync(
+                      c_cache_host,
+                      c_cache_device,
+                      bh_elements * sizeof(__half),
+                      cudaMemcpyDeviceToHost,
+                      compute_stream),
+                  "copy c0 cache -> host");
     }
 
     const int seed_blocks = static_cast<int>((bh_elements + threads - 1) / threads);
@@ -644,6 +723,67 @@ void StreamingLstmForward(
 
         CheckCuda(cudaStreamWaitEvent(d2h_stream, compute_done[slot].evt, 0), "wait compute_done on d2h");
 
+        if (store_z_cache) {
+            const size_t columns = steps_in_chunk * batch_size;
+            if (columns > 0) {
+                const size_t column_offset = chunk_start_step * batch_size;
+                __half *dst = z_cache_host + column_offset * z_rows;
+                const __half *src = z_cache_device + column_offset * z_rows;
+                CheckCuda(cudaMemcpyAsync(
+                              dst,
+                              src,
+                              columns * z_rows * sizeof(__half),
+                              cudaMemcpyDeviceToHost,
+                              d2h_stream),
+                          "copy z cache chunk");
+            }
+        }
+        if (store_h_cache) {
+            const size_t elements = steps_in_chunk * bh_elements;
+            if (elements > 0) {
+                const size_t offset = (chunk_start_step + 1) * bh_elements;
+                __half *dst = h_cache_host + offset;
+                const __half *src = h_cache_device + offset;
+                CheckCuda(cudaMemcpyAsync(
+                              dst,
+                              src,
+                              elements * sizeof(__half),
+                              cudaMemcpyDeviceToHost,
+                              d2h_stream),
+                          "copy h cache chunk");
+            }
+        }
+        if (store_c_cache) {
+            const size_t elements = steps_in_chunk * bh_elements;
+            if (elements > 0) {
+                const size_t offset = (chunk_start_step + 1) * bh_elements;
+                __half *dst = c_cache_host + offset;
+                const __half *src = c_cache_device + offset;
+                CheckCuda(cudaMemcpyAsync(
+                              dst,
+                              src,
+                              elements * sizeof(__half),
+                              cudaMemcpyDeviceToHost,
+                              d2h_stream),
+                          "copy c cache chunk");
+            }
+        }
+        if (store_gate_cache) {
+            const size_t elements = steps_in_chunk * batch_size * gate_dim;
+            if (elements > 0) {
+                const size_t offset = chunk_start_step * batch_size * gate_dim;
+                __half *dst = gate_cache_host + offset;
+                const __half *src = gate_cache_device + offset;
+                CheckCuda(cudaMemcpyAsync(
+                              dst,
+                              src,
+                              elements * sizeof(__half),
+                              cudaMemcpyDeviceToHost,
+                              d2h_stream),
+                          "copy gate cache chunk");
+            }
+        }
+
         if (y_tensor_host != nullptr) {
             const size_t y_elements_chunk = steps_in_chunk * bh_elements;
             if (y_elements_chunk > 0) {
@@ -706,10 +846,10 @@ extern "C" void flstm_StreamingLstmForward(
 
     __half *y_tensor_host,
 
-    __half *z_cache_device,
-    __half *h_cache_device,
-    __half *c_cache_device,
-    __half *gate_cache_device,
+    __half *z_cache_host,
+    __half *h_cache_host,
+    __half *c_cache_host,
+    __half *gate_cache_host,
 
     cudaStream_t compute_stream,
     cudaStream_t h2d_stream,
@@ -729,10 +869,10 @@ extern "C" void flstm_StreamingLstmForward(
             bias_ih,
             bias_hh,
             y_tensor_host,
-            z_cache_device,
-            h_cache_device,
-            c_cache_device,
-            gate_cache_device,
+            z_cache_host,
+            h_cache_host,
+            c_cache_host,
+            gate_cache_host,
             compute_stream,
             h2d_stream,
             d2h_stream

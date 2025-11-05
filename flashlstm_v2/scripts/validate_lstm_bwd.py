@@ -164,12 +164,13 @@ def _run_case_forward_only(lib: ctypes.CDLL, cfg: LstmConfig):
 
     y_host = torch.empty(cfg.time_steps, cfg.batch_size, cfg.hidden_size, dtype=torch.float16).contiguous().pin_memory()
     z_cache = torch.empty(cfg.input_size + cfg.hidden_size, cfg.time_steps * cfg.batch_size,
-                          dtype=torch.float16, device=device).contiguous()
+                          dtype=torch.float16).contiguous().pin_memory()
     h_state_cache = torch.empty(cfg.time_steps + 1, cfg.batch_size, cfg.hidden_size,
-                                dtype=torch.float16, device=device).contiguous()
-    c_state_cache = torch.empty_like(h_state_cache)
+                                dtype=torch.float16).contiguous().pin_memory()
+    c_state_cache = torch.empty(cfg.time_steps + 1, cfg.batch_size, cfg.hidden_size,
+                                dtype=torch.float16).contiguous().pin_memory()
     gate_cache = torch.empty(cfg.time_steps, cfg.batch_size, 4 * cfg.hidden_size,
-                             dtype=torch.float16, device=device).contiguous()
+                             dtype=torch.float16).contiguous().pin_memory()
 
 
     compute_stream = torch.cuda.Stream()

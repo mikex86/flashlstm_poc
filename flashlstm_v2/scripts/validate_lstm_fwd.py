@@ -132,12 +132,13 @@ def _run_case(lib: ctypes.CDLL, cfg: LstmConfig):
     y_host = torch.empty(cfg.time_steps, cfg.batch_size, cfg.hidden_size, dtype=torch.float16).contiguous().pin_memory()
 
     z_cache = torch.empty(cfg.input_size + cfg.hidden_size, cfg.time_steps * cfg.batch_size,
-                          device=device, dtype=torch.float16)
+                          dtype=torch.float16).contiguous().pin_memory()
     h_cache = torch.empty(cfg.time_steps + 1, cfg.batch_size, cfg.hidden_size,
-                          device=device, dtype=torch.float16)
-    c_cache = torch.empty_like(h_cache)
+                          dtype=torch.float16).contiguous().pin_memory()
+    c_cache = torch.empty(cfg.time_steps + 1, cfg.batch_size, cfg.hidden_size,
+                          dtype=torch.float16).contiguous().pin_memory()
     gate_cache = torch.empty(cfg.time_steps, cfg.batch_size, 4 * cfg.hidden_size,
-                             device=device, dtype=torch.float16)
+                             dtype=torch.float16).contiguous().pin_memory()
 
     compute_stream = torch.cuda.Stream()
     h2d_stream = torch.cuda.Stream()

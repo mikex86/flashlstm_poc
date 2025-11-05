@@ -226,10 +226,10 @@ void StreamingLstmBackward(
     size_t input_size,
     size_t hidden_size,
 
-    const __half *z_cache_device,
-    const __half *h_cache_device,
-    const __half *c_cache_device,
-    const __half *gate_cache_device,
+    const __half *z_cache_host,
+    const __half *h_cache_host,
+    const __half *c_cache_host,
+    const __half *gate_cache_host,
 
     const __half *dY_tensor_host,
     const __half *d_hn_device,
@@ -252,8 +252,8 @@ void StreamingLstmBackward(
     if (time_steps == 0 || batch_size == 0 || input_size == 0 || hidden_size == 0) {
         return;
     }
-    if (z_cache_device == nullptr || h_cache_device == nullptr ||
-        c_cache_device == nullptr || gate_cache_device == nullptr) {
+    if (z_cache_host == nullptr || h_cache_host == nullptr ||
+        c_cache_host == nullptr || gate_cache_host == nullptr) {
         throw std::runtime_error("StreamingLstmBackward requires forward caches");
     }
 
@@ -268,12 +268,16 @@ void StreamingLstmBackward(
     DeviceBuffer<float> d_hn_float;
     DeviceBuffer<float> d_cn_float;
     DeviceBuffer<float> dh_cur;
-    DeviceBuffer<float> dh_tmp;
-    DeviceBuffer<float> dc_cur;
-    DeviceBuffer<float> dc_tmp;
-    DeviceBuffer<float> z_cache_float;
-    DeviceBuffer<float> c_cache_float;
-    DeviceBuffer<float> gate_cache_float;
+   DeviceBuffer<float> dh_tmp;
+   DeviceBuffer<float> dc_cur;
+   DeviceBuffer<float> dc_tmp;
+    DeviceBuffer<__half> z_cache_device;
+   DeviceBuffer<float> z_cache_float;
+    DeviceBuffer<__half> h_cache_device;
+   DeviceBuffer<float> c_cache_float;
+    DeviceBuffer<__half> c_cache_device;
+   DeviceBuffer<float> gate_cache_float;
+    DeviceBuffer<__half> gate_cache_device;
     DeviceBuffer<float> dG_cache_col;
     DeviceBuffer<float> weight_cat_col;
     DeviceBuffer<float> dWcat_col;
@@ -324,21 +328,55 @@ void StreamingLstmBackward(
               "copy d_cn");
 
     const size_t z_cache_elements = z_rows * total_tb;
+    CheckCuda(cudaMalloc(&z_cache_device.ptr, z_cache_elements * sizeof(__half)), "cudaMalloc z_cache_device");
+    CheckCuda(cudaMemcpyAsync(
+                  z_cache_device.ptr,
+                  z_cache_host,
+                  z_cache_elements * sizeof(__half),
+                  cudaMemcpyHostToDevice,
+                  stream),
+              "copy z_cache host->device");
     CheckCuda(cudaMalloc(&z_cache_float.ptr, z_cache_elements * sizeof(float)), "cudaMalloc z_cache_float");
     const int z_cache_blocks = static_cast<int>((z_cache_elements + threads - 1) / threads);
-    HalfToFloatKernel<<<z_cache_blocks, threads, 0, stream>>>(z_cache_device, z_cache_float.ptr, z_cache_elements);
+    HalfToFloatKernel<<<z_cache_blocks, threads, 0, stream>>>(z_cache_device.ptr, z_cache_float.ptr, z_cache_elements);
     CheckCuda(cudaGetLastError(), "HalfToFloatKernel z_cache");
 
-    const size_t c_cache_elements = static_cast<size_t>(time_steps + 1) * bh_elements;
+    const size_t h_cache_elements = static_cast<size_t>(time_steps + 1) * bh_elements;
+    CheckCuda(cudaMalloc(&h_cache_device.ptr, h_cache_elements * sizeof(__half)), "cudaMalloc h_cache_device");
+    CheckCuda(cudaMemcpyAsync(
+                  h_cache_device.ptr,
+                  h_cache_host,
+                  h_cache_elements * sizeof(__half),
+                  cudaMemcpyHostToDevice,
+                  stream),
+              "copy h_cache host->device");
+
+    const size_t c_cache_elements = h_cache_elements;
+    CheckCuda(cudaMalloc(&c_cache_device.ptr, c_cache_elements * sizeof(__half)), "cudaMalloc c_cache_device");
+    CheckCuda(cudaMemcpyAsync(
+                  c_cache_device.ptr,
+                  c_cache_host,
+                  c_cache_elements * sizeof(__half),
+                  cudaMemcpyHostToDevice,
+                  stream),
+              "copy c_cache host->device");
     CheckCuda(cudaMalloc(&c_cache_float.ptr, c_cache_elements * sizeof(float)), "cudaMalloc c_cache_float");
     const int c_cache_blocks = static_cast<int>((c_cache_elements + threads - 1) / threads);
-    HalfToFloatKernel<<<c_cache_blocks, threads, 0, stream>>>(c_cache_device, c_cache_float.ptr, c_cache_elements);
+    HalfToFloatKernel<<<c_cache_blocks, threads, 0, stream>>>(c_cache_device.ptr, c_cache_float.ptr, c_cache_elements);
     CheckCuda(cudaGetLastError(), "HalfToFloatKernel c_cache");
 
     const size_t gate_cache_elements = time_steps * batch_size * gate_dim;
+    CheckCuda(cudaMalloc(&gate_cache_device.ptr, gate_cache_elements * sizeof(__half)), "cudaMalloc gate_cache_device");
+    CheckCuda(cudaMemcpyAsync(
+                  gate_cache_device.ptr,
+                  gate_cache_host,
+                  gate_cache_elements * sizeof(__half),
+                  cudaMemcpyHostToDevice,
+                  stream),
+              "copy gate_cache host->device");
     CheckCuda(cudaMalloc(&gate_cache_float.ptr, gate_cache_elements * sizeof(float)), "cudaMalloc gate_cache_float");
     const int gate_cache_blocks = static_cast<int>((gate_cache_elements + threads - 1) / threads);
-    HalfToFloatKernel<<<gate_cache_blocks, threads, 0, stream>>>(gate_cache_device, gate_cache_float.ptr, gate_cache_elements);
+    HalfToFloatKernel<<<gate_cache_blocks, threads, 0, stream>>>(gate_cache_device.ptr, gate_cache_float.ptr, gate_cache_elements);
     CheckCuda(cudaGetLastError(), "HalfToFloatKernel gate_cache");
 
     CheckCuda(cudaMalloc(&dG_cache_col.ptr, gate_dim * total_tb * sizeof(float)), "cudaMalloc dG_cache");
@@ -563,10 +601,10 @@ extern "C" void flstm_StreamingLstmBackward(
     size_t input_size,
     size_t hidden_size,
 
-    const __half *z_cache_device,
-    const __half *h_cache_device,
-    const __half *c_cache_device,
-    const __half *gate_cache_device,
+    const __half *z_cache_host,
+    const __half *h_cache_host,
+    const __half *c_cache_host,
+    const __half *gate_cache_host,
 
     const __half *dY_tensor_host,
     const __half *d_hn_device,
@@ -591,10 +629,10 @@ extern "C" void flstm_StreamingLstmBackward(
             batch_size,
             input_size,
             hidden_size,
-            z_cache_device,
-            h_cache_device,
-            c_cache_device,
-            gate_cache_device,
+            z_cache_host,
+            h_cache_host,
+            c_cache_host,
+            gate_cache_host,
             dY_tensor_host,
             d_hn_device,
             d_cn_device,

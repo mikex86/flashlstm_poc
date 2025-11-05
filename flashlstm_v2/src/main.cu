@@ -80,10 +80,10 @@ int main() {
     float *bias_ih_device = CudaMallocDevice<float>(bias_ih_host.size(), "cudaMalloc bias_ih");
     float *bias_hh_device = CudaMallocDevice<float>(bias_hh_host.size(), "cudaMalloc bias_hh");
 
-    __half *z_cache_device = CudaMallocDevice<__half>(cache_z_elements, "cudaMalloc z_cache");
-    __half *h_cache_device = CudaMallocDevice<__half>(cache_state_elements, "cudaMalloc h_cache");
-    __half *c_cache_device = CudaMallocDevice<__half>(cache_state_elements, "cudaMalloc c_cache");
-    __half *gate_cache_device = CudaMallocDevice<__half>(gate_elements, "cudaMalloc gate_cache");
+    __half *z_cache_host = CudaMallocHost<__half>(cache_z_elements, "cudaMallocHost z_cache");
+    __half *h_cache_host = CudaMallocHost<__half>(cache_state_elements, "cudaMallocHost h_cache");
+    __half *c_cache_host = CudaMallocHost<__half>(cache_state_elements, "cudaMallocHost c_cache");
+    __half *gate_cache_host = CudaMallocHost<__half>(gate_elements, "cudaMallocHost gate_cache");
 
     CheckCuda(cudaMemcpy(h0_device, h0_host.data(), state_elements * sizeof(__half), cudaMemcpyHostToDevice),
               "memcpy h0");
@@ -118,10 +118,10 @@ int main() {
         bias_ih_device,
         bias_hh_device,
         y_host,
-        z_cache_device,
-        h_cache_device,
-        c_cache_device,
-        gate_cache_device,
+        z_cache_host,
+        h_cache_host,
+        c_cache_host,
+        gate_cache_host,
         compute_stream,
         h2d_stream,
         d2h_stream
@@ -161,10 +161,10 @@ int main() {
         batch_size,
         input_size,
         hidden_size,
-        z_cache_device,
-        h_cache_device,
-        c_cache_device,
-        gate_cache_device,
+        z_cache_host,
+        h_cache_host,
+        c_cache_host,
+        gate_cache_host,
         dY_host,
         dHN_device,
         dCN_device,
@@ -208,6 +208,10 @@ int main() {
     cudaFreeHost(dx_host);
     cudaFreeHost(dY_host);
     cudaFreeHost(y_host);
+    cudaFreeHost(gate_cache_host);
+    cudaFreeHost(c_cache_host);
+    cudaFreeHost(h_cache_host);
+    cudaFreeHost(z_cache_host);
     cudaFreeHost(x_host);
     cudaFree(dW_ih_device);
     cudaFree(dW_hh_device);
@@ -217,10 +221,6 @@ int main() {
     cudaFree(dc0_out_device);
     cudaFree(dCN_device);
     cudaFree(dHN_device);
-    cudaFree(gate_cache_device);
-    cudaFree(c_cache_device);
-    cudaFree(h_cache_device);
-    cudaFree(z_cache_device);
     cudaFree(bias_hh_device);
     cudaFree(bias_ih_device);
     cudaFree(weight_hh_device);

@@ -209,6 +209,38 @@ __global__ void ConvertDxToHalfKernel(
     dx_half[idx] = __float2half(value);
 }
 
+__global__ void ReconstructCellStatesKernel(
+    const float *gate_cache,   // (T, B, 4H) row-major
+    size_t time_steps,
+    size_t batch_size,
+    size_t hidden_size,
+    const float *c0,           // (B, H) row-major
+    float *c_cache             // (T+1, B, H) row-major
+) {
+    const size_t bh_elements = batch_size * hidden_size;
+    const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= bh_elements) {
+        return;
+    }
+
+    const size_t batch_idx = idx / hidden_size;
+    const size_t hidden_idx = idx % hidden_size;
+    const size_t gate_dim = 4 * hidden_size;
+
+    float c_prev = c0[idx];
+    c_cache[idx] = c_prev;
+
+    const size_t gate_base = batch_idx * gate_dim + hidden_idx;
+    for (size_t t = 0; t < time_steps; ++t) {
+        const float *gate_step = gate_cache + t * batch_size * gate_dim;
+        const float i_gate = gate_step[gate_base + 0 * hidden_size];
+        const float f_gate = gate_step[gate_base + 1 * hidden_size];
+        const float g_gate = gate_step[gate_base + 2 * hidden_size];
+        c_prev = f_gate * c_prev + i_gate * g_gate;
+        c_cache[(t + 1) * bh_elements + idx] = c_prev;
+    }
+}
+
 __global__ void FillOnesKernel(float *dst, size_t count) {
     const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < count) {
@@ -227,12 +259,12 @@ void StreamingLstmBackward(
     size_t hidden_size,
 
     const __half *z_cache_host,
-    const __half *c_cache_host,
     const __half *gate_cache_host,
 
     const __half *dY_tensor_host,
     const __half *d_hn_device,
     const __half *d_cn_device,
+    const __half *c0_device,
 
     const float *weights_ih,
     const float *weights_hh,
@@ -251,7 +283,7 @@ void StreamingLstmBackward(
     if (time_steps == 0 || batch_size == 0 || input_size == 0 || hidden_size == 0) {
         return;
     }
-    if (z_cache_host == nullptr || c_cache_host == nullptr || gate_cache_host == nullptr) {
+    if (z_cache_host == nullptr || gate_cache_host == nullptr || c0_device == nullptr) {
         throw std::runtime_error("StreamingLstmBackward requires forward caches");
     }
 
@@ -272,7 +304,7 @@ void StreamingLstmBackward(
     DeviceBuffer<__half> z_cache_device;
     DeviceBuffer<float> z_cache_float;
     DeviceBuffer<float> c_cache_float;
-    DeviceBuffer<__half> c_cache_device;
+    DeviceBuffer<float> c0_float;
     DeviceBuffer<float> gate_cache_float;
     DeviceBuffer<__half> gate_cache_device;
     DeviceBuffer<float> dG_cache_col;
@@ -338,22 +370,6 @@ void StreamingLstmBackward(
     HalfToFloatKernel<<<z_cache_blocks, threads, 0, stream>>>(z_cache_device.ptr, z_cache_float.ptr, z_cache_elements);
     CheckCuda(cudaGetLastError(), "HalfToFloatKernel z_cache");
 
-    const size_t state_cache_elements = static_cast<size_t>(time_steps + 1) * bh_elements;
-
-    const size_t c_cache_elements = state_cache_elements;
-    CheckCuda(cudaMalloc(&c_cache_device.ptr, c_cache_elements * sizeof(__half)), "cudaMalloc c_cache_device");
-    CheckCuda(cudaMemcpyAsync(
-                  c_cache_device.ptr,
-                  c_cache_host,
-                  c_cache_elements * sizeof(__half),
-                  cudaMemcpyHostToDevice,
-                  stream),
-              "copy c_cache host->device");
-    CheckCuda(cudaMalloc(&c_cache_float.ptr, c_cache_elements * sizeof(float)), "cudaMalloc c_cache_float");
-    const int c_cache_blocks = static_cast<int>((c_cache_elements + threads - 1) / threads);
-    HalfToFloatKernel<<<c_cache_blocks, threads, 0, stream>>>(c_cache_device.ptr, c_cache_float.ptr, c_cache_elements);
-    CheckCuda(cudaGetLastError(), "HalfToFloatKernel c_cache");
-
     const size_t gate_cache_elements = time_steps * batch_size * gate_dim;
     CheckCuda(cudaMalloc(&gate_cache_device.ptr, gate_cache_elements * sizeof(__half)), "cudaMalloc gate_cache_device");
     CheckCuda(cudaMemcpyAsync(
@@ -367,6 +383,22 @@ void StreamingLstmBackward(
     const int gate_cache_blocks = static_cast<int>((gate_cache_elements + threads - 1) / threads);
     HalfToFloatKernel<<<gate_cache_blocks, threads, 0, stream>>>(gate_cache_device.ptr, gate_cache_float.ptr, gate_cache_elements);
     CheckCuda(cudaGetLastError(), "HalfToFloatKernel gate_cache");
+
+    const size_t state_cache_elements = static_cast<size_t>(time_steps + 1) * bh_elements;
+    CheckCuda(cudaMalloc(&c0_float.ptr, bh_elements * sizeof(float)), "cudaMalloc c0_float");
+    HalfToFloatKernel<<<bh_blocks, threads, 0, stream>>>(c0_device, c0_float.ptr, bh_elements);
+    CheckCuda(cudaGetLastError(), "HalfToFloatKernel c0");
+    CheckCuda(cudaMalloc(&c_cache_float.ptr, state_cache_elements * sizeof(float)), "cudaMalloc c_cache_float");
+    const int reconstruct_blocks = static_cast<int>((bh_elements + threads - 1) / threads);
+    ReconstructCellStatesKernel<<<reconstruct_blocks, threads, 0, stream>>>(
+        gate_cache_float.ptr,
+        time_steps,
+        batch_size,
+        hidden_size,
+        c0_float.ptr,
+        c_cache_float.ptr
+    );
+    CheckCuda(cudaGetLastError(), "ReconstructCellStatesKernel");
 
     CheckCuda(cudaMalloc(&dG_cache_col.ptr, gate_dim * total_tb * sizeof(float)), "cudaMalloc dG_cache");
     CheckCuda(cudaMalloc(&weight_cat_col.ptr, z_rows * gate_dim * sizeof(float)), "cudaMalloc weight_cat_col");
@@ -591,12 +623,12 @@ extern "C" void flstm_StreamingLstmBackward(
     size_t hidden_size,
 
     const __half *z_cache_host,
-    const __half *c_cache_host,
     const __half *gate_cache_host,
 
     const __half *dY_tensor_host,
     const __half *d_hn_device,
     const __half *d_cn_device,
+    const __half *c0_device,
 
     const float *weights_ih,
     const float *weights_hh,
@@ -618,11 +650,11 @@ extern "C" void flstm_StreamingLstmBackward(
             input_size,
             hidden_size,
             z_cache_host,
-            c_cache_host,
             gate_cache_host,
             dY_tensor_host,
             d_hn_device,
             d_cn_device,
+            c0_device,
             weights_ih,
             weights_hh,
             dx_tensor_host,

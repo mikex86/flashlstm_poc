@@ -18,7 +18,6 @@ namespace flstm {
  * Outputs:
  *   - y_tensor_host:     (T, B, H) in pinned host memory (__half)
  *   - z_cache_host:      (I+H, T*B) column-major FP16 cache written to host
- *   - c_cache_host:      (T+1, B, H) row-major FP16 cache written to host
  *   - gate_cache_host:   (T, B, 4H) row-major FP16 cache written to host
  *   - compute_stream / h2d_stream / d2h_stream: distinct CUDA streams used for
  *         GEMMs, host→device transfers, and device→host transfers respectively.
@@ -42,7 +41,6 @@ void StreamingLstmForward(
     __half *y_tensor_host,
 
     __half *z_cache_host,
-    __half *c_cache_host,
     __half *gate_cache_host,
 
     cudaStream_t compute_stream,
@@ -55,10 +53,10 @@ void StreamingLstmForward(
  *
  * Inputs:
  *   - z_cache_host:     (I+H, T*B) column-major concatenated inputs (FP16)
- *   - c_cache_host:     (T+1, B, H) row-major cell states (including t=0, FP16)
  *   - gate_cache_host:  (T, B, 4H) row-major gate activations (FP16)
  *   - dY_tensor_host:   upstream grads w.r.t outputs in host half precision
  *   - d_hn_device / d_cn_device: grads for final states (nullable)
+ *   - c0_device:        initial cell state provided in half precision (B, H)
  *   - weights_ih / weights_hh: forward weights (FP32) reused for GEMMs
  *
  * Outputs:
@@ -73,12 +71,12 @@ void StreamingLstmBackward(
     size_t hidden_size,
 
     const __half *z_cache_host,
-    const __half *c_cache_host,
     const __half *gate_cache_host,
 
     const __half *dY_tensor_host,
     const __half *d_hn_device,
     const __half *d_cn_device,
+    const __half *c0_device,
 
     const float *weights_ih,
     const float *weights_hh,
@@ -116,7 +114,6 @@ void flstm_StreamingLstmForward(
     __half *y_tensor_host,
 
     __half *z_cache_host,
-    __half *c_cache_host,
     __half *gate_cache_host,
 
     cudaStream_t compute_stream,
@@ -131,12 +128,12 @@ void flstm_StreamingLstmBackward(
     size_t hidden_size,
 
     const __half *z_cache_host,
-    const __half *c_cache_host,
     const __half *gate_cache_host,
 
     const __half *dY_tensor_host,
     const __half *d_hn_device,
     const __half *d_cn_device,
+    const __half *c0_device,
 
     const float *weights_ih,
     const float *weights_hh,

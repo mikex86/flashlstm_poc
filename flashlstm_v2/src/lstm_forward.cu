@@ -233,19 +233,6 @@ __global__ void SeedHiddenColumnKernel(
     z_cache_col[input_size + hidden_idx + batch_idx * z_rows] = __float2half(value);
 }
 
-__global__ void StoreInitialStateKernel(
-    const float *state,
-    __half *cache,
-    size_t batch_size,
-    size_t hidden_size
-) {
-    const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= batch_size * hidden_size) {
-        return;
-    }
-    cache[idx] = __float2half(state[idx]);
-}
-
 __global__ void ForwardPointwiseKernel(
     const float *gate_col,         // (4H, B) column-major
     const float *bias,             // (4H,)
@@ -336,7 +323,6 @@ void StreamingLstmForward(
     __half *y_tensor_host,
 
     __half *z_cache_host,
-    __half *c_cache_host,
     __half *gate_cache_host,
 
     cudaStream_t compute_stream,
@@ -356,7 +342,6 @@ void StreamingLstmForward(
     const size_t bh_elements = batch_size * hidden_size;
     const size_t total_tb = time_steps * batch_size;
     const size_t z_cache_elements = z_rows * total_tb;
-    const size_t state_cache_elements = (time_steps + 1) * bh_elements;
     const size_t gate_cache_elements = time_steps * batch_size * gate_dim;
     const size_t x_step_bytes = batch_size * input_size * sizeof(__half);
     const size_t y_step_bytes = bh_elements * sizeof(__half);
@@ -365,7 +350,6 @@ void StreamingLstmForward(
     const size_t chunk_input_capacity = chunk_capacity * batch_size * input_size;
     const size_t chunk_output_capacity = chunk_capacity * bh_elements;
     const bool store_z_cache = (z_cache_host != nullptr);
-    const bool store_c_cache = (c_cache_host != nullptr);
     const bool store_gate_cache = (gate_cache_host != nullptr);
     const bool needs_y_fallback = (y_tensor_host != nullptr);
 
@@ -375,7 +359,6 @@ void StreamingLstmForward(
     HostRegistration x_host_registration;
     HostRegistration y_host_registration;
     HostRegistration z_host_registration;
-    HostRegistration c_host_registration;
     HostRegistration gate_host_registration;
 
     x_host_registration.reset(
@@ -397,13 +380,6 @@ void StreamingLstmForward(
             "cudaHostRegister z_cache_host"
         );
     }
-    if (store_c_cache) {
-        c_host_registration.reset(
-            c_cache_host,
-            state_cache_elements * sizeof(__half),
-            "cudaHostRegister c_cache_host"
-        );
-    }
     if (store_gate_cache) {
         gate_host_registration.reset(
             gate_cache_host,
@@ -415,13 +391,6 @@ void StreamingLstmForward(
     DeviceBuffer<__half> z_cache_device_buffer;
     CheckCuda(cudaMalloc(&z_cache_device_buffer.ptr, z_cache_elements * sizeof(__half)), "cudaMalloc z_cache");
     __half *z_cache_device = z_cache_device_buffer.ptr;
-
-    DeviceBuffer<__half> c_cache_device_buffer;
-    if (store_c_cache) {
-        CheckCuda(cudaMalloc(&c_cache_device_buffer.ptr, state_cache_elements * sizeof(__half)),
-                  "cudaMalloc c_cache");
-    }
-    __half *c_cache_device = c_cache_device_buffer.ptr;
 
     DeviceBuffer<__half> gate_cache_device_buffer;
     if (store_gate_cache) {
@@ -483,23 +452,6 @@ void StreamingLstmForward(
     const int bias_blocks = static_cast<int>((gate_dim + threads - 1) / threads);
     FuseBiasKernel<<<bias_blocks, threads, 0, compute_stream>>>(bias_ih, bias_hh, bias_fused.ptr, hidden_size);
     CheckCuda(cudaGetLastError(), "FuseBiasKernel");
-
-    if (c_cache_device != nullptr) {
-        StoreInitialStateKernel<<<bh_blocks, threads, 0, compute_stream>>>(
-            c_prev.ptr,
-            c_cache_device,
-            batch_size,
-            hidden_size
-        );
-        CheckCuda(cudaGetLastError(), "StoreInitialStateKernel c_cache");
-        CheckCuda(cudaMemcpyAsync(
-                      c_cache_host,
-                      c_cache_device,
-                      bh_elements * sizeof(__half),
-                      cudaMemcpyDeviceToHost,
-                      compute_stream),
-                  "copy c0 cache -> host");
-    }
 
     const int seed_blocks = static_cast<int>((bh_elements + threads - 1) / threads);
     SeedHiddenColumnKernel<<<seed_blocks, threads, 0, compute_stream>>>(
@@ -656,7 +608,7 @@ void StreamingLstmForward(
                 y_step,
                 gate_cache_step,
                 nullptr,
-                c_cache_device,
+                nullptr,
                 z_cache_device,
                 z_rows,
                 input_size,
@@ -703,21 +655,6 @@ void StreamingLstmForward(
                               cudaMemcpyDeviceToHost,
                               d2h_stream),
                           "copy z cache chunk");
-            }
-        }
-        if (store_c_cache) {
-            const size_t elements = steps_in_chunk * bh_elements;
-            if (elements > 0) {
-                const size_t offset = (chunk_start_step + 1) * bh_elements;
-                __half *dst = c_cache_host + offset;
-                const __half *src = c_cache_device + offset;
-                CheckCuda(cudaMemcpyAsync(
-                              dst,
-                              src,
-                              elements * sizeof(__half),
-                              cudaMemcpyDeviceToHost,
-                              d2h_stream),
-                          "copy c cache chunk");
             }
         }
         if (store_gate_cache) {
@@ -788,7 +725,6 @@ extern "C" void flstm_StreamingLstmForward(
     __half *y_tensor_host,
 
     __half *z_cache_host,
-    __half *c_cache_host,
     __half *gate_cache_host,
 
     cudaStream_t compute_stream,
@@ -810,7 +746,6 @@ extern "C" void flstm_StreamingLstmForward(
             bias_hh,
             y_tensor_host,
             z_cache_host,
-            c_cache_host,
             gate_cache_host,
             compute_stream,
             h2d_stream,

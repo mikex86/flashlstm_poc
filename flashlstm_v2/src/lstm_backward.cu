@@ -220,36 +220,6 @@ namespace {
         dc_prev_row[idx] = dc_prev;
     }
 
-    __global__ void ColumnToRowKernel(
-        const float *src_col, // (rows, cols) column-major
-        float *dst_row, // (rows, cols) row-major
-        const size_t rows,
-        const size_t cols
-    ) {
-        const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-        if (idx >= rows * cols) {
-            return;
-        }
-        const size_t col = idx / rows;
-        const size_t row = idx % rows;
-        dst_row[row * cols + col] = src_col[row + col * rows];
-    }
-
-    __global__ void TransposeKernel(
-        const float *src_row, // (rows, cols) row-major
-        float *dst_row, // (cols, rows) row-major
-        const size_t rows,
-        const size_t cols
-    ) {
-        const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-        if (idx >= rows * cols) {
-            return;
-        }
-        const size_t row = idx / cols;
-        const size_t col = idx % cols;
-        dst_row[col * rows + row] = src_row[row * cols + col];
-    }
-
     __global__ void ConvertDxChunkToHalfKernel(
         const float *dx_col, // (I, chunk_tb) column-major
         __half *dx_half, // (chunk_steps, B, I) row-major
@@ -499,9 +469,7 @@ namespace flstm {
         DeviceBuffer<float> dc_cur;
         DeviceBuffer<float> dc_tmp;
         DeviceBuffer<float> h0_float;
-        DeviceBuffer<float> weight_cat_col;
-        DeviceBuffer<float> dWcat_col;
-        DeviceBuffer<float> dWcat_row;
+    DeviceBuffer<float> weight_cat_col;
         DeviceBuffer<float> db_buffer;
         DeviceBuffer<float> ones_vec;
 
@@ -558,10 +526,6 @@ namespace flstm {
         );
         CheckCuda(cudaGetLastError(), "FuseWeightsKernel");
 
-        AllocateDeviceBuffer(dWcat_col, weight_elems, "cudaMalloc dWcat_col");
-        ZeroDeviceMemory(dWcat_col.ptr, weight_elems, compute_stream, "memset dWcat_col");
-        AllocateDeviceBuffer(dWcat_row, weight_elems, "cudaMalloc dWcat_row");
-
         AllocateDeviceBuffer(db_buffer, gate_dim, "cudaMalloc db_buffer");
         ZeroDeviceMemory(db_buffer.ptr, gate_dim, compute_stream, "memset db buffer");
 
@@ -604,11 +568,14 @@ namespace flstm {
         AllocateDeviceBufferArray(dY_chunk_half, chunk_hidden_capacity, "cudaMalloc dY_chunk_half");
         AllocateDeviceBufferArray(dY_chunk_float, chunk_hidden_capacity, "cudaMalloc dY_chunk_float");
         AllocateDeviceBufferArray(y_chunk_float, chunk_hidden_capacity, "cudaMalloc y_chunk_float");
-        AllocateDeviceBufferArray(dG_chunk_col, dG_chunk_elements, "cudaMalloc dG_chunk_col");
-        AllocateDeviceBufferArray(y_prev_half, bh_elements, "cudaMalloc y_prev_half");
-        AllocateDeviceBufferArray(h_prev_boundary_float, bh_elements, "cudaMalloc h_prev_boundary_float");
+    AllocateDeviceBufferArray(dG_chunk_col, dG_chunk_elements, "cudaMalloc dG_chunk_col");
+    AllocateDeviceBufferArray(y_prev_half, bh_elements, "cudaMalloc y_prev_half");
+    AllocateDeviceBufferArray(h_prev_boundary_float, bh_elements, "cudaMalloc h_prev_boundary_float");
 
-        CublasHandle cublas;
+    ZeroDeviceMemory(dW_ih, static_cast<size_t>(gate_dim) * input_size, compute_stream, "memset dW_ih");
+    ZeroDeviceMemory(dW_hh, static_cast<size_t>(gate_dim) * hidden_size, compute_stream, "memset dW_hh");
+
+    CublasHandle cublas;
         CheckCublas(cublasCreate(&cublas.handle), "cublasCreate");
         CheckCublas(cublasSetStream(cublas.handle, compute_stream), "cublasSetStream");
         const float alpha = 1.0f;
@@ -810,26 +777,47 @@ namespace flstm {
 
             bool issued_dx_copy = false;
             size_t dx_chunk_elems = 0;
-            const int zgemm_m = static_cast<int>(z_rows);
-            const int zgemm_n = static_cast<int>(gate_dim);
             const int zgemm_k = static_cast<int>(chunk_tb);
             if (zgemm_k > 0) {
+                const float *z_chunk_base = z_chunk_col[slot].ptr;
+                const float *x_chunk_matrix = z_chunk_base;
+                const float *h_chunk_matrix = z_chunk_base + input_size;
+
                 CheckCublas(cublasSgemm(
                                 cublas.handle,
                                 CUBLAS_OP_N,
                                 CUBLAS_OP_T,
-                                zgemm_m,
-                                zgemm_n,
+                                static_cast<int>(input_size),
+                                static_cast<int>(gate_dim),
                                 zgemm_k,
                                 &alpha,
-                                z_chunk_col[slot].ptr,
+                                x_chunk_matrix,
                                 static_cast<int>(z_rows),
                                 dG_chunk_col[slot].ptr,
                                 static_cast<int>(gate_dim),
                                 &beta_one,
-                                dWcat_col.ptr,
-                                static_cast<int>(z_rows)),
-                            "cublasSgemm dWcat chunk");
+                                dW_ih,
+                                static_cast<int>(input_size)),
+                            "cublasSgemm dW_ih chunk");
+
+                if (hidden_size > 0) {
+                    CheckCublas(cublasSgemm(
+                                    cublas.handle,
+                                    CUBLAS_OP_N,
+                                    CUBLAS_OP_T,
+                                    static_cast<int>(hidden_size),
+                                    static_cast<int>(gate_dim),
+                                    zgemm_k,
+                                    &alpha,
+                                    h_chunk_matrix,
+                                    static_cast<int>(z_rows),
+                                    dG_chunk_col[slot].ptr,
+                                    static_cast<int>(gate_dim),
+                                    &beta_one,
+                                    dW_hh,
+                                    static_cast<int>(hidden_size)),
+                                "cublasSgemm dW_hh chunk");
+                }
 
                 CheckCublas(cublasSgemv(
                                 cublas.handle,
@@ -906,40 +894,6 @@ namespace flstm {
 
         CheckCuda(cudaStreamSynchronize(h2d_stream), "final h2d sync");
         CheckCuda(cudaStreamSynchronize(d2h_stream), "final d2h sync");
-
-        if (weight_elems > 0) {
-            const int col_to_row_blocks = BlocksFor(weight_elems, threads);
-            ColumnToRowKernel<<<col_to_row_blocks, threads, 0, compute_stream>>>(
-                dWcat_col.ptr,
-                dWcat_row.ptr,
-                z_rows,
-                gate_dim
-            );
-            CheckCuda(cudaGetLastError(), "ColumnToRowKernel dWcat");
-
-            const float *dW_ih_src = dWcat_row.ptr;
-            const float *dW_hh_src = dWcat_row.ptr + input_size * gate_dim;
-            const size_t dW_ih_elems = static_cast<size_t>(input_size) * gate_dim;
-            const size_t dW_hh_elems = static_cast<size_t>(hidden_size) * gate_dim;
-            const int dW_ih_blocks = BlocksFor(dW_ih_elems, threads);
-            const int dW_hh_blocks = BlocksFor(dW_hh_elems, threads);
-
-            TransposeKernel<<<dW_ih_blocks, threads, 0, compute_stream>>>(
-                dW_ih_src,
-                dW_ih,
-                input_size,
-                gate_dim
-            );
-            CheckCuda(cudaGetLastError(), "TransposeKernel dW_ih");
-
-            TransposeKernel<<<dW_hh_blocks, threads, 0, compute_stream>>>(
-                dW_hh_src,
-                dW_hh,
-                hidden_size,
-                gate_dim
-            );
-            CheckCuda(cudaGetLastError(), "TransposeKernel dW_hh");
-        }
 
         CheckCuda(cudaMemcpyAsync(
                       db_ih,

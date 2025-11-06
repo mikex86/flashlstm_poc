@@ -1,9 +1,11 @@
 #include "lstm.hpp"
+#include "cudnn_reference.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime_api.h>
 
 #include <algorithm>
+#include <cstdint>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -18,6 +20,7 @@ void CheckCuda(cudaError_t status, const char *what) {
         std::abort();
     }
 }
+
 
 template<typename T>
 T *CudaMallocDevice(size_t count, const char *what) {
@@ -53,9 +56,12 @@ int main() {
 
     __half *x_host = CudaMallocHost<__half>(x_elements, "cudaMallocHost x_host");
     __half *y_host = CudaMallocHost<__half>(y_elements, "cudaMallocHost y_host");
+    std::vector<float> x_host_float(x_elements);
     constexpr float kInputStd = 0.01f;
     for (size_t i = 0; i < x_elements; ++i) {
-        x_host[i] = __float2half(kInputStd * sample_normal());
+        const float value = kInputStd * sample_normal();
+        x_host[i] = __float2half(value);
+        x_host_float[i] = value;
     }
 
     std::vector<float> weight_ih_host(gate_dim * input_size);
@@ -69,6 +75,8 @@ int main() {
 
     std::vector<__half> h0_host(state_elements, __float2half(0.0f));
     std::vector<__half> c0_host(state_elements, __float2half(0.0f));
+    std::vector<float> h0_host_float(state_elements, 0.0f);
+    std::vector<float> c0_host_float(state_elements, 0.0f);
 
     __half *h0_device = CudaMallocDevice<__half>(state_elements, "cudaMalloc h0_device");
     __half *c0_device = CudaMallocDevice<__half>(state_elements, "cudaMalloc c0_device");
@@ -98,6 +106,26 @@ int main() {
     CheckCuda(cudaStreamCreate(&compute_stream), "cudaStreamCreate compute");
     CheckCuda(cudaStreamCreate(&h2d_stream), "cudaStreamCreate h2d");
     CheckCuda(cudaStreamCreate(&d2h_stream), "cudaStreamCreate d2h");
+
+    flstm_StreamingLstmForward(
+        time_steps,
+        batch_size,
+        input_size,
+        hidden_size,
+        x_host,
+        h0_device,
+        c0_device,
+        weight_ih_device,
+        weight_hh_device,
+        bias_ih_device,
+        bias_hh_device,
+        y_host,
+        gate_cache_host,
+        compute_stream,
+        h2d_stream,
+        d2h_stream
+    );
+    CheckCuda(cudaDeviceSynchronize(), "forward warmup synchronize");
 
     flstm_StreamingLstmForward(
         time_steps,
@@ -173,7 +201,127 @@ int main() {
         h2d_stream,
         d2h_stream
     );
+    CheckCuda(cudaDeviceSynchronize(), "backward warmup synchronize");
+
+    flstm_StreamingLstmBackward(
+        time_steps,
+        batch_size,
+        input_size,
+        hidden_size,
+        x_host,
+        y_host,
+        gate_cache_host,
+        dY_host,
+        dHN_device,
+        dCN_device,
+        h0_device,
+        c0_device,
+        weight_ih_device,
+        weight_hh_device,
+        dx_host,
+        dW_ih_device,
+        dW_hh_device,
+        db_ih_device,
+        db_hh_device,
+        dh0_out_device,
+        dc0_out_device,
+        compute_stream,
+        h2d_stream,
+        d2h_stream
+    );
     CheckCuda(cudaDeviceSynchronize(), "backward synchronize");
+
+    CudnnForwardComparisonResult cudnn_forward_result = RunCudnnForwardComparison(
+        time_steps,
+        batch_size,
+        input_size,
+        hidden_size,
+        x_host_float.data(),
+        weight_ih_host.data(),
+        weight_hh_host.data(),
+        bias_ih_host.data(),
+        bias_hh_host.data(),
+        h0_host_float.data(),
+        c0_host_float.data(),
+        y_host,
+        gate_cache_host
+    );
+
+    const float cudnn_forward_tol = 5e-2f;
+    if (cudnn_forward_result.max_y_delta > cudnn_forward_tol ||
+        cudnn_forward_result.max_h_delta > cudnn_forward_tol ||
+        cudnn_forward_result.max_c_delta > cudnn_forward_tol) {
+        std::fprintf(stderr,
+                     "cuDNN comparison failed: max|Δy|=%g, max|Δh|=%g, max|Δc|=%g (tol=%g)\n",
+                     cudnn_forward_result.max_y_delta,
+                     cudnn_forward_result.max_h_delta,
+                     cudnn_forward_result.max_c_delta,
+                     cudnn_forward_tol);
+        return EXIT_FAILURE;
+    }
+
+    std::printf("cuDNN reference: max|Δy|=%g, max|Δh|=%g, max|Δc|=%g\n",
+                cudnn_forward_result.max_y_delta,
+                cudnn_forward_result.max_h_delta,
+                cudnn_forward_result.max_c_delta);
+
+    CudnnBackwardComparisonResult cudnn_backward_result = RunCudnnBackwardComparison(
+        time_steps,
+        batch_size,
+        input_size,
+        hidden_size,
+        x_host_float.data(),
+        weight_ih_host.data(),
+        weight_hh_host.data(),
+        bias_ih_host.data(),
+        bias_hh_host.data(),
+        h0_host_float.data(),
+        c0_host_float.data(),
+        y_host,
+        gate_cache_host,
+        dY_host,
+        dHN_host,
+        dCN_host,
+        dx_host,
+        dW_ih_device,
+        dW_hh_device,
+        db_ih_device,
+        db_hh_device,
+        dh0_out_device,
+        dc0_out_device
+    );
+
+    const float cudnn_backward_tol = 5e-2f;
+    if (cudnn_backward_result.max_dx_delta > cudnn_backward_tol ||
+        cudnn_backward_result.max_dh0_delta > cudnn_backward_tol ||
+        cudnn_backward_result.max_dc0_delta > cudnn_backward_tol ||
+        cudnn_backward_result.max_dW_ih_delta > cudnn_backward_tol ||
+        cudnn_backward_result.max_dW_hh_delta > cudnn_backward_tol ||
+        cudnn_backward_result.max_db_ih_delta > cudnn_backward_tol ||
+        cudnn_backward_result.max_db_hh_delta > cudnn_backward_tol) {
+        std::fprintf(stderr,
+                     "cuDNN backward comparison failed: max|Δdx|=%g, max|Δdh0|=%g, max|Δdc0|=%g, "
+                     "max|ΔdWih|=%g, max|ΔdWhh|=%g, max|Δdbih|=%g, max|Δdbhh|=%g (tol=%g)\n",
+                     cudnn_backward_result.max_dx_delta,
+                     cudnn_backward_result.max_dh0_delta,
+                     cudnn_backward_result.max_dc0_delta,
+                     cudnn_backward_result.max_dW_ih_delta,
+                     cudnn_backward_result.max_dW_hh_delta,
+                     cudnn_backward_result.max_db_ih_delta,
+                     cudnn_backward_result.max_db_hh_delta,
+                     cudnn_backward_tol);
+        return EXIT_FAILURE;
+    }
+
+    std::printf("cuDNN backward reference: max|Δdx|=%g, max|Δdh0|=%g, max|Δdc0|=%g, max|ΔdWih|=%g, "
+                "max|ΔdWhh|=%g, max|Δdbih|=%g, max|Δdbhh|=%g\n",
+                cudnn_backward_result.max_dx_delta,
+                cudnn_backward_result.max_dh0_delta,
+                cudnn_backward_result.max_dc0_delta,
+                cudnn_backward_result.max_dW_ih_delta,
+                cudnn_backward_result.max_dW_hh_delta,
+                cudnn_backward_result.max_db_ih_delta,
+                cudnn_backward_result.max_db_hh_delta);
 
     size_t nan_count = 0;
     size_t inf_count = 0;

@@ -741,7 +741,6 @@ void StreamingLstmForward(
 
 } // namespace flstm
 
-
 extern "C" void flstm_StreamingLstmForward(
     size_t time_steps,
     size_t batch_size,

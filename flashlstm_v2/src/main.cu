@@ -84,6 +84,8 @@ int main() {
     float *weight_hh_device = CudaMallocDevice<float>(weight_hh_host.size(), "cudaMalloc weight_hh");
     float *bias_ih_device = CudaMallocDevice<float>(bias_ih_host.size(), "cudaMalloc bias_ih");
     float *bias_hh_device = CudaMallocDevice<float>(bias_hh_host.size(), "cudaMalloc bias_hh");
+    __half *hy_device_out = CudaMallocDevice<__half>(state_elements, "cudaMalloc hy_device");
+    __half *cy_device_out = CudaMallocDevice<__half>(state_elements, "cudaMalloc cy_device");
 
     __half *gate_cache_host = CudaMallocHost<__half>(gate_elements, "cudaMallocHost gate_cache");
 
@@ -121,6 +123,8 @@ int main() {
         bias_hh_device,
         y_host,
         gate_cache_host,
+        hy_device_out,
+        cy_device_out,
         compute_stream,
         h2d_stream,
         d2h_stream
@@ -141,6 +145,8 @@ int main() {
         bias_hh_device,
         y_host,
         gate_cache_host,
+        hy_device_out,
+        cy_device_out,
         compute_stream,
         h2d_stream,
         d2h_stream
@@ -356,6 +362,8 @@ int main() {
     cudaFree(dW_hh_device);
     cudaFree(db_ih_device);
     cudaFree(db_hh_device);
+    cudaFree(hy_device_out);
+    cudaFree(cy_device_out);
     cudaFree(dh0_out_device);
     cudaFree(dc0_out_device);
     cudaFree(dCN_device);

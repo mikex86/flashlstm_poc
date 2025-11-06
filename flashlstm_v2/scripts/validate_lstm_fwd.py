@@ -60,6 +60,8 @@ def _prepare_function(lib: ctypes.CDLL) -> None:
         ctypes.c_void_p,  # bias_hh
         ctypes.c_void_p,  # y host
         ctypes.c_void_p,  # gate cache host
+        ctypes.c_void_p,  # hy device
+        ctypes.c_void_p,  # cy device
         ctypes.c_void_p,  # compute stream
         ctypes.c_void_p,  # h2d stream
         ctypes.c_void_p,  # d2h stream
@@ -130,6 +132,8 @@ def _run_case(lib: ctypes.CDLL, cfg: LstmConfig):
 
     gate_cache = torch.empty(cfg.time_steps, cfg.batch_size, 4 * cfg.hidden_size,
                              dtype=torch.float16).contiguous().pin_memory()
+    hy_device = torch.empty(cfg.batch_size, cfg.hidden_size, dtype=torch.float16, device=device).contiguous()
+    cy_device = torch.empty(cfg.batch_size, cfg.hidden_size, dtype=torch.float16, device=device).contiguous()
 
     compute_stream = torch.cuda.Stream()
     h2d_stream = torch.cuda.Stream()
@@ -156,7 +160,9 @@ def _run_case(lib: ctypes.CDLL, cfg: LstmConfig):
         _as_void_p(bias_hh),
         _as_void_p(y_host),
         _as_void_p(gate_cache),
-        ctypes.c_void_p(0),
+        _as_void_p(hy_device),
+        _as_void_p(cy_device),
+        ctypes.c_void_p(compute_stream.cuda_stream),
         ctypes.c_void_p(h2d_stream.cuda_stream),
         ctypes.c_void_p(d2h_stream.cuda_stream),
     )
@@ -177,8 +183,8 @@ def _run_case(lib: ctypes.CDLL, cfg: LstmConfig):
     c_states_custom = torch.cat(c_states_list, dim=0)
     h_states_ref_cpu = h_states_ref.cpu()
     c_states_ref_cpu = c_states_ref.cpu()
-    h_custom = h_states_custom[-1].cpu()
-    c_custom = c_states_custom[-1].cpu()
+    h_custom = hy_device.to(dtype=torch.float32).cpu()
+    c_custom = cy_device.to(dtype=torch.float32).cpu()
     h_ref = h_n_ref.squeeze(0).cpu()
     c_ref = c_n_ref.squeeze(0).cpu()
 

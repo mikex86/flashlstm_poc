@@ -408,6 +408,8 @@ void StreamingLstmForward(
     __half *y_tensor_host,
 
     __half *gate_cache_host,
+    __half *hy_device,
+    __half *cy_device,
 
     cudaStream_t compute_stream,
     cudaStream_t h2d_stream,
@@ -734,6 +736,26 @@ void StreamingLstmForward(
         ++chunk_idx;
     }
 
+    if (hy_device != nullptr) {
+        const int hy_blocks = BlocksFor(bh_elements, threads);
+        FloatToHalfKernel<<<hy_blocks, threads, 0, compute_stream>>>(
+            h_prev.ptr,
+            hy_device,
+            bh_elements
+        );
+        CheckCuda(cudaGetLastError(), "FloatToHalfKernel hy");
+    }
+
+    if (cy_device != nullptr) {
+        const int cy_blocks = BlocksFor(bh_elements, threads);
+        FloatToHalfKernel<<<cy_blocks, threads, 0, compute_stream>>>(
+            c_prev.ptr,
+            cy_device,
+            bh_elements
+        );
+        CheckCuda(cudaGetLastError(), "FloatToHalfKernel cy");
+    }
+
     CheckCuda(cudaStreamSynchronize(h2d_stream), "final h2d transfer sync");
     CheckCuda(cudaStreamSynchronize(d2h_stream), "final d2h transfer sync");
     CheckCuda(cudaStreamSynchronize(compute_stream), "final compute sync");
@@ -759,6 +781,8 @@ extern "C" void flstm_StreamingLstmForward(
     __half *y_tensor_host,
 
     __half *gate_cache_host,
+    __half *hy_device,
+    __half *cy_device,
 
     const cudaStream_t compute_stream,
     const cudaStream_t h2d_stream,
@@ -779,6 +803,8 @@ extern "C" void flstm_StreamingLstmForward(
             bias_hh,
             y_tensor_host,
             gate_cache_host,
+            hy_device,
+            cy_device,
             compute_stream,
             h2d_stream,
             d2h_stream

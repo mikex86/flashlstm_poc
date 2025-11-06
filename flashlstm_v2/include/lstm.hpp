@@ -40,6 +40,8 @@ void StreamingLstmForward(
     __half *y_tensor_host,
 
     __half *gate_cache_host,
+    __half *hy_device,
+    __half *cy_device,
 
     cudaStream_t compute_stream,
     cudaStream_t h2d_stream,
@@ -120,6 +122,8 @@ void flstm_StreamingLstmForward(
     __half *y_tensor_host,
 
     __half *gate_cache_host,
+    __half *hy_device,
+    __half *cy_device,
 
     cudaStream_t compute_stream,
     cudaStream_t h2d_stream,

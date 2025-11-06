@@ -28,13 +28,15 @@ PyObject *StreamingLstmForward(PyObject *, PyObject *args) {
     unsigned long long bias_hh{};
     unsigned long long y_tensor_host{};
     unsigned long long gate_cache_host{};
+    unsigned long long hy_device{};
+    unsigned long long cy_device{};
     unsigned long long compute_stream{};
     unsigned long long h2d_stream{};
     unsigned long long d2h_stream{};
 
     if (!PyArg_ParseTuple(
             args,
-            "KKKKKKKKKKKKKKKK",
+            "KKKKKKKKKKKKKKKKKK",
             &time_steps,
             &batch_size,
             &input_size,
@@ -48,6 +50,8 @@ PyObject *StreamingLstmForward(PyObject *, PyObject *args) {
             &bias_hh,
             &y_tensor_host,
             &gate_cache_host,
+            &hy_device,
+            &cy_device,
             &compute_stream,
             &h2d_stream,
             &d2h_stream)) {
@@ -69,6 +73,8 @@ PyObject *StreamingLstmForward(PyObject *, PyObject *args) {
         PtrFromUnsigned<const float *>(bias_hh),
         PtrFromUnsigned<__half *>(y_tensor_host),
         PtrFromUnsigned<__half *>(gate_cache_host),
+        PtrFromUnsigned<__half *>(hy_device),
+        PtrFromUnsigned<__half *>(cy_device),
         PtrFromUnsigned<cudaStream_t>(compute_stream),
         PtrFromUnsigned<cudaStream_t>(h2d_stream),
         PtrFromUnsigned<cudaStream_t>(d2h_stream)

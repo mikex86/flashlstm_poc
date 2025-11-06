@@ -1,8 +1,27 @@
+[build-system]
+requires = ["scikit-build-core>=0.4", "setuptools>=65", "wheel"]
+build-backend = "scikit_build_core.build"
+
 [project]
-name = "flashlstm-v2"
+name = "flashlstm"
 version = "0.1.0"
-description = "Add your description here"
-requires-python = ">=3.11"
-dependencies = [
-    "torch>=2.9.0",
+description = "Flash-optimized streaming LSTM kernels with CUDA/pybindings."
+readme = "README.md"
+requires-python = ">=3.8"
+authors = [{name = "FlashLSTM Developers"}]
+license = {text = "Proprietary"}
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: C++",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Operating System :: POSIX :: Linux",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
+
+[tool.scikit-build]
+cmake.minimum-version = "3.18"
+cmake.build-type = "Release"
+build-dir = "build"
+
+[tool.scikit-build.packages.find]
+where = ["python"]

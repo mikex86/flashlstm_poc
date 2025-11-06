@@ -742,10 +742,10 @@ void StreamingLstmForward(
 } // namespace flstm
 
 extern "C" void flstm_StreamingLstmForward(
-    size_t time_steps,
-    size_t batch_size,
-    size_t input_size,
-    size_t hidden_size,
+    const size_t time_steps,
+    const size_t batch_size,
+    const size_t input_size,
+    const size_t hidden_size,
 
     const __half *x_tensor_host,
     const __half *h0_device,
@@ -760,9 +760,9 @@ extern "C" void flstm_StreamingLstmForward(
 
     __half *gate_cache_host,
 
-    cudaStream_t compute_stream,
-    cudaStream_t h2d_stream,
-    cudaStream_t d2h_stream
+    const cudaStream_t compute_stream,
+    const cudaStream_t h2d_stream,
+    const cudaStream_t d2h_stream
 ) {
     try {
         flstm::StreamingLstmForward(

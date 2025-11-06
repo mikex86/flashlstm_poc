@@ -495,11 +495,6 @@ void StreamingLstmForward(
                       "wait compute_done before reuse");
             compute_done_valid[slot] = false;
         }
-        if (needs_y_fallback && y_copy_inflight[slot]) {
-            CheckCuda(cudaStreamWaitEvent(h2d_stream, y_copy_done[slot].evt, 0),
-                      "wait y_copy_done before reuse");
-            y_copy_inflight[slot] = false;
-        }
         const size_t remaining = time_steps - chunk_start;
         const size_t steps = std::min(chunk_capacity, remaining);
         const size_t bytes = steps * batch_size * input_size * sizeof(__half);

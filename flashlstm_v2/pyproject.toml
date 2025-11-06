@@ -19,9 +19,9 @@ classifiers = [
 ]
 
 [tool.scikit-build]
-cmake.minimum-version = "3.18"
+cmake.version = ">=3.18"
 cmake.build-type = "Release"
 build-dir = "build"
 
-[tool.scikit-build.packages.find]
-where = ["python"]
+[tool.scikit-build.wheel]
+packages = ["python/flashlstm"]

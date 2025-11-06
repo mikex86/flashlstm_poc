@@ -42,6 +42,11 @@ inline void CheckCublas(cublasStatus_t status, const char *what) {
     }
 }
 
+// Helper for consistent 1D launch configuration.
+inline int BlocksFor(size_t count, int threads = 256) {
+    return static_cast<int>((count + threads - 1) / threads);
+}
+
 bool RegisterHostMemoryOrThrow(const void *ptr, size_t bytes, const char *what) {
     if (ptr == nullptr || bytes == 0) {
         return false;
@@ -86,6 +91,33 @@ struct DeviceBuffer {
         }
     }
 };
+
+// Utility to allocate device memory while keeping the RAII wrapper simple.
+template<typename T>
+void AllocateDeviceBuffer(DeviceBuffer<T> &buffer, size_t elements, const char *what) {
+    if (elements == 0) {
+        buffer.ptr = nullptr;
+        return;
+    }
+    CheckCuda(cudaMalloc(&buffer.ptr, elements * sizeof(T)), what);
+}
+
+template<typename T, size_t N>
+void AllocateDeviceBufferArray(DeviceBuffer<T> (&buffers)[N], size_t elements, const char *what_prefix) {
+    for (size_t i = 0; i < N; ++i) {
+        std::string label = std::string(what_prefix) + "[" + std::to_string(i) + "]";
+        AllocateDeviceBuffer(buffers[i], elements, label.c_str());
+    }
+}
+
+// Async zero fill that honours optional buffers and element counts.
+template<typename T>
+void ZeroDeviceMemory(T *ptr, size_t elements, cudaStream_t stream, const char *what) {
+    if (elements == 0 || ptr == nullptr) {
+        return;
+    }
+    CheckCuda(cudaMemsetAsync(ptr, 0, elements * sizeof(T), stream), what);
+}
 
 struct CudaEvent {
     cudaEvent_t evt{nullptr};
@@ -301,6 +333,59 @@ __global__ void ForwardPointwiseKernel(
     }
 }
 
+// Aggregates references used while double-buffering host-to-device input loads.
+struct ForwardChunkCopyParams {
+    size_t total_chunks;
+    size_t time_steps;
+    size_t chunk_capacity;
+    size_t batch_size;
+    size_t input_size;
+    const __half *x_tensor_host;
+    DeviceBuffer<__half> *x_chunk_buffers;
+    CudaEvent *x_ready;
+    cudaStream_t h2d_stream;
+    bool *compute_done_valid;
+    CudaEvent *compute_done;
+};
+
+// Schedules input chunk copies, ensuring reuse waits for outstanding compute.
+static size_t IssueChunkCopy(size_t chunk_index, int slot, const ForwardChunkCopyParams &params) {
+    if (chunk_index >= params.total_chunks) {
+        return 0;
+    }
+    const size_t chunk_start = chunk_index * params.chunk_capacity;
+    if (chunk_start >= params.time_steps) {
+        return 0;
+    }
+    if (params.x_chunk_buffers[slot].ptr == nullptr) {
+        return 0;
+    }
+    if (params.compute_done_valid[slot]) {
+        CheckCuda(cudaStreamWaitEvent(params.h2d_stream, params.compute_done[slot].evt, 0),
+                  "wait compute_done before reuse");
+        params.compute_done_valid[slot] = false;
+    }
+    const size_t remaining = params.time_steps - chunk_start;
+    const size_t steps = std::min(params.chunk_capacity, remaining);
+    if (steps == 0) {
+        return 0;
+    }
+    const size_t bytes = steps * params.batch_size * params.input_size * sizeof(__half);
+    if (bytes == 0) {
+        return 0;
+    }
+    const __half *src = params.x_tensor_host + chunk_start * params.batch_size * params.input_size;
+    CheckCuda(cudaMemcpyAsync(
+                  params.x_chunk_buffers[slot].ptr,
+                  src,
+                  bytes,
+                  cudaMemcpyHostToDevice,
+                  params.h2d_stream),
+              "async copy x chunk");
+    CheckCuda(cudaEventRecord(params.x_ready[slot].evt, params.h2d_stream), "record x_ready");
+    return steps;
+}
+
 } // namespace
 
 namespace flstm {
@@ -352,7 +437,7 @@ void StreamingLstmForward(
     const bool needs_y_fallback = (y_tensor_host != nullptr);
 
     const int threads = 256;
-    const int bh_blocks = static_cast<int>((bh_elements + threads - 1) / threads);
+    const int bh_blocks = BlocksFor(bh_elements, threads);
 
     HostRegistration x_host_registration;
     HostRegistration y_host_registration;
@@ -379,13 +464,12 @@ void StreamingLstmForward(
     }
 
     DeviceBuffer<__half> z_cache_device_buffer;
-    CheckCuda(cudaMalloc(&z_cache_device_buffer.ptr, z_cache_elements * sizeof(__half)), "cudaMalloc z_cache");
+    AllocateDeviceBuffer(z_cache_device_buffer, z_cache_elements, "cudaMalloc z_cache");
     __half *z_cache_device = z_cache_device_buffer.ptr;
 
     DeviceBuffer<__half> gate_cache_device_buffer;
     if (store_gate_cache) {
-        CheckCuda(cudaMalloc(&gate_cache_device_buffer.ptr, gate_cache_elements * sizeof(__half)),
-                  "cudaMalloc gate_cache");
+        AllocateDeviceBuffer(gate_cache_device_buffer, gate_cache_elements, "cudaMalloc gate_cache");
     }
     __half *gate_cache_device = gate_cache_device_buffer.ptr;
 
@@ -399,17 +483,17 @@ void StreamingLstmForward(
     DeviceBuffer<__half> weight_cat_half;
     DeviceBuffer<float> bias_fused;
 
-    CheckCuda(cudaMalloc(&h0_float.ptr, bh_elements * sizeof(float)), "cudaMalloc h0_float");
-    CheckCuda(cudaMalloc(&c0_float.ptr, bh_elements * sizeof(float)), "cudaMalloc c0_float");
+    AllocateDeviceBuffer(h0_float, bh_elements, "cudaMalloc h0_float");
+    AllocateDeviceBuffer(c0_float, bh_elements, "cudaMalloc c0_float");
     HalfToFloatKernel<<<bh_blocks, threads, 0, compute_stream>>>(h_0_device, h0_float.ptr, bh_elements);
     CheckCuda(cudaGetLastError(), "HalfToFloatKernel h0");
     HalfToFloatKernel<<<bh_blocks, threads, 0, compute_stream>>>(c_0_device, c0_float.ptr, bh_elements);
     CheckCuda(cudaGetLastError(), "HalfToFloatKernel c0");
 
-    CheckCuda(cudaMalloc(&h_prev.ptr, bh_elements * sizeof(float)), "cudaMalloc h_prev");
-    CheckCuda(cudaMalloc(&c_prev.ptr, bh_elements * sizeof(float)), "cudaMalloc c_prev");
-    CheckCuda(cudaMalloc(&h_next.ptr, bh_elements * sizeof(float)), "cudaMalloc h_next");
-    CheckCuda(cudaMalloc(&c_next.ptr, bh_elements * sizeof(float)), "cudaMalloc c_next");
+    AllocateDeviceBuffer(h_prev, bh_elements, "cudaMalloc h_prev");
+    AllocateDeviceBuffer(c_prev, bh_elements, "cudaMalloc c_prev");
+    AllocateDeviceBuffer(h_next, bh_elements, "cudaMalloc h_next");
+    AllocateDeviceBuffer(c_next, bh_elements, "cudaMalloc c_next");
     CheckCuda(cudaMemcpyAsync(
                   h_prev.ptr,
                   h0_float.ptr,
@@ -425,11 +509,11 @@ void StreamingLstmForward(
                   compute_stream),
               "copy c0 -> c_prev");
 
-    CheckCuda(cudaMalloc(&gate_pre_col.ptr, gate_dim * batch_size * sizeof(float)), "cudaMalloc gate_pre_col");
-    CheckCuda(cudaMalloc(&weight_cat_half.ptr, z_rows * gate_dim * sizeof(__half)), "cudaMalloc weight_cat_half");
-    CheckCuda(cudaMalloc(&bias_fused.ptr, gate_dim * sizeof(float)), "cudaMalloc bias_fused");
+    AllocateDeviceBuffer(gate_pre_col, gate_dim * batch_size, "cudaMalloc gate_pre_col");
+    AllocateDeviceBuffer(weight_cat_half, z_rows * gate_dim, "cudaMalloc weight_cat_half");
+    AllocateDeviceBuffer(bias_fused, gate_dim, "cudaMalloc bias_fused");
 
-    const int weight_blocks = static_cast<int>(((z_rows * gate_dim) + threads - 1) / threads);
+    const int weight_blocks = BlocksFor(z_rows * gate_dim, threads);
     FuseWeightsKernel<<<weight_blocks, threads, 0, compute_stream>>>(
         weights_ih,
         weights_hh,
@@ -439,11 +523,11 @@ void StreamingLstmForward(
     );
     CheckCuda(cudaGetLastError(), "FuseWeightsKernel");
 
-    const int bias_blocks = static_cast<int>((gate_dim + threads - 1) / threads);
+    const int bias_blocks = BlocksFor(gate_dim, threads);
     FuseBiasKernel<<<bias_blocks, threads, 0, compute_stream>>>(bias_ih, bias_hh, bias_fused.ptr, hidden_size);
     CheckCuda(cudaGetLastError(), "FuseBiasKernel");
 
-    const int seed_blocks = static_cast<int>((bh_elements + threads - 1) / threads);
+    const int seed_blocks = BlocksFor(bh_elements, threads);
     SeedHiddenColumnKernel<<<seed_blocks, threads, 0, compute_stream>>>(
         h0_float.ptr,
         z_cache_device,
@@ -462,15 +546,10 @@ void StreamingLstmForward(
     DeviceBuffer<__half> x_chunk_buffers[2];
     DeviceBuffer<float> y_chunk_float[2];
     DeviceBuffer<__half> y_chunk_half[2];
-    for (int i = 0; i < 2; ++i) {
-        CheckCuda(cudaMalloc(&x_chunk_buffers[i].ptr, chunk_input_capacity * sizeof(__half)),
-                  "cudaMalloc x_chunk_buffer");
-        CheckCuda(cudaMalloc(&y_chunk_float[i].ptr, chunk_output_capacity * sizeof(float)),
-                  "cudaMalloc y_chunk_float");
-        if (needs_y_fallback) {
-            CheckCuda(cudaMalloc(&y_chunk_half[i].ptr, chunk_output_capacity * sizeof(__half)),
-                      "cudaMalloc y_chunk_half");
-        }
+    AllocateDeviceBufferArray(x_chunk_buffers, chunk_input_capacity, "cudaMalloc x_chunk_buffer");
+    AllocateDeviceBufferArray(y_chunk_float, chunk_output_capacity, "cudaMalloc y_chunk_float");
+    if (needs_y_fallback) {
+        AllocateDeviceBufferArray(y_chunk_half, chunk_output_capacity, "cudaMalloc y_chunk_half");
     }
 
     CudaEvent x_ready[2];
@@ -482,41 +561,27 @@ void StreamingLstmForward(
 
     const size_t total_chunks = (time_steps + chunk_capacity - 1) / chunk_capacity;
 
-    auto issue_chunk_copy = [&](size_t chunk_index, int slot) -> size_t {
-        if (chunk_index >= total_chunks) {
-            return 0;
-        }
-        const size_t chunk_start = chunk_index * chunk_capacity;
-        if (chunk_start >= time_steps) {
-            return 0;
-        }
-        if (compute_done_valid[slot]) {
-            CheckCuda(cudaStreamWaitEvent(h2d_stream, compute_done[slot].evt, 0),
-                      "wait compute_done before reuse");
-            compute_done_valid[slot] = false;
-        }
-        const size_t remaining = time_steps - chunk_start;
-        const size_t steps = std::min(chunk_capacity, remaining);
-        const size_t bytes = steps * batch_size * input_size * sizeof(__half);
-        const __half *src = x_tensor_host + chunk_start * batch_size * input_size;
-        CheckCuda(cudaMemcpyAsync(
-                      x_chunk_buffers[slot].ptr,
-                      src,
-                      bytes,
-                      cudaMemcpyHostToDevice,
-                      h2d_stream),
-                  "async copy x chunk");
-        CheckCuda(cudaEventRecord(x_ready[slot].evt, h2d_stream), "record x_ready");
-        return steps;
-    };
+    // Shared metadata for the double-buffered input copy helper.
+    ForwardChunkCopyParams chunk_params{};
+    chunk_params.total_chunks = total_chunks;
+    chunk_params.time_steps = time_steps;
+    chunk_params.chunk_capacity = chunk_capacity;
+    chunk_params.batch_size = batch_size;
+    chunk_params.input_size = input_size;
+    chunk_params.x_tensor_host = x_tensor_host;
+    chunk_params.x_chunk_buffers = x_chunk_buffers;
+    chunk_params.x_ready = x_ready;
+    chunk_params.h2d_stream = h2d_stream;
+    chunk_params.compute_done_valid = compute_done_valid;
+    chunk_params.compute_done = compute_done;
 
     size_t prefetched = 0;
     for (; prefetched < std::min<size_t>(total_chunks, 2); ++prefetched) {
         const int slot = static_cast<int>(prefetched % 2);
-        chunk_steps[slot] = issue_chunk_copy(prefetched, slot);
+        chunk_steps[slot] = IssueChunkCopy(prefetched, slot, chunk_params);
     }
 
-    const int point_blocks = static_cast<int>((bh_elements + threads - 1) / threads);
+    const int point_blocks = BlocksFor(bh_elements, threads);
 
     size_t chunk_idx = 0;
     while (chunk_idx < total_chunks) {
@@ -537,7 +602,7 @@ void StreamingLstmForward(
         const size_t chunk_start_step = chunk_idx * chunk_capacity;
         const size_t chunk_input_elems = steps_in_chunk * batch_size * input_size;
         if (chunk_input_elems > 0) {
-            const int convert_blocks = static_cast<int>((chunk_input_elems + threads - 1) / threads);
+            const int convert_blocks = BlocksFor(chunk_input_elems, threads);
             ConvertInputToZCacheKernel<<<convert_blocks, threads, 0, compute_stream>>>(
                 x_chunk_buffers[slot].ptr,
                 z_cache_device,
@@ -612,7 +677,7 @@ void StreamingLstmForward(
         if (needs_y_fallback) {
             const size_t chunk_y_elements = steps_in_chunk * bh_elements;
             if (chunk_y_elements > 0) {
-                const int y_blocks = static_cast<int>((chunk_y_elements + threads - 1) / threads);
+                const int y_blocks = BlocksFor(chunk_y_elements, threads);
                 FloatToHalfKernel<<<y_blocks, threads, 0, compute_stream>>>(
                     y_chunk_float[slot].ptr,
                     y_chunk_half[slot].ptr,
@@ -662,7 +727,7 @@ void StreamingLstmForward(
 
         if (prefetched < total_chunks) {
             const int reuse_slot = slot;
-            chunk_steps[reuse_slot] = issue_chunk_copy(prefetched, reuse_slot);
+            chunk_steps[reuse_slot] = IssueChunkCopy(prefetched, reuse_slot, chunk_params);
             ++prefetched;
         }
 

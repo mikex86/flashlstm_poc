@@ -166,7 +166,6 @@ class _StreamingLSTMFunction(Function):
             gate_cache_host,
         ) = ctx.saved_tensors
         time_steps, batch_size, input_size, hidden_size = ctx.meta
-        gate_dim = 4 * hidden_size
 
         if grad_y_host is None:
             grad_y_host = torch.zeros_like(y_host)

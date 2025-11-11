@@ -54,8 +54,8 @@ int main() {
     std::normal_distribution<float> normal_dist(0.0f, 1.0f);
     auto sample_normal = [&]() -> float { return normal_dist(rng); };
 
-    __half *x_host = CudaMallocHost<__half>(x_elements, "cudaMallocHost x_host");
-    __half *y_host = CudaMallocHost<__half>(y_elements, "cudaMallocHost y_host");
+    auto *x_host = CudaMallocHost<__half>(x_elements, "cudaMallocHost x_host");
+    auto *y_host = CudaMallocHost<__half>(y_elements, "cudaMallocHost y_host");
     std::vector<float> x_host_float(x_elements);
     constexpr float kInputStd = 0.01f;
     for (size_t i = 0; i < x_elements; ++i) {

@@ -13,29 +13,68 @@
 #include <vector>
 
 namespace {
-
-void CheckCuda(cudaError_t status, const char *what) {
-    if (status != cudaSuccess) {
-        std::fprintf(stderr, "%s failed: %s\n", what, cudaGetErrorString(status));
-        std::abort();
+    void CheckCuda(cudaError_t status, const char *what) {
+        if (status != cudaSuccess) {
+            std::fprintf(stderr, "%s failed: %s\n", what, cudaGetErrorString(status));
+            std::abort();
+        }
     }
-}
 
 
-template<typename T>
-T *CudaMallocDevice(size_t count, const char *what) {
-    T *ptr = nullptr;
-    CheckCuda(cudaMalloc(&ptr, count * sizeof(T)), what);
-    return ptr;
-}
+    template<typename T>
+    T *CudaMallocDevice(size_t count, const char *what) {
+        T *ptr = nullptr;
+        CheckCuda(cudaMalloc(&ptr, count * sizeof(T)), what);
+        return ptr;
+    }
 
-template<typename T>
-T *CudaMallocHost(size_t count, const char *what) {
-    T *ptr = nullptr;
-    CheckCuda(cudaMallocHost(&ptr, count * sizeof(T)), what);
-    return ptr;
-}
 
+    template<typename T>
+    T *CudaMallocHost(const size_t count, const char *what) {
+        if (count == 0) {
+            return nullptr;
+        }
+        const size_t bytes = count * sizeof(T);
+        T *ptr = nullptr;
+        cudaError_t err = cudaMallocHost(&ptr, bytes);
+        if (err == cudaSuccess) {
+            return ptr;
+        }
+        if (err != cudaErrorInvalidValue) {
+            std::fprintf(stderr, "%s failed: %s\n", what, cudaGetErrorString(err));
+            std::abort();
+        }
+
+        // Fall back to manual allocation + chunked host registration to dodge per-call size limits.
+        constexpr size_t kPageAlignment = 4096;
+        void *raw = nullptr;
+        if (posix_memalign(&raw, kPageAlignment, bytes) != 0 || raw == nullptr) {
+            std::fprintf(stderr, "%s fallback memalign failed\n", what);
+            std::abort();
+        }
+        auto *base = static_cast<uint8_t *>(raw);
+        constexpr size_t chunk_bytes = (1ull << 30); // 1 GiB per registration
+        constexpr size_t aligned_chunk = (chunk_bytes / kPageAlignment) * kPageAlignment;
+        std::vector<void *> registered_ptrs;
+        registered_ptrs.reserve((bytes + aligned_chunk - 1) / aligned_chunk);
+        size_t offset = 0;
+        while (offset < bytes) {
+            const size_t remaining = bytes - offset;
+            const size_t this_size = std::min(aligned_chunk, remaining);
+            err = cudaHostRegister(base + offset, this_size, cudaHostRegisterPortable);
+            if (err != cudaSuccess) {
+                std::fprintf(stderr, "%s fallback cudaHostRegister failed: %s\n", what, cudaGetErrorString(err));
+                for (void *p: registered_ptrs) {
+                    cudaHostUnregister(p);
+                }
+                std::free(raw);
+                std::abort();
+            }
+            registered_ptrs.push_back(base + offset);
+            offset += this_size;
+        }
+        return reinterpret_cast<T *>(base);
+    }
 } // namespace
 
 int main() {
@@ -70,8 +109,8 @@ int main() {
     std::vector<float> bias_hh_host(gate_dim, 0.0f);
     const float weight_limit = 1.0f / std::sqrt(static_cast<float>(hidden_size));
     std::uniform_real_distribution<float> weight_dist(-weight_limit, weight_limit);
-    for (auto &w : weight_ih_host) { w = weight_dist(rng); }
-    for (auto &w : weight_hh_host) { w = weight_dist(rng); }
+    for (auto &w: weight_ih_host) { w = weight_dist(rng); }
+    for (auto &w: weight_hh_host) { w = weight_dist(rng); }
 
     std::vector<__half> h0_host(state_elements, __float2half(0.0f));
     std::vector<__half> c0_host(state_elements, __float2half(0.0f));

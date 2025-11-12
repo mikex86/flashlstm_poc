@@ -267,12 +267,12 @@ __global__ void SeedHiddenColumnKernel(
 }
 
 __global__ void ForwardPointwiseKernel(
-    const float *gate_col,         // (4H, B) column-major
+    const __half *gate_col,        // (4H, B) column-major
     const float *bias,             // (4H,)
     const float *c_prev,           // (B, H) row-major
     float *h_next,                 // (B, H) row-major
     float *c_next,                 // (B, H) row-major
-    float *y_out,                  // (B, H) row-major
+    __half *y_half_out,            // (B, H) row-major half or nullptr
     __half *gate_cache_step,       // (B, 4H) row-major
     __half *h_cache,               // (T+1, B, H) row-major
     __half *c_cache,               // (T+1, B, H) row-major
@@ -296,10 +296,14 @@ __global__ void ForwardPointwiseKernel(
     const size_t col = batch_idx;
     const size_t row_base = hidden_idx;
 
-    const float gi = gate_col[row_base + col * gate_dim] + bias[row_base + 0 * hidden_size];
-    const float gf = gate_col[row_base + hidden_size + col * gate_dim] + bias[row_base + 1 * hidden_size];
-    const float gg = gate_col[row_base + 2 * hidden_size + col * gate_dim] + bias[row_base + 2 * hidden_size];
-    const float go = gate_col[row_base + 3 * hidden_size + col * gate_dim] + bias[row_base + 3 * hidden_size];
+    const float gi =
+        __half2float(gate_col[row_base + col * gate_dim]) + bias[row_base + 0 * hidden_size];
+    const float gf =
+        __half2float(gate_col[row_base + hidden_size + col * gate_dim]) + bias[row_base + 1 * hidden_size];
+    const float gg =
+        __half2float(gate_col[row_base + 2 * hidden_size + col * gate_dim]) + bias[row_base + 2 * hidden_size];
+    const float go =
+        __half2float(gate_col[row_base + 3 * hidden_size + col * gate_dim]) + bias[row_base + 3 * hidden_size];
 
     const float i_gate = 1.0f / (1.0f + expf(-gi));
     const float f_gate = 1.0f / (1.0f + expf(-gf));
@@ -311,7 +315,9 @@ __global__ void ForwardPointwiseKernel(
 
     h_next[batch_idx * hidden_size + hidden_idx] = h_val;
     c_next[batch_idx * hidden_size + hidden_idx] = c_val;
-    y_out[batch_idx * hidden_size + hidden_idx] = h_val;
+    if (y_half_out != nullptr) {
+        y_half_out[batch_idx * hidden_size + hidden_idx] = __float2half(h_val);
+    }
 
     if (gate_cache_step != nullptr) {
         __half *gate_ptr = gate_cache_step + batch_idx * gate_dim;
@@ -482,7 +488,7 @@ void StreamingLstmForward(
     DeviceBuffer<float> c_prev;
     DeviceBuffer<float> h_next;
     DeviceBuffer<float> c_next;
-    DeviceBuffer<float> gate_pre_col;
+    DeviceBuffer<__half> gate_pre_col;
     DeviceBuffer<__half> weight_cat_half;
     DeviceBuffer<float> bias_fused;
 
@@ -538,10 +544,8 @@ void StreamingLstmForward(
     const int seed_blocks = BlocksFor(bh_elements, threads);
 
     DeviceBuffer<__half> x_chunk_buffers[2];
-    DeviceBuffer<float> y_chunk_float[2];
     DeviceBuffer<__half> y_chunk_half[2];
     AllocateDeviceBufferArray(x_chunk_buffers, chunk_input_capacity, "cudaMalloc x_chunk_buffer");
-    AllocateDeviceBufferArray(y_chunk_float, chunk_output_capacity, "cudaMalloc y_chunk_float");
     if (needs_y_fallback) {
         AllocateDeviceBufferArray(y_chunk_half, chunk_output_capacity, "cudaMalloc y_chunk_half");
     }
@@ -654,7 +658,10 @@ void StreamingLstmForward(
             const size_t global_step = chunk_start_step + step;
             const size_t column_offset = step * batch_size;
             const __half *z_step = z_chunk_device + column_offset * z_rows;
-            float *y_step = y_chunk_float[slot].ptr + step * bh_elements;
+            __half *y_step = nullptr;
+            if (needs_y_fallback && y_chunk_half[slot].ptr != nullptr) {
+                y_step = y_chunk_half[slot].ptr + step * bh_elements;
+            }
             __half *gate_cache_step = nullptr;
 
             if (store_checkpoints && next_checkpoint_step != static_cast<size_t>(-1) &&
@@ -704,7 +711,7 @@ void StreamingLstmForward(
                             static_cast<int>(z_rows),
                             &beta_zero_f,
                             gate_pre_col.ptr,
-                            CUDA_R_32F,
+                            CUDA_R_16F,
                             static_cast<int>(gate_dim),
                             CUBLAS_COMPUTE_32F,
                             CUBLAS_GEMM_DEFAULT_TENSOR_OP),
@@ -739,19 +746,6 @@ void StreamingLstmForward(
             std::swap(c_prev.ptr, c_next.ptr);
         }
 
-        if (needs_y_fallback) {
-            const size_t chunk_y_elements = steps_in_chunk * bh_elements;
-            if (chunk_y_elements > 0) {
-                const int y_blocks = BlocksFor(chunk_y_elements, threads);
-                FloatToHalfKernel<<<y_blocks, threads, 0, compute_stream>>>(
-                    y_chunk_float[slot].ptr,
-                    y_chunk_half[slot].ptr,
-                    chunk_y_elements
-                );
-                CheckCuda(cudaGetLastError(), "FloatToHalfKernel chunk y");
-            }
-        }
-
         CheckCuda(cudaEventRecord(compute_done[slot].evt, compute_stream), "record compute_done");
         compute_done_valid[slot] = true;
 
@@ -775,7 +769,7 @@ void StreamingLstmForward(
             }
         }
 
-        if (y_tensor_host != nullptr) {
+        if (y_tensor_host != nullptr && y_chunk_half[slot].ptr != nullptr) {
             const size_t y_elements_chunk = steps_in_chunk * bh_elements;
             if (y_elements_chunk > 0) {
                 __half *dst = y_tensor_host + chunk_start_step * bh_elements;

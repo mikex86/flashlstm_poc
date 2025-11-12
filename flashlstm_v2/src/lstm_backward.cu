@@ -82,9 +82,9 @@ namespace {
         }
     }
 
-    // Async zero fill that honours optional buffers and element counts.
+    /// Async zero fill that honours optional buffers and element counts.
     template<typename T>
-    void ZeroDeviceMemory(T *ptr, size_t elements, cudaStream_t stream, const char *what) {
+    void ZeroDeviceMemory(T *ptr, const size_t elements, const cudaStream_t stream, const char *what) {
         if (elements == 0 || ptr == nullptr) {
             return;
         }
@@ -136,7 +136,7 @@ namespace {
     __global__ void FuseWeightsKernel(
         const float *weight_ih, // (4H, I) row-major
         const float *weight_hh, // (4H, H) row-major
-        float *weight_cat, // (I+H, 4H) column-major
+        __half *weight_cat, // (I+H, 4H) column-major
         const size_t input_size,
         const size_t hidden_size
     ) {
@@ -155,14 +155,14 @@ namespace {
             const size_t h_row = row - input_size;
             value = weight_hh[col * hidden_size + h_row];
         }
-        weight_cat[row + col * rows] = value;
+        weight_cat[row + col * rows] = __float2half(value);
     }
 
     __global__ void FuseBiasKernel(
         const float *bias_ih, // (4H,)
         const float *bias_hh, // (4H,)
         float *bias_out, // (4H,)
-        size_t hidden_size
+        const size_t hidden_size
     ) {
         const size_t gate_dim = 4 * hidden_size;
         const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -173,12 +173,13 @@ namespace {
     }
 
     __global__ void BackwardPointwiseKernel(
-        const float *dY_row, // (B, H) row-major
+        const __half *dY_row, // (B, H) row-major half
         const float *dh_next_row, // (B, H) row-major
         const float *dc_next_row, // (B, H) row-major
         const float *gate_cache_row, // (B, 4H) row-major (i,f,g,o)
-        const float *y_row, // (B, H) row-major
+        const __half *y_row, // (B, H) row-major half
         float *dG_col_step, // (4H, B) column-major
+        __half *dG_half_col_step, // (4H, B) column-major half
         float *dh_point_prev_col, // (H, B) column-major
         float *dc_prev_row, // (B, H) row-major
         const size_t batch_size,
@@ -193,7 +194,7 @@ namespace {
         const size_t hidden_idx = idx % hidden_size;
         const size_t gate_dim = 4 * hidden_size;
 
-        const float dh_total = dY_row[idx] + dh_next_row[idx];
+        const float dh_total = __half2float(dY_row[idx]) + dh_next_row[idx];
         const float dc_next = dc_next_row[idx];
 
         const float i_gate = gate_cache_row[batch_idx * gate_dim + hidden_idx + 0 * hidden_size];
@@ -201,7 +202,7 @@ namespace {
         const float g_gate = gate_cache_row[batch_idx * gate_dim + hidden_idx + 2 * hidden_size];
         const float o_gate = gate_cache_row[batch_idx * gate_dim + hidden_idx + 3 * hidden_size];
 
-        const float y_t = y_row[idx];
+        const float y_t = __half2float(y_row[idx]);
         constexpr float kEps = 1e-6f;
 
         const float denom_o = fabsf(o_gate) < kEps ? (o_gate >= 0.0f ? kEps : -kEps) : o_gate;
@@ -230,6 +231,13 @@ namespace {
         dG_col_step[hidden_idx + hidden_size + batch_idx * gate_dim] = daf;
         dG_col_step[hidden_idx + 2 * hidden_size + batch_idx * gate_dim] = dag;
         dG_col_step[hidden_idx + 3 * hidden_size + batch_idx * gate_dim] = dao;
+        if (dG_half_col_step != nullptr) {
+            const size_t base = batch_idx * gate_dim;
+            dG_half_col_step[hidden_idx + base] = __float2half(dai);
+            dG_half_col_step[hidden_idx + hidden_size + base] = __float2half(daf);
+            dG_half_col_step[hidden_idx + 2 * hidden_size + base] = __float2half(dag);
+            dG_half_col_step[hidden_idx + 3 * hidden_size + base] = __float2half(dao);
+        }
 
         dh_point_prev_col[hidden_idx + batch_idx * hidden_size] = 0.0f; // initialise accumulator
         dc_prev_row[idx] = dc_prev;
@@ -237,29 +245,29 @@ namespace {
 
     __global__ void PackInputStepKernel(
         const __half *x_step, // (B, I) row-major
-        float *z_step, // (I+H, B) column-major
-        size_t batch_size,
-        size_t input_size,
-        size_t hidden_size
+        __half *z_step, // (I+H, B) column-major
+        const size_t batch_size,
+        const size_t input_size,
+        const size_t hidden_size
     ) {
         const size_t total = batch_size * input_size;
         const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
         if (idx >= total) {
             return;
         }
-        size_t tmp = idx;
+        const size_t tmp = idx;
         const size_t input_idx = tmp % input_size;
         const size_t batch_idx = tmp / input_size;
         const size_t z_rows = input_size + hidden_size;
-        z_step[input_idx + batch_idx * z_rows] = __half2float(x_step[idx]);
+        z_step[input_idx + batch_idx * z_rows] = x_step[idx];
     }
 
     __global__ void PackHiddenStateKernel(
         const float *h_prev, // (B, H) row-major
-        float *z_step, // (I+H, B) column-major
-        size_t batch_size,
-        size_t input_size,
-        size_t hidden_size
+        __half *z_step, // (I+H, B) column-major
+        const size_t batch_size,
+        const size_t input_size,
+        const size_t hidden_size
     ) {
         const size_t total = batch_size * hidden_size;
         const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -269,18 +277,19 @@ namespace {
         const size_t batch_idx = idx / hidden_size;
         const size_t hidden_idx = idx % hidden_size;
         const size_t z_rows = input_size + hidden_size;
-        z_step[input_size + hidden_idx + batch_idx * z_rows] = h_prev[idx];
+        const float h_value = h_prev[idx];
+        z_step[input_size + hidden_idx + batch_idx * z_rows] = __float2half(h_value);
     }
 
     __global__ void RecomputePointwiseKernel(
-        const float *gate_col, // (4H, B) column-major
+        const __half *gate_col, // (4H, B) column-major
         const float *bias, // (4H,)
         const float *c_prev, // (B, H) row-major
         float *h_next, // (B, H) row-major
         float *c_next, // (B, H) row-major
         float *gate_out, // (B, 4H) row-major or nullptr
-        size_t batch_size,
-        size_t hidden_size
+        const size_t batch_size,
+        const size_t hidden_size
     ) {
         const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
         const size_t total = batch_size * hidden_size;
@@ -293,10 +302,14 @@ namespace {
         const size_t col = batch_idx;
         const size_t row_base = hidden_idx;
 
-        const float gi = gate_col[row_base + col * gate_dim] + bias[row_base + 0 * hidden_size];
-        const float gf = gate_col[row_base + hidden_size + col * gate_dim] + bias[row_base + 1 * hidden_size];
-        const float gg = gate_col[row_base + 2 * hidden_size + col * gate_dim] + bias[row_base + 2 * hidden_size];
-        const float go = gate_col[row_base + 3 * hidden_size + col * gate_dim] + bias[row_base + 3 * hidden_size];
+        const float gi =
+            __half2float(gate_col[row_base + col * gate_dim]) + bias[row_base + 0 * hidden_size];
+        const float gf =
+            __half2float(gate_col[row_base + hidden_size + col * gate_dim]) + bias[row_base + 1 * hidden_size];
+        const float gg =
+            __half2float(gate_col[row_base + 2 * hidden_size + col * gate_dim]) + bias[row_base + 2 * hidden_size];
+        const float go =
+            __half2float(gate_col[row_base + 3 * hidden_size + col * gate_dim]) + bias[row_base + 3 * hidden_size];
 
         const float i_gate = 1.0f / (1.0f + expf(-gi));
         const float f_gate = 1.0f / (1.0f + expf(-gf));
@@ -343,7 +356,7 @@ namespace {
 
     __global__ void ConvertInputToZChunkKernel(
         const __half *x_src, // (chunk_steps, B, I)
-        float *z_chunk_col, // (I+H, chunk_tb) column-major
+        __half *z_chunk_col, // (I+H, chunk_tb) column-major
         const size_t chunk_steps,
         const size_t batch_size,
         const size_t input_size,
@@ -362,17 +375,17 @@ namespace {
 
         const size_t column = step_idx * batch_size + batch_idx;
         const size_t z_rows = input_size + hidden_size;
-        z_chunk_col[input_idx + column * z_rows] = __half2float(x_src[idx]);
+        z_chunk_col[input_idx + column * z_rows] = x_src[idx];
     }
 
     __global__ void FillHiddenPartForZChunkKernel(
-        const float *y_chunk, // (chunk_steps, B, H) row-major
-        const float *first_prev, // (B, H) row-major
+        const __half *y_chunk, // (chunk_steps, B, H) row-major
+        const __half *first_prev, // (B, H) row-major
         const size_t chunk_steps,
         const size_t batch_size,
         const size_t hidden_size,
         const size_t input_size,
-        float *z_chunk_col // (I+H, chunk_tb) column-major
+        __half *z_chunk_col // (I+H, chunk_tb) column-major
     ) {
         const size_t total = chunk_steps * batch_size * hidden_size;
         const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -389,20 +402,20 @@ namespace {
         const size_t column = step_idx * batch_size + batch_idx;
         const size_t z_rows = input_size + hidden_size;
 
-        float h_prev;
+        __half h_prev{};
         if (step_idx == 0) {
             h_prev = first_prev[batch_idx * hidden_size + hidden_idx];
         } else {
-            const float *y_prev = y_chunk + ((step_idx - 1) * batch_size + batch_idx) * hidden_size;
+            const __half *y_prev = y_chunk + ((step_idx - 1) * batch_size + batch_idx) * hidden_size;
             h_prev = y_prev[hidden_idx];
         }
 
         z_chunk_col[input_size + hidden_idx + column * z_rows] = h_prev;
     }
 
-    __global__ void FillOnesKernel(float *dst, const size_t count) {
+    __global__ void FillOnesKernel(__half *dst, const size_t count) {
         if (const size_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < count) {
-            dst[idx] = 1.0f;
+            dst[idx] = __float2half(1.0f);
         }
     }
 
@@ -589,11 +602,10 @@ namespace flstm {
         DeviceBuffer<float> dh_tmp;
         DeviceBuffer<float> dc_cur;
         DeviceBuffer<float> dc_tmp;
-        DeviceBuffer<float> h0_float;
-        DeviceBuffer<float> weight_cat_col;
+        DeviceBuffer<__half> weight_cat_col;
         DeviceBuffer<float> db_buffer;
         DeviceBuffer<float> bias_fused;
-        DeviceBuffer<float> ones_vec;
+        DeviceBuffer<__half> ones_vec;
 
         const int threads = 256;
 
@@ -632,10 +644,6 @@ namespace flstm {
                       compute_stream),
                   "copy d_cn");
 
-        AllocateDeviceBuffer(h0_float, bh_elements, "cudaMalloc h0_float");
-        HalfToFloatKernel<<<bh_blocks, threads, 0, compute_stream>>>(h0_device, h0_float.ptr, bh_elements);
-        CheckCuda(cudaGetLastError(), "HalfToFloatKernel h0");
-
         const size_t weight_elems = z_rows * gate_dim;
         AllocateDeviceBuffer(weight_cat_col, weight_elems, "cudaMalloc weight_cat_col");
         const int weight_blocks = BlocksFor(weight_elems, threads);
@@ -668,21 +676,19 @@ namespace flstm {
         DeviceBuffer<__half> y_chunk_half[2];
         DeviceBuffer<__half> dY_chunk_half[2];
         DeviceBuffer<float> gate_chunk_float[2];
-        DeviceBuffer<float> dY_chunk_float[2];
-        DeviceBuffer<float> y_chunk_float[2];
-        DeviceBuffer<float> z_chunk_col[2];
+        DeviceBuffer<__half> z_chunk_col[2];
         DeviceBuffer<float> dG_chunk_col[2];
+        DeviceBuffer<__half> dG_chunk_half[2];
         DeviceBuffer<float> dX_chunk_col[2];
         DeviceBuffer<__half> dx_chunk_half[2];
         DeviceBuffer<__half> y_prev_half[2];
-        DeviceBuffer<float> h_prev_boundary_float[2];
         DeviceBuffer<__half> checkpoint_half[2];
         DeviceBuffer<float> recompute_h_prev;
         DeviceBuffer<float> recompute_h_next;
         DeviceBuffer<float> recompute_c_prev;
         DeviceBuffer<float> recompute_c_next;
-        DeviceBuffer<float> z_step_col;
-        DeviceBuffer<float> gate_pre_col;
+        DeviceBuffer<__half> z_step_col;
+        DeviceBuffer<__half> gate_pre_col;
 
         const size_t z_chunk_elements = z_rows * chunk_tb_capacity;
         const size_t dX_chunk_elements = input_size * chunk_tb_capacity;
@@ -698,11 +704,9 @@ namespace flstm {
         AllocateDeviceBufferArray(dx_chunk_half, chunk_input_capacity, "cudaMalloc dx_chunk_half");
         AllocateDeviceBufferArray(y_chunk_half, chunk_hidden_capacity, "cudaMalloc y_chunk_half");
         AllocateDeviceBufferArray(dY_chunk_half, chunk_hidden_capacity, "cudaMalloc dY_chunk_half");
-        AllocateDeviceBufferArray(dY_chunk_float, chunk_hidden_capacity, "cudaMalloc dY_chunk_float");
-        AllocateDeviceBufferArray(y_chunk_float, chunk_hidden_capacity, "cudaMalloc y_chunk_float");
         AllocateDeviceBufferArray(dG_chunk_col, dG_chunk_elements, "cudaMalloc dG_chunk_col");
+        AllocateDeviceBufferArray(dG_chunk_half, dG_chunk_elements, "cudaMalloc dG_chunk_half");
         AllocateDeviceBufferArray(y_prev_half, bh_elements, "cudaMalloc y_prev_half");
-        AllocateDeviceBufferArray(h_prev_boundary_float, bh_elements, "cudaMalloc h_prev_boundary_float");
         AllocateDeviceBufferArray(checkpoint_half, checkpoint_half_elements, "cudaMalloc checkpoint_half");
         AllocateDeviceBuffer(bias_fused, gate_dim, "cudaMalloc bias_fused");
         AllocateDeviceBuffer(recompute_h_prev, bh_elements, "cudaMalloc recompute_h_prev");
@@ -721,10 +725,10 @@ namespace flstm {
         );
         CheckCuda(cudaGetLastError(), "FuseBiasKernel");
 
-    ZeroDeviceMemory(dW_ih, static_cast<size_t>(gate_dim) * input_size, compute_stream, "memset dW_ih");
-    ZeroDeviceMemory(dW_hh, static_cast<size_t>(gate_dim) * hidden_size, compute_stream, "memset dW_hh");
+        ZeroDeviceMemory(dW_ih, static_cast<size_t>(gate_dim) * input_size, compute_stream, "memset dW_ih");
+        ZeroDeviceMemory(dW_hh, static_cast<size_t>(gate_dim) * hidden_size, compute_stream, "memset dW_hh");
 
-    CublasHandle cublas;
+        CublasHandle cublas;
         CheckCublas(cublasCreate(&cublas.handle), "cublasCreate");
         CheckCublas(cublasSetStream(cublas.handle, compute_stream), "cublasSetStream");
         const float alpha = 1.0f;
@@ -811,26 +815,6 @@ namespace flstm {
             const size_t recompute_steps = chunk_recompute_steps[slot];
 
             const size_t chunk_hidden_elems = steps_in_chunk * bh_elements;
-            if (chunk_hidden_elems > 0) {
-                if (dY_chunk_half[slot].ptr != nullptr && dY_chunk_float[slot].ptr != nullptr) {
-                    const int dY_blocks = BlocksFor(chunk_hidden_elems, threads);
-                    HalfToFloatKernel<<<dY_blocks, threads, 0, compute_stream>>>(
-                        dY_chunk_half[slot].ptr,
-                        dY_chunk_float[slot].ptr,
-                        chunk_hidden_elems
-                    );
-                    CheckCuda(cudaGetLastError(), "HalfToFloatKernel dY chunk");
-                }
-                if (y_chunk_half[slot].ptr != nullptr && y_chunk_float[slot].ptr != nullptr) {
-                    const int y_blocks = BlocksFor(chunk_hidden_elems, threads);
-                    HalfToFloatKernel<<<y_blocks, threads, 0, compute_stream>>>(
-                        y_chunk_half[slot].ptr,
-                        y_chunk_float[slot].ptr,
-                        chunk_hidden_elems
-                    );
-                    CheckCuda(cudaGetLastError(), "HalfToFloatKernel y chunk");
-                }
-            }
 
             const size_t chunk_input_elems = steps_in_chunk * batch_size * input_size;
             if (chunk_input_elems > 0 && x_chunk_half[slot].ptr != nullptr) {
@@ -847,24 +831,17 @@ namespace flstm {
                 CheckCuda(cudaGetLastError(), "ConvertInputToZChunkKernel");
             }
 
-            const float *first_prev_ptr = nullptr;
+            const __half *first_prev_ptr = nullptr;
             if (chunk_start_step == 0) {
-                first_prev_ptr = h0_float.ptr;
+                first_prev_ptr = h0_device;
             } else {
-                const int prev_blocks = BlocksFor(bh_elements, threads);
-                HalfToFloatKernel<<<prev_blocks, threads, 0, compute_stream>>>(
-                    y_prev_half[slot].ptr,
-                    h_prev_boundary_float[slot].ptr,
-                    bh_elements
-                );
-                CheckCuda(cudaGetLastError(), "HalfToFloatKernel y_prev");
-                first_prev_ptr = h_prev_boundary_float[slot].ptr;
+                first_prev_ptr = y_prev_half[slot].ptr;
             }
 
             if (chunk_hidden_elems > 0) {
                 const int hidden_blocks = BlocksFor(chunk_hidden_elems, threads);
                 FillHiddenPartForZChunkKernel<<<hidden_blocks, threads, 0, compute_stream>>>(
-                    y_chunk_float[slot].ptr,
+                    y_chunk_half[slot].ptr,
                     first_prev_ptr,
                     steps_in_chunk,
                     batch_size,
@@ -892,7 +869,7 @@ namespace flstm {
 
                 for (size_t local_step = 0; local_step < recompute_steps; ++local_step) {
                     const __half *x_step_half =
-                        x_chunk_half[slot].ptr + local_step * batch_size * input_size;
+                            x_chunk_half[slot].ptr + local_step * batch_size * input_size;
                     const int input_blocks = BlocksFor(batch_size * input_size, threads);
                     PackInputStepKernel<<<input_blocks, threads, 0, compute_stream>>>(
                         x_step_half,
@@ -910,7 +887,7 @@ namespace flstm {
                         hidden_size
                     );
                     CheckCuda(cudaGetLastError(), "PackHiddenStateKernel");
-                    CheckCublas(cublasSgemm(
+                    CheckCublas(cublasGemmEx(
                                     cublas.handle,
                                     CUBLAS_OP_T,
                                     CUBLAS_OP_N,
@@ -919,13 +896,18 @@ namespace flstm {
                                     static_cast<int>(z_rows),
                                     &alpha,
                                     weight_cat_col.ptr,
+                                    CUDA_R_16F,
                                     static_cast<int>(z_rows),
                                     z_step_col.ptr,
+                                    CUDA_R_16F,
                                     static_cast<int>(z_rows),
                                     &beta_zero,
                                     gate_pre_col.ptr,
-                                    static_cast<int>(gate_dim)),
-                                "cublasSgemm recompute gates");
+                                    CUDA_R_16F,
+                                    static_cast<int>(gate_dim),
+                                    CUBLAS_COMPUTE_32F,
+                                    CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+                                "cublasGemmEx recompute gates");
                     profiler.AddTotal(mfu::GemmFlops(gate_dim, batch_size, z_rows));
                     float *gate_out_ptr = nullptr;
                     if (local_step >= prefix_steps) {
@@ -951,12 +933,13 @@ namespace flstm {
             for (int step = static_cast<int>(steps_in_chunk) - 1; step >= 0; --step) {
                 const size_t local_offset = static_cast<size_t>(step) * batch_size;
                 float *dG_step = dG_chunk_col[slot].ptr + local_offset * gate_dim;
+                __half *dG_half_step = dG_chunk_half[slot].ptr + local_offset * gate_dim;
                 float *dh_out = dh_tmp.ptr;
                 float *dc_out = dc_tmp.ptr;
 
-                const float *dY_t = dY_chunk_float[slot].ptr + static_cast<size_t>(step) * bh_elements;
+                const __half *dY_t = dY_chunk_half[slot].ptr + static_cast<size_t>(step) * bh_elements;
                 const float *gate_step = gate_chunk_float[slot].ptr + static_cast<size_t>(step) * batch_size * gate_dim;
-                const float *y_step = y_chunk_float[slot].ptr + static_cast<size_t>(step) * bh_elements;
+                const __half *y_step = y_chunk_half[slot].ptr + static_cast<size_t>(step) * bh_elements;
 
                 BackwardPointwiseKernel<<<point_blocks, threads, 0, compute_stream>>>(
                     dY_t,
@@ -965,6 +948,7 @@ namespace flstm {
                     gate_step,
                     y_step,
                     dG_step,
+                    dG_half_step,
                     dh_out,
                     dc_out,
                     batch_size,
@@ -972,8 +956,8 @@ namespace flstm {
                 );
                 CheckCuda(cudaGetLastError(), "BackwardPointwiseKernel");
 
-                const float *W_hh_block = weight_cat_col.ptr + input_size;
-                CheckCublas(cublasSgemm(
+                const __half *W_hh_block = weight_cat_col.ptr + input_size;
+                CheckCublas(cublasGemmEx(
                                 cublas.handle,
                                 CUBLAS_OP_N,
                                 CUBLAS_OP_N,
@@ -982,13 +966,18 @@ namespace flstm {
                                 static_cast<int>(gate_dim),
                                 &alpha,
                                 W_hh_block,
+                                CUDA_R_16F,
                                 static_cast<int>(z_rows),
-                                dG_step,
+                                dG_half_step,
+                                CUDA_R_16F,
                                 static_cast<int>(gate_dim),
                                 &beta_one,
                                 dh_out,
-                                static_cast<int>(hidden_size)),
-                            "cublasSgemm dh_prev");
+                                CUDA_R_32F,
+                                static_cast<int>(hidden_size),
+                                CUBLAS_COMPUTE_32F,
+                                CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+                            "cublasGemmEx dh_prev");
                 profiler.AddUseful(mfu::GemmFlops(hidden_size, batch_size, gate_dim));
 
                 std::swap(dh_cur.ptr, dh_tmp.ptr);
@@ -999,11 +988,12 @@ namespace flstm {
             size_t dx_chunk_elems = 0;
             const int zgemm_k = static_cast<int>(chunk_tb);
             if (zgemm_k > 0) {
-                const float *z_chunk_base = z_chunk_col[slot].ptr;
-                const float *x_chunk_matrix = z_chunk_base;
-                const float *h_chunk_matrix = z_chunk_base + input_size;
+                const __half *z_chunk_base = z_chunk_col[slot].ptr;
+                const __half *x_chunk_matrix = z_chunk_base;
+                const __half *h_chunk_matrix = z_chunk_base + input_size;
+                const __half *dG_chunk_half_ptr = dG_chunk_half[slot].ptr;
 
-                CheckCublas(cublasSgemm(
+                CheckCublas(cublasGemmEx(
                                 cublas.handle,
                                 CUBLAS_OP_N,
                                 CUBLAS_OP_T,
@@ -1012,17 +1002,22 @@ namespace flstm {
                                 zgemm_k,
                                 &alpha,
                                 x_chunk_matrix,
+                                CUDA_R_16F,
                                 static_cast<int>(z_rows),
-                                dG_chunk_col[slot].ptr,
+                                dG_chunk_half_ptr,
+                                CUDA_R_16F,
                                 static_cast<int>(gate_dim),
                                 &beta_one,
                                 dW_ih,
-                                static_cast<int>(input_size)),
-                            "cublasSgemm dW_ih chunk");
+                                CUDA_R_32F,
+                                static_cast<int>(input_size),
+                                CUBLAS_COMPUTE_32F,
+                                CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+                            "cublasGemmEx dW_ih chunk");
                 profiler.AddUseful(mfu::GemmFlops(input_size, gate_dim, static_cast<size_t>(zgemm_k)));
 
                 if (hidden_size > 0) {
-                    CheckCublas(cublasSgemm(
+                    CheckCublas(cublasGemmEx(
                                     cublas.handle,
                                     CUBLAS_OP_N,
                                     CUBLAS_OP_T,
@@ -1031,33 +1026,45 @@ namespace flstm {
                                     zgemm_k,
                                     &alpha,
                                     h_chunk_matrix,
+                                    CUDA_R_16F,
                                     static_cast<int>(z_rows),
-                                    dG_chunk_col[slot].ptr,
+                                    dG_chunk_half_ptr,
+                                    CUDA_R_16F,
                                     static_cast<int>(gate_dim),
                                     &beta_one,
                                     dW_hh,
-                                    static_cast<int>(hidden_size)),
-                                "cublasSgemm dW_hh chunk");
+                                    CUDA_R_32F,
+                                    static_cast<int>(hidden_size),
+                                    CUBLAS_COMPUTE_32F,
+                                    CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+                                "cublasGemmEx dW_hh chunk");
                     profiler.AddUseful(mfu::GemmFlops(hidden_size, gate_dim, static_cast<size_t>(zgemm_k)));
                 }
 
-                CheckCublas(cublasSgemv(
+                CheckCublas(cublasGemmEx(
                                 cublas.handle,
                                 CUBLAS_OP_N,
+                                CUBLAS_OP_N,
                                 static_cast<int>(gate_dim),
+                                1,
                                 zgemm_k,
                                 &alpha,
-                                dG_chunk_col[slot].ptr,
+                                dG_chunk_half_ptr,
+                                CUDA_R_16F,
                                 static_cast<int>(gate_dim),
                                 ones_vec.ptr,
-                                1,
+                                CUDA_R_16F,
+                                zgemm_k,
                                 &beta_one,
                                 db_buffer.ptr,
-                                1),
-                            "cublasSgemv db chunk");
+                                CUDA_R_32F,
+                                static_cast<int>(gate_dim),
+                                CUBLAS_COMPUTE_32F,
+                                CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+                            "cublasGemmEx db chunk");
                 profiler.AddUseful(mfu::GemvFlops(gate_dim, static_cast<size_t>(zgemm_k)));
 
-                CheckCublas(cublasSgemm(
+                CheckCublas(cublasGemmEx(
                                 cublas.handle,
                                 CUBLAS_OP_N,
                                 CUBLAS_OP_N,
@@ -1066,13 +1073,18 @@ namespace flstm {
                                 static_cast<int>(gate_dim),
                                 &alpha,
                                 weight_cat_col.ptr,
+                                CUDA_R_16F,
                                 static_cast<int>(z_rows),
-                                dG_chunk_col[slot].ptr,
+                                dG_chunk_half_ptr,
+                                CUDA_R_16F,
                                 static_cast<int>(gate_dim),
                                 &beta_zero,
                                 dX_chunk_col[slot].ptr,
-                                static_cast<int>(input_size)),
-                            "cublasSgemm dX chunk");
+                                CUDA_R_32F,
+                                static_cast<int>(input_size),
+                                CUBLAS_COMPUTE_32F,
+                                CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+                            "cublasGemmEx dX chunk");
                 profiler.AddUseful(mfu::GemmFlops(input_size, static_cast<size_t>(zgemm_k), gate_dim));
 
                 dx_chunk_elems = steps_in_chunk * batch_size * input_size;

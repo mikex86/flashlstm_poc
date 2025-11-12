@@ -141,17 +141,20 @@ def _run_case(lib: ctypes.CDLL, cfg: LstmConfig):
         cfg.hidden_size,
         dtype=torch.float16,
     ).contiguous().pin_memory()
+
     hy_device = torch.empty(cfg.batch_size, cfg.hidden_size, dtype=torch.float16, device=device).contiguous()
     cy_device = torch.empty(cfg.batch_size, cfg.hidden_size, dtype=torch.float16, device=device).contiguous()
 
     compute_stream = torch.cuda.Stream()
     h2d_stream = torch.cuda.Stream()
     d2h_stream = torch.cuda.Stream()
+
     stream_handles = {
         compute_stream.cuda_stream,
         h2d_stream.cuda_stream,
         d2h_stream.cuda_stream,
     }
+
     if len(stream_handles) != 3:
         raise RuntimeError("Streaming LSTM forward requires three distinct CUDA streams")
 

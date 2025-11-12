@@ -9,7 +9,6 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
-#include <random>
 #include <vector>
 #include <mutex>
 #include <optional>
@@ -117,44 +116,223 @@ namespace {
         }
         std::free(entry.base);
     }
+
+    __device__ __forceinline__ uint64_t SplitMix64(uint64_t x) {
+        x += 0x9E3779B97F4A7C15ull;
+        x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull;
+        x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
+        return x ^ (x >> 31);
+    }
+
+    __device__ __forceinline__ float UniformFloat01(uint64_t bits) {
+        constexpr double kInv = 1.0 / static_cast<double>(1ull << 53);
+        const double val = static_cast<double>(bits >> 11) * kInv;
+        return static_cast<float>(val);
+    }
+
+    __global__ void GenerateNormalKernel(
+        float *dst,
+        size_t count,
+        float mean,
+        float stddev,
+        uint64_t seed,
+        uint64_t index_offset
+    ) {
+        const size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+        const size_t stride = blockDim.x * gridDim.x;
+        constexpr float kTwoPi = 6.283185307179586476925286766559f;
+        for (size_t i = tid; i < count; i += stride) {
+            const uint64_t global_idx = index_offset + i;
+            const uint64_t bits0 = SplitMix64(seed + global_idx * 2ull);
+            const uint64_t bits1 = SplitMix64(seed + global_idx * 2ull + 1ull);
+            const float u1 = fmaxf(UniformFloat01(bits0), 1e-7f);
+            const float u2 = UniformFloat01(bits1);
+            const float magnitude = sqrtf(-2.0f * logf(u1));
+            const float z = magnitude * cosf(kTwoPi * u2);
+            dst[i] = mean + stddev * z;
+        }
+    }
+
+    __global__ void GenerateUniformKernel(
+        float *dst,
+        size_t count,
+        float low,
+        float high,
+        uint64_t seed,
+        uint64_t index_offset
+    ) {
+        const size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+        const size_t stride = blockDim.x * gridDim.x;
+        const float range = high - low;
+        for (size_t i = tid; i < count; i += stride) {
+            const uint64_t global_idx = index_offset + i;
+            const uint64_t bits = SplitMix64(seed + global_idx);
+            const float u = UniformFloat01(bits);
+            dst[i] = low + range * u;
+        }
+    }
+
+    __global__ void FloatToHalfKernel(const float *src, __half *dst, size_t count) {
+        const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+        if (idx >= count) {
+            return;
+        }
+        dst[idx] = __float2half(src[idx]);
+    }
+
+    inline int BlocksForCount(size_t count, int threads = 256) {
+        if (count == 0) {
+            return 1;
+        }
+        const size_t raw = (count + threads - 1) / threads;
+        return static_cast<int>(std::min<size_t>(raw, 65535));
+    }
+
+    void FillNormalHostBuffers(
+        float *device_float_buffer,
+        __half *device_half_buffer,
+        size_t chunk_capacity,
+        float *host_float_out,
+        __half *host_half_out,
+        size_t count,
+        float mean,
+        float stddev,
+        uint64_t seed
+    ) {
+        if (count == 0) {
+            return;
+        }
+        const int threads = 256;
+        uint64_t offset = 0;
+        while (offset < count) {
+            const size_t chunk = std::min(chunk_capacity, count - offset);
+            const int blocks = BlocksForCount(chunk, threads);
+            GenerateNormalKernel<<<blocks, threads>>>(
+                device_float_buffer,
+                chunk,
+                mean,
+                stddev,
+                seed,
+                offset
+            );
+            CheckCuda(cudaGetLastError(), "GenerateNormalKernel");
+            if (host_float_out != nullptr) {
+                CheckCuda(cudaMemcpy(
+                              host_float_out + offset,
+                              device_float_buffer,
+                              chunk * sizeof(float),
+                              cudaMemcpyDeviceToHost),
+                          "copy normal floats -> host");
+            }
+            if (host_half_out != nullptr) {
+                const int convert_blocks = BlocksForCount(chunk, threads);
+                FloatToHalfKernel<<<convert_blocks, threads>>>(device_float_buffer, device_half_buffer, chunk);
+                CheckCuda(cudaGetLastError(), "FloatToHalfKernel (normal init)");
+                CheckCuda(cudaMemcpy(
+                              host_half_out + offset,
+                              device_half_buffer,
+                              chunk * sizeof(__half),
+                              cudaMemcpyDeviceToHost),
+                          "copy normal halves -> host");
+            }
+            offset += chunk;
+        }
+    }
+
+    void FillUniformHostBuffer(
+        float *device_float_buffer,
+        const size_t chunk_capacity,
+        float *host_out,
+        const size_t count,
+        const float low,
+        const float high,
+        const uint64_t seed
+    ) {
+        if (count == 0) {
+            return;
+        }
+        constexpr int threads = 256;
+        uint64_t offset = 0;
+        while (offset < count) {
+            const size_t chunk = std::min(chunk_capacity, count - offset);
+            const int blocks = BlocksForCount(chunk, threads);
+            GenerateUniformKernel<<<blocks, threads>>>(
+                device_float_buffer,
+                chunk,
+                low,
+                high,
+                seed,
+                offset
+            );
+            CheckCuda(cudaGetLastError(), "GenerateUniformKernel");
+            CheckCuda(cudaMemcpy(
+                          host_out + offset,
+                          device_float_buffer,
+                          chunk * sizeof(float),
+                          cudaMemcpyDeviceToHost),
+                      "copy uniform floats -> host");
+            offset += chunk;
+        }
+    }
 } // namespace
 
 int main() {
-    constexpr size_t time_steps = 8192;
-    constexpr size_t batch_size = 512;
+    constexpr size_t time_steps = 2048;
+    constexpr size_t batch_size = 1024;
     constexpr size_t input_size = 1024;
     constexpr size_t hidden_size = 1024;
     constexpr size_t recompute_interval = 4;
     constexpr size_t gate_dim = 4 * hidden_size;
 
-    const size_t x_elements = time_steps * batch_size * input_size;
-    const size_t y_elements = time_steps * batch_size * hidden_size;
-    const size_t checkpoint_steps = (time_steps + recompute_interval - 1) / recompute_interval;
-    const size_t gate_elements = checkpoint_steps * batch_size * hidden_size * 2;
-    const size_t state_elements = batch_size * hidden_size;
-
-    std::mt19937 rng(0);
-    std::normal_distribution<float> normal_dist(0.0f, 1.0f);
-    auto sample_normal = [&]() -> float { return normal_dist(rng); };
+    constexpr size_t x_elements = time_steps * batch_size * input_size;
+    constexpr size_t y_elements = time_steps * batch_size * hidden_size;
+    constexpr size_t checkpoint_steps = (time_steps + recompute_interval - 1) / recompute_interval;
+    constexpr size_t gate_elements = checkpoint_steps * batch_size * hidden_size * 2;
+    constexpr size_t state_elements = batch_size * hidden_size;
 
     auto *x_host = CudaMallocHost<__half>(x_elements, "cudaMallocHost x_host");
     auto *y_host = CudaMallocHost<__half>(y_elements, "cudaMallocHost y_host");
     std::vector<float> x_host_float(x_elements);
     constexpr float kInputStd = 0.01f;
-    for (size_t i = 0; i < x_elements; ++i) {
-        const float value = kInputStd * sample_normal();
-        x_host[i] = __float2half(value);
-        x_host_float[i] = value;
-    }
+    constexpr size_t kNormalChunkElements = 1 << 22;
+    float *rng_chunk_float = CudaMallocDevice<float>(kNormalChunkElements, "cudaMalloc rng_chunk_float");
+    __half *rng_chunk_half = CudaMallocDevice<__half>(kNormalChunkElements, "cudaMalloc rng_chunk_half");
+    constexpr uint64_t kBaseSeed = 1337;
+    FillNormalHostBuffers(
+        rng_chunk_float,
+        rng_chunk_half,
+        kNormalChunkElements,
+        x_host_float.data(),
+        x_host,
+        x_elements,
+        0.0f,
+        kInputStd,
+        kBaseSeed
+    );
 
     std::vector<float> weight_ih_host(gate_dim * input_size);
     std::vector<float> weight_hh_host(gate_dim * hidden_size);
     std::vector<float> bias_ih_host(gate_dim, 0.0f);
     std::vector<float> bias_hh_host(gate_dim, 0.0f);
     const float weight_limit = 1.0f / std::sqrt(static_cast<float>(hidden_size));
-    std::uniform_real_distribution<float> weight_dist(-weight_limit, weight_limit);
-    for (auto &w: weight_ih_host) { w = weight_dist(rng); }
-    for (auto &w: weight_hh_host) { w = weight_dist(rng); }
+    FillUniformHostBuffer(
+        rng_chunk_float,
+        kNormalChunkElements,
+        weight_ih_host.data(),
+        weight_ih_host.size(),
+        -weight_limit,
+        weight_limit,
+        kBaseSeed + 4
+    );
+    FillUniformHostBuffer(
+        rng_chunk_float,
+        kNormalChunkElements,
+        weight_hh_host.data(),
+        weight_hh_host.size(),
+        -weight_limit,
+        weight_limit,
+        kBaseSeed + 5
+    );
 
     std::vector h0_host(state_elements, __float2half(0.0f));
     std::vector c0_host(state_elements, __float2half(0.0f));
@@ -243,13 +421,41 @@ int main() {
     std::vector<__half> dHN_host(state_elements);
     std::vector<__half> dCN_host(state_elements);
     constexpr float kGradStd = 0.005f;
-    for (size_t i = 0; i < y_elements; ++i) {
-        dY_host[i] = __float2half(kGradStd * sample_normal());
-    }
-    for (size_t i = 0; i < state_elements; ++i) {
-        dHN_host[i] = __float2half(kGradStd * sample_normal());
-        dCN_host[i] = __float2half(kGradStd * sample_normal());
-    }
+    FillNormalHostBuffers(
+        rng_chunk_float,
+        rng_chunk_half,
+        kNormalChunkElements,
+        nullptr,
+        dY_host,
+        y_elements,
+        0.0f,
+        kGradStd,
+        kBaseSeed + 1
+    );
+    FillNormalHostBuffers(
+        rng_chunk_float,
+        rng_chunk_half,
+        kNormalChunkElements,
+        nullptr,
+        dHN_host.data(),
+        state_elements,
+        0.0f,
+        kGradStd,
+        kBaseSeed + 2
+    );
+    FillNormalHostBuffers(
+        rng_chunk_float,
+        rng_chunk_half,
+        kNormalChunkElements,
+        nullptr,
+        dCN_host.data(),
+        state_elements,
+        0.0f,
+        kGradStd,
+        kBaseSeed + 3
+    );
+    cudaFree(rng_chunk_half);
+    cudaFree(rng_chunk_float);
 
     __half *dHN_device = CudaMallocDevice<__half>(state_elements, "cudaMalloc dHN_device");
     __half *dCN_device = CudaMallocDevice<__half>(state_elements, "cudaMalloc dCN_device");
@@ -438,7 +644,6 @@ int main() {
                 cudnn_backward_result.max_db_ih_delta,
                 cudnn_backward_result.max_db_hh_delta);
 #else
-    std::printf("cuDNN reference path disabled (build without FLASHLSTM_ENABLE_CUDNN)\n");
 #endif
 
     size_t nan_count = 0;

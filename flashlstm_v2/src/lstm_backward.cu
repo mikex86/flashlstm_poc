@@ -245,7 +245,7 @@ namespace {
 
     __global__ void PackInputStepKernel(
         const __half *x_step, // (B, I) row-major
-        __half *z_step, // (I+H, B) column-major
+        float *z_step, // (I+H, B) column-major float staging
         const size_t batch_size,
         const size_t input_size,
         const size_t hidden_size
@@ -259,12 +259,12 @@ namespace {
         const size_t input_idx = tmp % input_size;
         const size_t batch_idx = tmp / input_size;
         const size_t z_rows = input_size + hidden_size;
-        z_step[input_idx + batch_idx * z_rows] = x_step[idx];
+        z_step[input_idx + batch_idx * z_rows] = __half2float(x_step[idx]);
     }
 
     __global__ void PackHiddenStateKernel(
         const float *h_prev, // (B, H) row-major
-        __half *z_step, // (I+H, B) column-major
+        float *z_step, // (I+H, B) column-major float staging
         const size_t batch_size,
         const size_t input_size,
         const size_t hidden_size
@@ -278,7 +278,65 @@ namespace {
         const size_t hidden_idx = idx % hidden_size;
         const size_t z_rows = input_size + hidden_size;
         const float h_value = h_prev[idx];
-        z_step[input_size + hidden_idx + batch_idx * z_rows] = __float2half(h_value);
+        z_step[input_size + hidden_idx + batch_idx * z_rows] = h_value;
+    }
+
+    constexpr float kFp16SafeMax = 60000.0f;
+
+    __global__ void ScaleAndPackColumnsKernel(
+        const float *z_cols_float, // (I+H, B) column-major float
+        __half *z_cols_half, // (I+H, B) column-major half
+        float *column_scale, // (B,) scaling factors
+        size_t z_rows,
+        size_t batch_size
+    ) {
+        const size_t batch_idx = blockIdx.x;
+        if (batch_idx >= batch_size) {
+            return;
+        }
+        extern __shared__ float shared[];
+        const float *src = z_cols_float + batch_idx * z_rows;
+        __half *dst = z_cols_half + batch_idx * z_rows;
+
+        float local_max = 0.0f;
+        for (size_t row = threadIdx.x; row < z_rows; row += blockDim.x) {
+            const float value = src[row];
+            local_max = fmaxf(local_max, fabsf(value));
+        }
+        shared[threadIdx.x] = local_max;
+        __syncthreads();
+
+        for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+            if (threadIdx.x < stride) {
+                shared[threadIdx.x] = fmaxf(shared[threadIdx.x], shared[threadIdx.x + stride]);
+            }
+            __syncthreads();
+        }
+
+        float inv_scale = 1.0f;
+        if (threadIdx.x == 0) {
+            const float max_abs = shared[0];
+            float scale = 1.0f;
+            if (max_abs > 0.0f) {
+                scale = max_abs / kFp16SafeMax;
+                if (!(scale > 0.0f)) {
+                    scale = 1.0f;
+                }
+                inv_scale = 1.0f / scale;
+            } else {
+                inv_scale = 1.0f;
+            }
+            column_scale[batch_idx] = 1.0f / inv_scale;
+            shared[0] = inv_scale;
+        }
+        __syncthreads();
+        inv_scale = shared[0];
+
+        for (size_t row = threadIdx.x; row < z_rows; row += blockDim.x) {
+            float scaled = src[row] * inv_scale;
+            scaled = fminf(fmaxf(scaled, -kFp16SafeMax), kFp16SafeMax);
+            dst[row] = __float2half(scaled);
+        }
     }
 
     __global__ void RecomputePointwiseKernel(
@@ -288,6 +346,7 @@ namespace {
         float *h_next, // (B, H) row-major
         float *c_next, // (B, H) row-major
         float *gate_out, // (B, 4H) row-major or nullptr
+        const float *column_scale, // (B,) scaling factors for this step
         const size_t batch_size,
         const size_t hidden_size
     ) {
@@ -302,10 +361,14 @@ namespace {
         const size_t col = batch_idx;
         const size_t row_base = hidden_idx;
 
-        const float gi = gate_col[row_base + col * gate_dim] + bias[row_base + 0 * hidden_size];
-        const float gf = gate_col[row_base + hidden_size + col * gate_dim] + bias[row_base + 1 * hidden_size];
-        const float gg = gate_col[row_base + 2 * hidden_size + col * gate_dim] + bias[row_base + 2 * hidden_size];
-        const float go = gate_col[row_base + 3 * hidden_size + col * gate_dim] + bias[row_base + 3 * hidden_size];
+        const float scale = column_scale[col];
+        const float gi = gate_col[row_base + col * gate_dim] * scale + bias[row_base + 0 * hidden_size];
+        const float gf =
+            gate_col[row_base + hidden_size + col * gate_dim] * scale + bias[row_base + 1 * hidden_size];
+        const float gg =
+            gate_col[row_base + 2 * hidden_size + col * gate_dim] * scale + bias[row_base + 2 * hidden_size];
+        const float go =
+            gate_col[row_base + 3 * hidden_size + col * gate_dim] * scale + bias[row_base + 3 * hidden_size];
 
         const float i_gate = 1.0f / (1.0f + expf(-gi));
         const float f_gate = 1.0f / (1.0f + expf(-gf));
@@ -683,7 +746,9 @@ namespace flstm {
         DeviceBuffer<float> recompute_h_next;
         DeviceBuffer<float> recompute_c_prev;
         DeviceBuffer<float> recompute_c_next;
-        DeviceBuffer<__half> z_step_col;
+        DeviceBuffer<float> z_step_float;
+        DeviceBuffer<__half> z_step_half;
+        DeviceBuffer<float> column_scale_tmp;
         DeviceBuffer<float> gate_pre_col;
 
         const size_t z_chunk_elements = z_rows * chunk_tb_capacity;
@@ -709,7 +774,9 @@ namespace flstm {
         AllocateDeviceBuffer(recompute_h_next, bh_elements, "cudaMalloc recompute_h_next");
         AllocateDeviceBuffer(recompute_c_prev, bh_elements, "cudaMalloc recompute_c_prev");
         AllocateDeviceBuffer(recompute_c_next, bh_elements, "cudaMalloc recompute_c_next");
-        AllocateDeviceBuffer(z_step_col, z_step_elements, "cudaMalloc z_step_col");
+        AllocateDeviceBuffer(z_step_float, z_step_elements, "cudaMalloc z_step_float");
+        AllocateDeviceBuffer(z_step_half, z_step_elements, "cudaMalloc z_step_half");
+        AllocateDeviceBuffer(column_scale_tmp, batch_size, "cudaMalloc column_scale_tmp");
         AllocateDeviceBuffer(gate_pre_col, gate_step_elements, "cudaMalloc gate_pre_col");
 
         const int bias_blocks = BlocksFor(gate_dim, threads);
@@ -870,7 +937,7 @@ namespace flstm {
                     const int input_blocks = BlocksFor(batch_size * input_size, threads);
                     PackInputStepKernel<<<input_blocks, threads, 0, compute_stream>>>(
                         x_step_half,
-                        z_step_col.ptr,
+                        z_step_float.ptr,
                         batch_size,
                         input_size,
                         hidden_size
@@ -878,12 +945,22 @@ namespace flstm {
                     CheckCuda(cudaGetLastError(), "PackInputStepKernel");
                     PackHiddenStateKernel<<<point_blocks, threads, 0, compute_stream>>>(
                         recompute_h_prev.ptr,
-                        z_step_col.ptr,
+                        z_step_float.ptr,
                         batch_size,
                         input_size,
                         hidden_size
                     );
                     CheckCuda(cudaGetLastError(), "PackHiddenStateKernel");
+                    const int scale_blocks = static_cast<int>(batch_size);
+                    const size_t shared_bytes = threads * sizeof(float);
+                    ScaleAndPackColumnsKernel<<<scale_blocks, threads, shared_bytes, compute_stream>>>(
+                        z_step_float.ptr,
+                        z_step_half.ptr,
+                        column_scale_tmp.ptr,
+                        z_rows,
+                        batch_size
+                    );
+                    CheckCuda(cudaGetLastError(), "ScaleAndPackColumnsKernel recompute");
                     CheckCublas(cublasGemmEx(
                                     cublas.handle,
                                     CUBLAS_OP_T,
@@ -895,7 +972,7 @@ namespace flstm {
                                     weight_cat_col.ptr,
                                     CUDA_R_16F,
                                     static_cast<int>(z_rows),
-                                    z_step_col.ptr,
+                                    z_step_half.ptr,
                                     CUDA_R_16F,
                                     static_cast<int>(z_rows),
                                     &beta_zero,
@@ -918,6 +995,7 @@ namespace flstm {
                         recompute_h_next.ptr,
                         recompute_c_next.ptr,
                         gate_out_ptr,
+                        column_scale_tmp.ptr,
                         batch_size,
                         hidden_size
                     );

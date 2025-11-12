@@ -223,7 +223,7 @@ __global__ void FuseBiasKernel(
 
 __global__ void ConvertInputToZCacheKernel(
     const __half *x_src,           // (chunk_steps, B, I) half
-    __half *z_cache_col,           // (I+H, T*B) column-major
+    float *z_cache_col,            // (I+H, T*B) column-major float staging
     size_t time_offset,
     size_t chunk_steps,
     size_t batch_size,
@@ -244,12 +244,12 @@ __global__ void ConvertInputToZCacheKernel(
 
     const size_t column = time_idx * batch_size + batch_idx;
     const size_t z_rows = input_size + hidden_size;
-    z_cache_col[input_idx + column * z_rows] = x_src[idx];
+    z_cache_col[input_idx + column * z_rows] = __half2float(x_src[idx]);
 }
 
 __global__ void SeedHiddenColumnKernel(
     const float *h0,          // (B, H) row-major
-    __half *z_cache_col,      // (I+H, T*B) column-major
+    float *z_cache_col,       // (I+H, T*B) column-major float staging
     size_t batch_size,
     size_t input_size,
     size_t hidden_size
@@ -263,7 +263,65 @@ __global__ void SeedHiddenColumnKernel(
     const size_t hidden_idx = idx % hidden_size;
     const size_t z_rows = input_size + hidden_size;
     const float value = h0[batch_idx * hidden_size + hidden_idx];
-    z_cache_col[input_size + hidden_idx + batch_idx * z_rows] = __float2half(value);
+    z_cache_col[input_size + hidden_idx + batch_idx * z_rows] = value;
+}
+
+constexpr float kFp16SafeMax = 60000.0f;
+
+__global__ void ScaleAndPackColumnsKernel(
+    const float *z_cols_float,   // (I+H, B) column-major float
+    __half *z_cols_half,         // (I+H, B) column-major half
+    float *column_scale,         // (B,) scale factors to undo quantisation
+    size_t z_rows,
+    size_t batch_size
+) {
+    const size_t batch_idx = blockIdx.x;
+    if (batch_idx >= batch_size) {
+        return;
+    }
+    extern __shared__ float shared[];
+    const float *src = z_cols_float + batch_idx * z_rows;
+    __half *dst = z_cols_half + batch_idx * z_rows;
+
+    float local_max = 0.0f;
+    for (size_t row = threadIdx.x; row < z_rows; row += blockDim.x) {
+        const float value = src[row];
+        local_max = fmaxf(local_max, fabsf(value));
+    }
+    shared[threadIdx.x] = local_max;
+    __syncthreads();
+
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            shared[threadIdx.x] = fmaxf(shared[threadIdx.x], shared[threadIdx.x + stride]);
+        }
+        __syncthreads();
+    }
+
+    float inv_scale = 1.0f;
+    if (threadIdx.x == 0) {
+        const float max_abs = shared[0];
+        float scale = 1.0f;
+        if (max_abs > 0.0f) {
+            scale = max_abs / kFp16SafeMax;
+            if (!(scale > 0.0f)) {
+                scale = 1.0f;
+            }
+            inv_scale = 1.0f / scale;
+        } else {
+            inv_scale = 1.0f;
+        }
+        column_scale[batch_idx] = 1.0f / inv_scale;
+        shared[0] = inv_scale;
+    }
+    __syncthreads();
+    inv_scale = shared[0];
+
+    for (size_t row = threadIdx.x; row < z_rows; row += blockDim.x) {
+        float scaled = src[row] * inv_scale;
+        scaled = fminf(fmaxf(scaled, -kFp16SafeMax), kFp16SafeMax);
+        dst[row] = __float2half(scaled);
+    }
 }
 
 __global__ void ForwardPointwiseKernel(
@@ -276,7 +334,8 @@ __global__ void ForwardPointwiseKernel(
     __half *gate_cache_step,       // (B, 4H) row-major
     __half *h_cache,               // (T+1, B, H) row-major
     __half *c_cache,               // (T+1, B, H) row-major
-    __half *z_cache_col,           // (I+H, T*B) column-major
+    float *z_cache_col,            // (I+H, T*B) column-major float staging
+    const float *column_scale,     // (B,) scaling factors for this step
     size_t z_rows,
     size_t input_size,
     int has_next_column,
@@ -296,10 +355,14 @@ __global__ void ForwardPointwiseKernel(
     const size_t col = batch_idx;
     const size_t row_base = hidden_idx;
 
-    const float gi = gate_col[row_base + col * gate_dim] + bias[row_base + 0 * hidden_size];
-    const float gf = gate_col[row_base + hidden_size + col * gate_dim] + bias[row_base + 1 * hidden_size];
-    const float gg = gate_col[row_base + 2 * hidden_size + col * gate_dim] + bias[row_base + 2 * hidden_size];
-    const float go = gate_col[row_base + 3 * hidden_size + col * gate_dim] + bias[row_base + 3 * hidden_size];
+    const float scale = column_scale[col];
+    const float gi = gate_col[row_base + col * gate_dim] * scale + bias[row_base + 0 * hidden_size];
+    const float gf =
+        gate_col[row_base + hidden_size + col * gate_dim] * scale + bias[row_base + 1 * hidden_size];
+    const float gg =
+        gate_col[row_base + 2 * hidden_size + col * gate_dim] * scale + bias[row_base + 2 * hidden_size];
+    const float go =
+        gate_col[row_base + 3 * hidden_size + col * gate_dim] * scale + bias[row_base + 3 * hidden_size];
 
     const float i_gate = 1.0f / (1.0f + expf(-gi));
     const float f_gate = 1.0f / (1.0f + expf(-gf));
@@ -332,7 +395,7 @@ __global__ void ForwardPointwiseKernel(
     }
     if (has_next_column && z_cache_col != nullptr) {
         const size_t column = next_column_offset + batch_idx;
-        z_cache_col[input_size + hidden_idx + column * z_rows] = __float2half(h_val);
+        z_cache_col[input_size + hidden_idx + column * z_rows] = h_val;
     }
 }
 
@@ -474,9 +537,13 @@ void StreamingLstmForward(
     }
 
     const size_t z_chunk_elements = z_rows * chunk_capacity * batch_size;
-    DeviceBuffer<__half> z_chunk_device_buffer;
-    AllocateDeviceBuffer(z_chunk_device_buffer, z_chunk_elements, "cudaMalloc z_chunk");
-    __half *z_chunk_device = z_chunk_device_buffer.ptr;
+    DeviceBuffer<float> z_chunk_float_buffer;
+    AllocateDeviceBuffer(z_chunk_float_buffer, z_chunk_elements, "cudaMalloc z_chunk_float");
+    float *z_chunk_float = z_chunk_float_buffer.ptr;
+    DeviceBuffer<__half> z_step_half_buffer;
+    AllocateDeviceBuffer(z_step_half_buffer, z_rows * batch_size, "cudaMalloc z_step_half");
+    DeviceBuffer<float> column_scale_buffer;
+    AllocateDeviceBuffer(column_scale_buffer, batch_size, "cudaMalloc column_scale");
 
     DeviceBuffer<float> h0_float;
     DeviceBuffer<float> c0_float;
@@ -613,7 +680,7 @@ void StreamingLstmForward(
             const int convert_blocks = BlocksFor(chunk_input_elems, threads);
             ConvertInputToZCacheKernel<<<convert_blocks, threads, 0, compute_stream>>>(
                 x_chunk_buffers[slot].ptr,
-                z_chunk_device,
+                z_chunk_float,
                 0,
                 steps_in_chunk,
                 batch_size,
@@ -625,7 +692,7 @@ void StreamingLstmForward(
         if (steps_in_chunk > 0) {
             SeedHiddenColumnKernel<<<seed_blocks, threads, 0, compute_stream>>>(
                 h_prev.ptr,
-                z_chunk_device,
+                z_chunk_float,
                 batch_size,
                 input_size,
                 hidden_size
@@ -653,7 +720,17 @@ void StreamingLstmForward(
         for (size_t step = 0; step < steps_in_chunk; ++step) {
             const size_t global_step = chunk_start_step + step;
             const size_t column_offset = step * batch_size;
-            const __half *z_step = z_chunk_device + column_offset * z_rows;
+            float *z_step_float = z_chunk_float + column_offset * z_rows;
+            const int scale_blocks = static_cast<int>(batch_size);
+            const size_t shared_bytes = threads * sizeof(float);
+            ScaleAndPackColumnsKernel<<<scale_blocks, threads, shared_bytes, compute_stream>>>(
+                z_step_float,
+                z_step_half_buffer.ptr,
+                column_scale_buffer.ptr,
+                z_rows,
+                batch_size
+            );
+            CheckCuda(cudaGetLastError(), "ScaleAndPackColumnsKernel");
             __half *y_step = nullptr;
             if (needs_y_fallback && y_chunk_half[slot].ptr != nullptr) {
                 y_step = y_chunk_half[slot].ptr + step * bh_elements;
@@ -704,7 +781,7 @@ void StreamingLstmForward(
                             weight_cat_half.ptr,
                             CUDA_R_16F,
                             static_cast<int>(z_rows),
-                            z_step,
+                            z_step_half_buffer.ptr,
                             CUDA_R_16F,
                             static_cast<int>(z_rows),
                             &beta_zero_f,
@@ -729,7 +806,8 @@ void StreamingLstmForward(
                 gate_cache_step,
                 nullptr,
                 nullptr,
-                z_chunk_device,
+                z_chunk_float,
+                column_scale_buffer.ptr,
                 z_rows,
                 input_size,
                 has_next_column ? 1 : 0,

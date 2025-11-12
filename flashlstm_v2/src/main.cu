@@ -277,7 +277,7 @@ namespace {
 } // namespace
 
 int main() {
-    constexpr size_t time_steps = 2048;
+    constexpr size_t time_steps = 8192;
     constexpr size_t batch_size = 1024;
     constexpr size_t input_size = 1024;
     constexpr size_t hidden_size = 1024;

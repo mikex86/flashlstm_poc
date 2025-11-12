@@ -139,7 +139,7 @@ def _run_case(lib: ctypes.CDLL, cfg: LstmConfig):
         2,
         cfg.batch_size,
         cfg.hidden_size,
-        dtype=torch.float16,
+        dtype=torch.float32,
     ).contiguous().pin_memory()
 
     hy_device = torch.empty(cfg.batch_size, cfg.hidden_size, dtype=torch.float16, device=device).contiguous()

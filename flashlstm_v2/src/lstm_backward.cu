@@ -424,11 +424,11 @@ namespace {
         size_t gate_dim;
         size_t input_size;
         size_t bh_elements;
-        const __half *checkpoint_cache_host;
+        const float *checkpoint_cache_host;
         const __half *x_tensor_host;
         const __half *y_tensor_host;
         const __half *dY_tensor_host;
-        DeviceBuffer<__half> *checkpoint_half;
+        DeviceBuffer<float> *checkpoint_half;
         DeviceBuffer<__half> *x_chunk_half;
         DeviceBuffer<__half> *y_chunk_half;
         DeviceBuffer<__half> *dY_chunk_half;
@@ -515,11 +515,11 @@ namespace {
         }
 
         if (params.checkpoint_cache_host != nullptr && params.checkpoint_half[slot].ptr != nullptr) {
-            const __half *checkpoint_src = params.checkpoint_cache_host + checkpoint_index * 2 * params.bh_elements;
+            const float *checkpoint_src = params.checkpoint_cache_host + checkpoint_index * 2 * params.bh_elements;
             CheckCuda(cudaMemcpyAsync(
                           params.checkpoint_half[slot].ptr,
                           checkpoint_src,
-                          2 * params.bh_elements * sizeof(__half),
+                          2 * params.bh_elements * sizeof(float),
                           cudaMemcpyHostToDevice,
                           params.h2d_stream),
                       "copy checkpoint state");
@@ -543,7 +543,7 @@ namespace flstm {
 
         const __half *x_tensor_host,
         const __half *y_tensor_host,
-        const __half *gate_cache_host,
+        const float *gate_cache_host,
 
         const __half *dY_tensor_host,
         const __half *d_hn_device,
@@ -678,7 +678,7 @@ namespace flstm {
         DeviceBuffer<float> dX_chunk_col[2];
         DeviceBuffer<__half> dx_chunk_half[2];
         DeviceBuffer<__half> y_prev_half[2];
-        DeviceBuffer<__half> checkpoint_half[2];
+        DeviceBuffer<float> checkpoint_half[2];
         DeviceBuffer<float> recompute_h_prev;
         DeviceBuffer<float> recompute_h_next;
         DeviceBuffer<float> recompute_c_prev;
@@ -849,19 +849,20 @@ namespace flstm {
             }
 
             if (recompute_steps > 0) {
-                const int checkpoint_blocks = BlocksFor(bh_elements, threads);
-                HalfToFloatKernel<<<checkpoint_blocks, threads, 0, compute_stream>>>(
-                    checkpoint_half[slot].ptr,
-                    recompute_h_prev.ptr,
-                    bh_elements
-                );
-                CheckCuda(cudaGetLastError(), "HalfToFloatKernel checkpoint h");
-                HalfToFloatKernel<<<checkpoint_blocks, threads, 0, compute_stream>>>(
-                    checkpoint_half[slot].ptr + bh_elements,
-                    recompute_c_prev.ptr,
-                    bh_elements
-                );
-                CheckCuda(cudaGetLastError(), "HalfToFloatKernel checkpoint c");
+                CheckCuda(cudaMemcpyAsync(
+                              recompute_h_prev.ptr,
+                              checkpoint_half[slot].ptr,
+                              bh_elements * sizeof(float),
+                              cudaMemcpyDeviceToDevice,
+                              compute_stream),
+                          "copy checkpoint h");
+                CheckCuda(cudaMemcpyAsync(
+                              recompute_c_prev.ptr,
+                              checkpoint_half[slot].ptr + bh_elements,
+                              bh_elements * sizeof(float),
+                              cudaMemcpyDeviceToDevice,
+                              compute_stream),
+                          "copy checkpoint c");
 
                 for (size_t local_step = 0; local_step < recompute_steps; ++local_step) {
                     const __half *x_step_half =
@@ -1171,7 +1172,7 @@ extern "C" void flstm_StreamingLstmBackward(
 
     const __half *x_tensor_host,
     const __half *y_tensor_host,
-    const __half *gate_cache_host,
+    const float *gate_cache_host,
 
     const __half *dY_tensor_host,
     const __half *d_hn_device,

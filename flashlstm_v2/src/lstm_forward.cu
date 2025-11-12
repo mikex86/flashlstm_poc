@@ -411,7 +411,7 @@ void StreamingLstmForward(
 
     __half *y_tensor_host,
 
-    __half *gate_cache_host,
+    float *gate_cache_host,
     __half *hy_device,
     __half *cy_device,
 
@@ -468,7 +468,7 @@ void StreamingLstmForward(
     if (store_checkpoints) {
         gate_host_registration.reset(
             gate_cache_host,
-            checkpoint_elements * sizeof(__half),
+            checkpoint_elements * sizeof(float),
             "cudaHostRegister checkpoint_cache_host"
         );
     }
@@ -548,7 +548,7 @@ void StreamingLstmForward(
 
     const size_t max_checkpoints_per_chunk = std::max<size_t>(1, (chunk_capacity + checkpoint_stride - 1) / checkpoint_stride + 1);
     const size_t checkpoint_entry_elements = 2 * bh_elements;
-    DeviceBuffer<__half> checkpoint_chunks[2];
+    DeviceBuffer<float> checkpoint_chunks[2];
     if (store_checkpoints) {
         AllocateDeviceBufferArray(checkpoint_chunks, max_checkpoints_per_chunk * checkpoint_entry_elements, "cudaMalloc checkpoint_chunk");
     }
@@ -664,19 +664,21 @@ void StreamingLstmForward(
                 global_step == next_checkpoint_step) {
                 if (checkpoint_global_index < checkpoint_count) {
                     const size_t checkpoint_slot_offset = checkpoint_counts[slot] * checkpoint_entry_elements;
-                    __half *checkpoint_dst = checkpoint_chunks[slot].ptr + checkpoint_slot_offset;
-                    FloatToHalfKernel<<<bh_blocks, threads, 0, compute_stream>>>(
-                        h_prev.ptr,
-                        checkpoint_dst,
-                        bh_elements
-                    );
-                    CheckCuda(cudaGetLastError(), "FloatToHalfKernel checkpoint h");
-                    FloatToHalfKernel<<<bh_blocks, threads, 0, compute_stream>>>(
-                        c_prev.ptr,
-                        checkpoint_dst + bh_elements,
-                        bh_elements
-                    );
-                    CheckCuda(cudaGetLastError(), "FloatToHalfKernel checkpoint c");
+                    float *checkpoint_dst = checkpoint_chunks[slot].ptr + checkpoint_slot_offset;
+                    CheckCuda(cudaMemcpyAsync(
+                                  checkpoint_dst,
+                                  h_prev.ptr,
+                                  bh_elements * sizeof(float),
+                                  cudaMemcpyDeviceToDevice,
+                                  compute_stream),
+                              "copy checkpoint h");
+                    CheckCuda(cudaMemcpyAsync(
+                                  checkpoint_dst + bh_elements,
+                                  c_prev.ptr,
+                                  bh_elements * sizeof(float),
+                                  cudaMemcpyDeviceToDevice,
+                                  compute_stream),
+                              "copy checkpoint c");
                     if (checkpoint_counts[slot] == 0) {
                         checkpoint_host_offsets[slot] = checkpoint_global_index;
                     }
@@ -751,12 +753,12 @@ void StreamingLstmForward(
             const size_t checkpoint_count_chunk = checkpoint_counts[slot];
             if (checkpoint_count_chunk > 0) {
                 const size_t elements = checkpoint_count_chunk * checkpoint_entry_elements;
-                __half *dst = gate_cache_host + checkpoint_host_offsets[slot] * checkpoint_entry_elements;
-                const __half *src = checkpoint_chunks[slot].ptr;
+                float *dst = gate_cache_host + checkpoint_host_offsets[slot] * checkpoint_entry_elements;
+                const float *src = checkpoint_chunks[slot].ptr;
                 CheckCuda(cudaMemcpyAsync(
                               dst,
                               src,
-                              elements * sizeof(__half),
+                              elements * sizeof(float),
                               cudaMemcpyDeviceToHost,
                               d2h_stream),
                           "copy checkpoint chunk");
@@ -837,7 +839,7 @@ extern "C" void flstm_StreamingLstmForward(
 
     __half *y_tensor_host,
 
-    __half *gate_cache_host,
+    float *gate_cache_host,
     __half *hy_device,
     __half *cy_device,
 

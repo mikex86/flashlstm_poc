@@ -24,7 +24,7 @@ CudnnForwardComparisonResult RunCudnnForwardComparison(
     const float *h0_host_float,
     const float *c0_host_float,
     const __half *y_host,
-    const __half *gate_cache_host,
+    const float *gate_cache_host,
     const __half *hy_host,
     const __half *cy_host);
 
@@ -51,7 +51,7 @@ CudnnBackwardComparisonResult RunCudnnBackwardComparison(
     const float *h0_host_float,
     const float *c0_host_float,
     const __half *y_host,
-    const __half *gate_cache_host,
+    const float *gate_cache_host,
     const __half *dY_host,
     const std::vector<__half> &dHN_host_half,
     const std::vector<__half> &dCN_host_half,

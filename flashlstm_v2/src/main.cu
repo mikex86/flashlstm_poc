@@ -348,7 +348,7 @@ int main() {
     __half *hy_device_out = CudaMallocDevice<__half>(state_elements, "cudaMalloc hy_device");
     __half *cy_device_out = CudaMallocDevice<__half>(state_elements, "cudaMalloc cy_device");
 
-    __half *gate_cache_host = CudaMallocHost<__half>(gate_elements, "cudaMallocHost gate_cache");
+    float *gate_cache_host = CudaMallocHost<float>(gate_elements, "cudaMallocHost gate_cache");
 
     CheckCuda(cudaMemcpy(h0_device, h0_host.data(), state_elements * sizeof(__half), cudaMemcpyHostToDevice),
               "memcpy h0");

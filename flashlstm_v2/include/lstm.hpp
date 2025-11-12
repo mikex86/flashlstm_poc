@@ -17,7 +17,7 @@ namespace flstm {
  *
  * Outputs:
  *   - y_tensor_host:     (T, B, H) in pinned host memory (__half)
- *   - gate_cache_host:   checkpoint buffer storing (⌈T / R⌉, 2, B, H) FP16
+ *   - gate_cache_host:   checkpoint buffer storing (⌈T / R⌉, 2, B, H) FP32
  *                        states (h and c) where R is `recompute_interval`
  *                        controlling how frequently backward checkpoints are
  *                        materialised to host.
@@ -43,7 +43,7 @@ void StreamingLstmForward(
 
     __half *y_tensor_host,
 
-    __half *gate_cache_host,
+    float *gate_cache_host,
     __half *hy_device,
     __half *cy_device,
 
@@ -57,7 +57,7 @@ void StreamingLstmForward(
  *
  * Inputs:
  *   - x_tensor_host:    (T, B, I) inputs in pinned host memory (__half)
- *   - gate_cache_host:  checkpoint buffer storing (⌈T / R⌉, 2, B, H) FP16
+ *   - gate_cache_host:  checkpoint buffer storing (⌈T / R⌉, 2, B, H) FP32
  *                       states (h and c) captured every `recompute_interval`
  *                       steps to seed backward recomputation.
  *   - dY_tensor_host:   upstream grads w.r.t outputs in host half precision
@@ -84,7 +84,7 @@ void StreamingLstmBackward(
 
     const __half *x_tensor_host,
     const __half *y_tensor_host,
-    const __half *gate_cache_host,
+    const float *gate_cache_host,
 
     const __half *dY_tensor_host,
     const __half *d_hn_device,
@@ -132,7 +132,7 @@ void flstm_StreamingLstmForward(
 
     __half *y_tensor_host,
 
-    __half *gate_cache_host,
+    float *gate_cache_host,
     __half *hy_device,
     __half *cy_device,
 
@@ -150,7 +150,7 @@ void flstm_StreamingLstmBackward(
 
     const __half *x_tensor_host,
     const __half *y_tensor_host,
-    const __half *gate_cache_host,
+    const float *gate_cache_host,
 
     const __half *dY_tensor_host,
     const __half *d_hn_device,

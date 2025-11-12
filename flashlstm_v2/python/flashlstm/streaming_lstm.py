@@ -20,6 +20,15 @@ def _check_pinned_half(tensor: torch.Tensor, name: str) -> None:
         raise ValueError(f"{name} must be allocated in pinned memory (tensor.pin_memory()).")
 
 
+def _check_pinned_float(tensor: torch.Tensor, name: str) -> None:
+    if tensor.device.type != "cpu":
+        raise ValueError(f"{name} must reside on the CPU (pinned host memory).")
+    if tensor.dtype != torch.float32:
+        raise ValueError(f"{name} must use dtype torch.float32, got {tensor.dtype}.")
+    if not tensor.is_pinned():
+        raise ValueError(f"{name} must be allocated in pinned memory (tensor.pin_memory()).")
+
+
 def _ensure_half_cuda(
     tensor: Optional[torch.Tensor],
     shape: Tuple[int, ...],
@@ -95,7 +104,7 @@ class _StreamingLSTMFunction(Function):
         )
         gate_cache_host = torch.empty(
             (checkpoint_steps, 2, batch_size, hidden_size),
-            dtype=torch.float16,
+            dtype=torch.float32,
             pin_memory=True,
         )
         hy_device = torch.empty(
@@ -172,6 +181,7 @@ class _StreamingLSTMFunction(Function):
             gate_cache_host,
         ) = ctx.saved_tensors
         time_steps, batch_size, input_size, hidden_size, recompute_interval = ctx.meta
+        _check_pinned_float(gate_cache_host, "gate_cache_host")
 
         if grad_y_host is None:
             grad_y_host = torch.zeros_like(y_host)

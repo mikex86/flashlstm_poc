@@ -13,21 +13,17 @@ def _random_pinned_half(shape):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
 def test_streaming_lstm_matches_torch_lstm():
     torch.manual_seed(1234)
-    torch.cuda.manual_seed_all(1234)
 
     time_steps = 4
     batch_size = 2
     input_size = 3
     hidden_size = 5
 
-    module = StreamingLSTM(input_size, hidden_size).cuda()
-    reference = torch.nn.LSTM(input_size, hidden_size, batch_first=False).cuda()
+    module = StreamingLSTM(input_size, hidden_size)
 
-    with torch.no_grad():
-        reference.weight_ih_l0.copy_(module.weight_ih)
-        reference.weight_hh_l0.copy_(module.weight_hh)
-        reference.bias_ih_l0.copy_(module.bias_ih)
-        reference.bias_hh_l0.copy_(module.bias_hh)
+    torch.manual_seed(1234)
+
+    reference = torch.nn.LSTM(input_size, hidden_size, batch_first=False, device='cuda')
 
     x_host = _random_pinned_half((time_steps, batch_size, input_size)).contiguous()
     x_ref = x_host.to(device="cuda", dtype=torch.float32)
@@ -91,3 +87,6 @@ def test_streaming_lstm_matches_torch_lstm():
         rtol=1e-3,
         atol=5e-3,
     )
+
+if __name__ == '__main__':
+    pytest.main([__file__])

@@ -333,11 +333,9 @@ class StreamingLSTM(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
-        std = 1.0 / math.sqrt(self.hidden_size)
-        nn.init.uniform_(self.weight_ih, -std, std)
-        nn.init.uniform_(self.weight_hh, -std, std)
-        nn.init.zeros_(self.bias_ih)
-        nn.init.zeros_(self.bias_hh)
+        std = 1.0 / math.sqrt(self.hidden_size) if self.hidden_size > 0 else 0.0
+        for param in self.parameters():
+            nn.init.uniform_(param, -std, std)
 
     def forward(
         self,

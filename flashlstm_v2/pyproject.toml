@@ -17,6 +17,9 @@ classifiers = [
     "Operating System :: POSIX :: Linux",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
+dependencies = [
+    "torch>=2.5.1",
+]
 
 [tool.scikit-build]
 cmake.version = ">=3.18"

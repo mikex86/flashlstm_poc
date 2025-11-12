@@ -282,7 +282,7 @@ namespace {
     }
 
     __global__ void RecomputePointwiseKernel(
-        const __half *gate_col, // (4H, B) column-major
+        const float *gate_col, // (4H, B) column-major
         const float *bias, // (4H,)
         const float *c_prev, // (B, H) row-major
         float *h_next, // (B, H) row-major
@@ -302,14 +302,10 @@ namespace {
         const size_t col = batch_idx;
         const size_t row_base = hidden_idx;
 
-        const float gi =
-            __half2float(gate_col[row_base + col * gate_dim]) + bias[row_base + 0 * hidden_size];
-        const float gf =
-            __half2float(gate_col[row_base + hidden_size + col * gate_dim]) + bias[row_base + 1 * hidden_size];
-        const float gg =
-            __half2float(gate_col[row_base + 2 * hidden_size + col * gate_dim]) + bias[row_base + 2 * hidden_size];
-        const float go =
-            __half2float(gate_col[row_base + 3 * hidden_size + col * gate_dim]) + bias[row_base + 3 * hidden_size];
+        const float gi = gate_col[row_base + col * gate_dim] + bias[row_base + 0 * hidden_size];
+        const float gf = gate_col[row_base + hidden_size + col * gate_dim] + bias[row_base + 1 * hidden_size];
+        const float gg = gate_col[row_base + 2 * hidden_size + col * gate_dim] + bias[row_base + 2 * hidden_size];
+        const float go = gate_col[row_base + 3 * hidden_size + col * gate_dim] + bias[row_base + 3 * hidden_size];
 
         const float i_gate = 1.0f / (1.0f + expf(-gi));
         const float f_gate = 1.0f / (1.0f + expf(-gf));
@@ -688,7 +684,7 @@ namespace flstm {
         DeviceBuffer<float> recompute_c_prev;
         DeviceBuffer<float> recompute_c_next;
         DeviceBuffer<__half> z_step_col;
-        DeviceBuffer<__half> gate_pre_col;
+        DeviceBuffer<float> gate_pre_col;
 
         const size_t z_chunk_elements = z_rows * chunk_tb_capacity;
         const size_t dX_chunk_elements = input_size * chunk_tb_capacity;
@@ -903,7 +899,7 @@ namespace flstm {
                                     static_cast<int>(z_rows),
                                     &beta_zero,
                                     gate_pre_col.ptr,
-                                    CUDA_R_16F,
+                                    CUDA_R_32F,
                                     static_cast<int>(gate_dim),
                                     CUBLAS_COMPUTE_32F,
                                     CUBLAS_GEMM_DEFAULT_TENSOR_OP),

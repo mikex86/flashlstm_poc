@@ -24,7 +24,9 @@ CudnnForwardComparisonResult RunCudnnForwardComparison(
     const float *h0_host_float,
     const float *c0_host_float,
     const __half *y_host,
-    const __half *gate_cache_host);
+    const __half *gate_cache_host,
+    const __half *hy_host,
+    const __half *cy_host);
 
 struct CudnnBackwardComparisonResult {
     float max_dx_delta;

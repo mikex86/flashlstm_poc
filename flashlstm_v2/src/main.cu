@@ -11,6 +11,8 @@
 #include <cstdlib>
 #include <random>
 #include <vector>
+#include <mutex>
+#include <optional>
 
 namespace {
     void CheckCuda(cudaError_t status, const char *what) {
@@ -29,27 +31,32 @@ namespace {
     }
 
 
+    struct FallbackHostAllocation {
+        void *base{nullptr};
+        size_t bytes{0};
+        std::vector<void *> registered_ptrs;
+    };
+
+    std::mutex &HostAllocMutex() {
+        static std::mutex mutex;
+        return mutex;
+    }
+
+    std::vector<FallbackHostAllocation> &HostAllocTable() {
+        static std::vector<FallbackHostAllocation> table;
+        return table;
+    }
+
     template<typename T>
     T *CudaMallocHost(const size_t count, const char *what) {
         if (count == 0) {
             return nullptr;
         }
         const size_t bytes = count * sizeof(T);
-        T *ptr = nullptr;
-        cudaError_t err = cudaMallocHost(&ptr, bytes);
-        if (err == cudaSuccess) {
-            return ptr;
-        }
-        if (err != cudaErrorInvalidValue) {
-            std::fprintf(stderr, "%s failed: %s\n", what, cudaGetErrorString(err));
-            std::abort();
-        }
-
-        // Fall back to manual allocation + chunked host registration to dodge per-call size limits.
         constexpr size_t kPageAlignment = 4096;
         void *raw = nullptr;
         if (posix_memalign(&raw, kPageAlignment, bytes) != 0 || raw == nullptr) {
-            std::fprintf(stderr, "%s fallback memalign failed\n", what);
+            std::fprintf(stderr, "%s posix_memalign failed\n", what);
             std::abort();
         }
         auto *base = static_cast<uint8_t *>(raw);
@@ -61,9 +68,9 @@ namespace {
         while (offset < bytes) {
             const size_t remaining = bytes - offset;
             const size_t this_size = std::min(aligned_chunk, remaining);
-            err = cudaHostRegister(base + offset, this_size, cudaHostRegisterPortable);
+            const cudaError_t err = cudaHostRegister(base + offset, this_size, cudaHostRegisterPortable);
             if (err != cudaSuccess) {
-                std::fprintf(stderr, "%s fallback cudaHostRegister failed: %s\n", what, cudaGetErrorString(err));
+                std::fprintf(stderr, "%s cudaHostRegister failed: %s\n", what, cudaGetErrorString(err));
                 for (void *p: registered_ptrs) {
                     cudaHostUnregister(p);
                 }
@@ -73,20 +80,57 @@ namespace {
             registered_ptrs.push_back(base + offset);
             offset += this_size;
         }
+        {
+            std::lock_guard lock(HostAllocMutex());
+            FallbackHostAllocation record{};
+            record.base = base;
+            record.bytes = bytes;
+            record.registered_ptrs = std::move(registered_ptrs);
+            HostAllocTable().push_back(std::move(record));
+        }
         return reinterpret_cast<T *>(base);
+    }
+
+    void CudaFreeHostWrapper(void *ptr) {
+        if (ptr == nullptr) {
+            return;
+        }
+        FallbackHostAllocation entry{};
+        {
+            std::lock_guard lock(HostAllocMutex());
+            auto &table = HostAllocTable();
+            auto it = std::find_if(
+                table.begin(),
+                table.end(),
+                [&](const FallbackHostAllocation &alloc) { return alloc.base == ptr; }
+            );
+            if (it == table.end()) {
+                std::fprintf(stderr, "CudaFreeHostWrapper: pointer %p not tracked; freeing directly\n", ptr);
+                std::free(ptr);
+                return;
+            }
+            entry = std::move(*it);
+            table.erase(it);
+        }
+        for (void *reg: entry.registered_ptrs) {
+            cudaHostUnregister(reg);
+        }
+        std::free(entry.base);
     }
 } // namespace
 
 int main() {
-    constexpr size_t time_steps = 2048;
-    constexpr size_t batch_size = 32;
+    constexpr size_t time_steps = 8192;
+    constexpr size_t batch_size = 512;
     constexpr size_t input_size = 1024;
     constexpr size_t hidden_size = 1024;
+    constexpr size_t recompute_interval = 4;
     constexpr size_t gate_dim = 4 * hidden_size;
 
     const size_t x_elements = time_steps * batch_size * input_size;
     const size_t y_elements = time_steps * batch_size * hidden_size;
-    const size_t gate_elements = time_steps * batch_size * gate_dim;
+    const size_t checkpoint_steps = (time_steps + recompute_interval - 1) / recompute_interval;
+    const size_t gate_elements = checkpoint_steps * batch_size * hidden_size * 2;
     const size_t state_elements = batch_size * hidden_size;
 
     std::mt19937 rng(0);
@@ -112,10 +156,10 @@ int main() {
     for (auto &w: weight_ih_host) { w = weight_dist(rng); }
     for (auto &w: weight_hh_host) { w = weight_dist(rng); }
 
-    std::vector<__half> h0_host(state_elements, __float2half(0.0f));
-    std::vector<__half> c0_host(state_elements, __float2half(0.0f));
-    std::vector<float> h0_host_float(state_elements, 0.0f);
-    std::vector<float> c0_host_float(state_elements, 0.0f);
+    std::vector h0_host(state_elements, __float2half(0.0f));
+    std::vector c0_host(state_elements, __float2half(0.0f));
+    std::vector h0_host_float(state_elements, 0.0f);
+    std::vector c0_host_float(state_elements, 0.0f);
 
     __half *h0_device = CudaMallocDevice<__half>(state_elements, "cudaMalloc h0_device");
     __half *c0_device = CudaMallocDevice<__half>(state_elements, "cudaMalloc c0_device");
@@ -153,6 +197,7 @@ int main() {
         batch_size,
         input_size,
         hidden_size,
+        recompute_interval,
         x_host,
         h0_device,
         c0_device,
@@ -175,6 +220,7 @@ int main() {
         batch_size,
         input_size,
         hidden_size,
+        recompute_interval,
         x_host,
         h0_device,
         c0_device,
@@ -225,6 +271,7 @@ int main() {
         batch_size,
         input_size,
         hidden_size,
+        recompute_interval,
         x_host,
         y_host,
         gate_cache_host,
@@ -235,6 +282,8 @@ int main() {
         c0_device,
         weight_ih_device,
         weight_hh_device,
+        bias_ih_device,
+        bias_hh_device,
         dx_host,
         dW_ih_device,
         dW_hh_device,
@@ -253,6 +302,7 @@ int main() {
         batch_size,
         input_size,
         hidden_size,
+        recompute_interval,
         x_host,
         y_host,
         gate_cache_host,
@@ -263,6 +313,8 @@ int main() {
         c0_device,
         weight_ih_device,
         weight_hh_device,
+        bias_ih_device,
+        bias_hh_device,
         dx_host,
         dW_ih_device,
         dW_hh_device,
@@ -276,6 +328,22 @@ int main() {
     );
     CheckCuda(cudaDeviceSynchronize(), "backward synchronize");
 
+    std::vector<__half> hy_host_final(state_elements);
+    std::vector<__half> cy_host_final(state_elements);
+    CheckCuda(cudaMemcpy(
+                  hy_host_final.data(),
+                  hy_device_out,
+                  state_elements * sizeof(__half),
+                  cudaMemcpyDeviceToHost),
+              "memcpy hy_host_final");
+    CheckCuda(cudaMemcpy(
+                  cy_host_final.data(),
+                  cy_device_out,
+                  state_elements * sizeof(__half),
+                  cudaMemcpyDeviceToHost),
+              "memcpy cy_host_final");
+
+#ifdef FLASHLSTM_ENABLE_CUDNN
     CudnnForwardComparisonResult cudnn_forward_result = RunCudnnForwardComparison(
         time_steps,
         batch_size,
@@ -289,7 +357,9 @@ int main() {
         h0_host_float.data(),
         c0_host_float.data(),
         y_host,
-        gate_cache_host
+        gate_cache_host,
+        hy_host_final.data(),
+        cy_host_final.data()
     );
 
     const float cudnn_forward_tol = 5e-2f;
@@ -367,6 +437,9 @@ int main() {
                 cudnn_backward_result.max_dW_hh_delta,
                 cudnn_backward_result.max_db_ih_delta,
                 cudnn_backward_result.max_db_hh_delta);
+#else
+    std::printf("cuDNN reference path disabled (build without FLASHLSTM_ENABLE_CUDNN)\n");
+#endif
 
     size_t nan_count = 0;
     size_t inf_count = 0;
@@ -392,11 +465,11 @@ int main() {
     std::printf("Max |dx| = %.6f, mean |dx| = %.6f\n", dx_max, dx_mean);
     std::printf("NaN count = %zu, Inf count = %zu\n", nan_count, inf_count);
 
-    cudaFreeHost(dx_host);
-    cudaFreeHost(dY_host);
-    cudaFreeHost(y_host);
-    cudaFreeHost(gate_cache_host);
-    cudaFreeHost(x_host);
+    CudaFreeHostWrapper(dx_host);
+    CudaFreeHostWrapper(dY_host);
+    CudaFreeHostWrapper(y_host);
+    CudaFreeHostWrapper(gate_cache_host);
+    CudaFreeHostWrapper(x_host);
     cudaFree(dW_ih_device);
     cudaFree(dW_hh_device);
     cudaFree(db_ih_device);
@@ -417,6 +490,8 @@ int main() {
     cudaStreamDestroy(d2h_stream);
     cudaStreamDestroy(h2d_stream);
     cudaStreamDestroy(compute_stream);
+
+    cudaDeviceReset();
 
     return 0;
 }

@@ -47,10 +47,14 @@ class _StreamingLSTMFunction(Function):
         weight_hh: torch.Tensor,
         bias_ih: torch.Tensor,
         bias_hh: torch.Tensor,
+        recompute_interval: int,
     ):
         _check_pinned_half(x_host, "x_host")
         if not x_host.is_contiguous():
             x_host = x_host.contiguous()
+
+        if recompute_interval <= 0:
+            raise ValueError(f"recompute_interval must be >= 1, got {recompute_interval}")
 
         for name, param in (
             ("weight_ih", weight_ih),
@@ -69,6 +73,7 @@ class _StreamingLSTMFunction(Function):
         time_steps, batch_size, input_size = x_host.shape
         hidden_size = weight_hh.size(1)
         gate_dim = 4 * hidden_size
+        checkpoint_steps = (time_steps + recompute_interval - 1) // recompute_interval
 
         if weight_ih.shape != (gate_dim, input_size):
             raise ValueError(
@@ -89,7 +94,7 @@ class _StreamingLSTMFunction(Function):
             pin_memory=True,
         )
         gate_cache_host = torch.empty(
-            (time_steps, batch_size, gate_dim),
+            (checkpoint_steps, 2, batch_size, hidden_size),
             dtype=torch.float16,
             pin_memory=True,
         )
@@ -109,6 +114,7 @@ class _StreamingLSTMFunction(Function):
             batch_size,
             input_size,
             hidden_size,
+            recompute_interval,
             x_host.data_ptr(),
             h0.data_ptr(),
             c0.data_ptr(),
@@ -141,7 +147,7 @@ class _StreamingLSTMFunction(Function):
             y_host,
             gate_cache_host,
         )
-        ctx.meta = (time_steps, batch_size, input_size, hidden_size)
+        ctx.meta = (time_steps, batch_size, input_size, hidden_size, recompute_interval)
         ctx.mark_non_differentiable(gate_cache_host)
 
         return y_host, gate_cache_host, hy_device, cy_device
@@ -165,7 +171,7 @@ class _StreamingLSTMFunction(Function):
             y_host,
             gate_cache_host,
         ) = ctx.saved_tensors
-        time_steps, batch_size, input_size, hidden_size = ctx.meta
+        time_steps, batch_size, input_size, hidden_size, recompute_interval = ctx.meta
 
         if grad_y_host is None:
             grad_y_host = torch.zeros_like(y_host)
@@ -223,6 +229,7 @@ class _StreamingLSTMFunction(Function):
             batch_size,
             input_size,
             hidden_size,
+            recompute_interval,
             x_host.data_ptr(),
             y_host.data_ptr(),
             gate_cache_host.data_ptr(),
@@ -233,6 +240,8 @@ class _StreamingLSTMFunction(Function):
             c0.data_ptr(),
             weight_ih.data_ptr(),
             weight_hh.data_ptr(),
+            bias_ih.data_ptr(),
+            bias_hh.data_ptr(),
             dx_host.data_ptr(),
             dW_ih.data_ptr(),
             dW_hh.data_ptr(),
@@ -261,6 +270,7 @@ class _StreamingLSTMFunction(Function):
             dW_hh,
             db_ih,
             db_hh,
+            None,
         )
 
 
@@ -272,6 +282,8 @@ def streaming_lstm(
     weight_hh: torch.Tensor,
     bias_ih: torch.Tensor,
     bias_hh: torch.Tensor,
+    *,
+    recompute_interval: int = 1,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Functional wrapper for the streaming LSTM kernels.
@@ -285,6 +297,7 @@ def streaming_lstm(
         weight_hh,
         bias_ih,
         bias_hh,
+        recompute_interval,
     )
 
 
@@ -321,6 +334,8 @@ class StreamingLSTM(nn.Module):
         x_host: torch.Tensor,
         h0: Optional[torch.Tensor] = None,
         c0: Optional[torch.Tensor] = None,
+        *,
+        recompute_interval: int = 1,
     ) -> Tuple[torch.Tensor, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         _check_pinned_half(x_host, "x_host")
         batch_size = x_host.size(1)
@@ -335,5 +350,6 @@ class StreamingLSTM(nn.Module):
             self.weight_hh,
             self.bias_ih,
             self.bias_hh,
+            recompute_interval=recompute_interval,
         )
         return y_host, gate_cache_host, (hy, cy)

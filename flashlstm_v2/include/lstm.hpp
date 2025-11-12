@@ -17,7 +17,10 @@ namespace flstm {
  *
  * Outputs:
  *   - y_tensor_host:     (T, B, H) in pinned host memory (__half)
- *   - gate_cache_host:   (T, B, 4H) row-major FP16 cache written to host
+ *   - gate_cache_host:   checkpoint buffer storing (⌈T / R⌉, 2, B, H) FP16
+ *                        states (h and c) where R is `recompute_interval`
+ *                        controlling how frequently backward checkpoints are
+ *                        materialised to host.
  *   - compute_stream / h2d_stream / d2h_stream: distinct CUDA streams used for
  *         GEMMs, host→device transfers, and device→host transfers respectively.
  *         All three stream handles must be different to enable overlap.
@@ -27,6 +30,7 @@ void StreamingLstmForward(
     size_t batch_size,
     size_t input_size,
     size_t hidden_size,
+    size_t recompute_interval,
 
     const __half *x_tensor_host,
     const __half *h0_device,
@@ -53,11 +57,14 @@ void StreamingLstmForward(
  *
  * Inputs:
  *   - x_tensor_host:    (T, B, I) inputs in pinned host memory (__half)
- *   - gate_cache_host:  (T, B, 4H) row-major gate activations (FP16)
+ *   - gate_cache_host:  checkpoint buffer storing (⌈T / R⌉, 2, B, H) FP16
+ *                       states (h and c) captured every `recompute_interval`
+ *                       steps to seed backward recomputation.
  *   - dY_tensor_host:   upstream grads w.r.t outputs in host half precision
  *   - d_hn_device / d_cn_device: grads for final states (nullable)
  *   - c0_device:        initial cell state provided in half precision (B, H)
  *   - weights_ih / weights_hh: forward weights (FP32) reused for GEMMs
+ *   - bias_ih / bias_hh: fused bias terms reused during recomputation
  *
  * Outputs:
  *   - dx_tensor_host:   gradients w.r.t. inputs written in host half precision
@@ -73,6 +80,7 @@ void StreamingLstmBackward(
     size_t batch_size,
     size_t input_size,
     size_t hidden_size,
+    size_t recompute_interval,
 
     const __half *x_tensor_host,
     const __half *y_tensor_host,
@@ -86,6 +94,8 @@ void StreamingLstmBackward(
 
     const float *weights_ih,
     const float *weights_hh,
+    const float *bias_ih,
+    const float *bias_hh,
 
     __half *dx_tensor_host,
     float *dW_ih,
@@ -109,6 +119,7 @@ void flstm_StreamingLstmForward(
     size_t batch_size,
     size_t input_size,
     size_t hidden_size,
+    size_t recompute_interval,
 
     const __half *x_tensor_host,
     const __half *h0_device,
@@ -135,6 +146,7 @@ void flstm_StreamingLstmBackward(
     size_t batch_size,
     size_t input_size,
     size_t hidden_size,
+    size_t recompute_interval,
 
     const __half *x_tensor_host,
     const __half *y_tensor_host,
@@ -148,6 +160,8 @@ void flstm_StreamingLstmBackward(
 
     const float *weights_ih,
     const float *weights_hh,
+    const float *bias_ih,
+    const float *bias_hh,
 
     __half *dx_tensor_host,
     float *dW_ih,

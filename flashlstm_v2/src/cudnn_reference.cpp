@@ -422,29 +422,6 @@ namespace {
         DestroyCudnnHandle(ctx.handle, cudnnDestroy);
     }
 
-    void ComputeFinalCellStates(
-        const size_t time_steps,
-        const size_t batch_size,
-        const size_t hidden_size,
-        const float *c0_host_float,
-        const std::vector<float> &gate_cache_float,
-        std::vector<float> &c_stream_final
-    ) {
-        const size_t gate_dim = static_cast<size_t>(kGateCount) * hidden_size;
-        for (size_t b = 0; b < batch_size; ++b) {
-            for (size_t h = 0; h < hidden_size; ++h) {
-                float c_prev = c0_host_float[b * hidden_size + h];
-                for (size_t t = 0; t < time_steps; ++t) {
-                    const size_t gate_base = (t * batch_size + b) * gate_dim + h;
-                    const float i_gate = gate_cache_float[gate_base + 0 * hidden_size];
-                    const float f_gate = gate_cache_float[gate_base + 1 * hidden_size];
-                    const float g_gate = gate_cache_float[gate_base + 2 * hidden_size];
-                    c_prev = f_gate * c_prev + i_gate * g_gate;
-                }
-                c_stream_final[b * hidden_size + h] = c_prev;
-            }
-        }
-    }
 } // namespace
 
 CudnnForwardComparisonResult RunCudnnForwardComparison(
@@ -460,15 +437,17 @@ CudnnForwardComparisonResult RunCudnnForwardComparison(
     const float *h0_host_float,
     const float *c0_host_float,
     const __half *y_host,
-    const __half *gate_cache_host
+    const __half *gate_cache_host,
+    const __half *hy_host,
+    const __half *cy_host
 ) {
+    (void) gate_cache_host;
+    (void) hy_host;
     const size_t y_elements = time_steps * batch_size * hidden_size;
-    const size_t gate_dim = static_cast<size_t>(kGateCount) * hidden_size;
-    const size_t gate_elements = time_steps * batch_size * gate_dim;
     const size_t state_elements = batch_size * hidden_size;
 
     std::vector<float> y_stream_float = ConvertHalfBufferToFloat(y_host, y_elements);
-    std::vector<float> gate_cache_float = ConvertHalfBufferToFloat(gate_cache_host, gate_elements);
+    std::vector<float> c_stream_final = ConvertHalfBufferToFloat(cy_host, state_elements);
 
     CudnnRnnContext ctx = CreateCudnnRnnContext(
         time_steps,
@@ -546,9 +525,6 @@ CudnnForwardComparisonResult RunCudnnForwardComparison(
     CudaMemcpyDeviceToHost(y_cudnn_host.data(), ctx.y_dev, y_elements, "memcpy y_dev");
     CudaMemcpyDeviceToHost(hy_cudnn_host.data(), ctx.hy_dev, state_elements, "memcpy hy_dev");
     CudaMemcpyDeviceToHost(cy_cudnn_host.data(), ctx.cy_dev, state_elements, "memcpy cy_dev");
-
-    std::vector c_stream_final(state_elements, 0.0f);
-    ComputeFinalCellStates(time_steps, batch_size, hidden_size, c0_host_float, gate_cache_float, c_stream_final);
 
     const size_t last_step_offset = (time_steps - 1) * batch_size * hidden_size;
     std::vector<float> h_stream_final(state_elements);

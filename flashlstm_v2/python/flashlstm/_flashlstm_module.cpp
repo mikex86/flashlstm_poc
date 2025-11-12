@@ -19,6 +19,7 @@ PyObject *StreamingLstmForward(PyObject *, PyObject *args) {
     unsigned long long batch_size{};
     unsigned long long input_size{};
     unsigned long long hidden_size{};
+    unsigned long long recompute_interval{};
     unsigned long long x_tensor_host{};
     unsigned long long h0_device{};
     unsigned long long c0_device{};
@@ -36,11 +37,12 @@ PyObject *StreamingLstmForward(PyObject *, PyObject *args) {
 
     if (!PyArg_ParseTuple(
             args,
-            "KKKKKKKKKKKKKKKKKK",
+            "KKKKKKKKKKKKKKKKKKK",
             &time_steps,
             &batch_size,
             &input_size,
             &hidden_size,
+            &recompute_interval,
             &x_tensor_host,
             &h0_device,
             &c0_device,
@@ -64,6 +66,7 @@ PyObject *StreamingLstmForward(PyObject *, PyObject *args) {
         static_cast<size_t>(batch_size),
         static_cast<size_t>(input_size),
         static_cast<size_t>(hidden_size),
+        static_cast<size_t>(recompute_interval),
         PtrFromUnsigned<const __half *>(x_tensor_host),
         PtrFromUnsigned<const __half *>(h0_device),
         PtrFromUnsigned<const __half *>(c0_device),
@@ -89,6 +92,7 @@ PyObject *StreamingLstmBackward(PyObject *, PyObject *args) {
     unsigned long long batch_size{};
     unsigned long long input_size{};
     unsigned long long hidden_size{};
+    unsigned long long recompute_interval{};
     unsigned long long x_tensor_host{};
     unsigned long long y_tensor_host{};
     unsigned long long gate_cache_host{};
@@ -99,6 +103,8 @@ PyObject *StreamingLstmBackward(PyObject *, PyObject *args) {
     unsigned long long c0_device{};
     unsigned long long weights_ih{};
     unsigned long long weights_hh{};
+    unsigned long long bias_ih{};
+    unsigned long long bias_hh{};
     unsigned long long dx_tensor_host{};
     unsigned long long dW_ih{};
     unsigned long long dW_hh{};
@@ -112,11 +118,12 @@ PyObject *StreamingLstmBackward(PyObject *, PyObject *args) {
 
     if (!PyArg_ParseTuple(
             args,
-            "KKKKKKKKKKKKKKKKKKKKKKKK",
+            "KKKKKKKKKKKKKKKKKKKKKKKKKKK",
             &time_steps,
             &batch_size,
             &input_size,
             &hidden_size,
+            &recompute_interval,
             &x_tensor_host,
             &y_tensor_host,
             &gate_cache_host,
@@ -127,6 +134,8 @@ PyObject *StreamingLstmBackward(PyObject *, PyObject *args) {
             &c0_device,
             &weights_ih,
             &weights_hh,
+            &bias_ih,
+            &bias_hh,
             &dx_tensor_host,
             &dW_ih,
             &dW_hh,
@@ -146,6 +155,7 @@ PyObject *StreamingLstmBackward(PyObject *, PyObject *args) {
         static_cast<size_t>(batch_size),
         static_cast<size_t>(input_size),
         static_cast<size_t>(hidden_size),
+        static_cast<size_t>(recompute_interval),
         PtrFromUnsigned<const __half *>(x_tensor_host),
         PtrFromUnsigned<const __half *>(y_tensor_host),
         PtrFromUnsigned<const __half *>(gate_cache_host),
@@ -156,6 +166,8 @@ PyObject *StreamingLstmBackward(PyObject *, PyObject *args) {
         PtrFromUnsigned<const __half *>(c0_device),
         PtrFromUnsigned<const float *>(weights_ih),
         PtrFromUnsigned<const float *>(weights_hh),
+        PtrFromUnsigned<const float *>(bias_ih),
+        PtrFromUnsigned<const float *>(bias_hh),
         PtrFromUnsigned<__half *>(dx_tensor_host),
         PtrFromUnsigned<float *>(dW_ih),
         PtrFromUnsigned<float *>(dW_hh),

@@ -1,5 +1,6 @@
 #include "lstm.hpp"
 #include "gputx.h"
+#include "mfu_profiler.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -395,6 +396,7 @@ void StreamingLstmForward(
     size_t batch_size,
     size_t input_size,
     size_t hidden_size,
+    size_t recompute_interval,
 
     const __half *x_tensor_host,
     const __half *h_0_device,
@@ -416,8 +418,12 @@ void StreamingLstmForward(
     cudaStream_t d2h_stream
 ) {
     GPUTX_RANGE("StreamingLstmForward");
+    mfu::Profiler profiler("forward");
     if (time_steps == 0 || batch_size == 0 || input_size == 0 || hidden_size == 0) {
         return;
+    }
+    if (recompute_interval == 0) {
+        throw std::runtime_error("StreamingLstmForward requires recompute_interval >= 1");
     }
     if (compute_stream == h2d_stream || compute_stream == d2h_stream || h2d_stream == d2h_stream) {
         throw std::runtime_error("StreamingLstmForward requires distinct compute/h2d/d2h streams");
@@ -426,14 +432,16 @@ void StreamingLstmForward(
     const size_t gate_dim = 4 * hidden_size;
     const size_t z_rows = input_size + hidden_size;
     const size_t bh_elements = batch_size * hidden_size;
-    const size_t gate_cache_elements = time_steps * batch_size * gate_dim;
+    const size_t checkpoint_stride = recompute_interval;
+    const size_t checkpoint_count = (time_steps + checkpoint_stride - 1) / checkpoint_stride;
+    const size_t checkpoint_elements = checkpoint_count * 2 * bh_elements;
     const size_t x_step_bytes = batch_size * input_size * sizeof(__half);
     const size_t y_step_bytes = bh_elements * sizeof(__half);
     constexpr size_t kChunkSteps = 32;
     const size_t chunk_capacity = kChunkSteps;
     const size_t chunk_input_capacity = chunk_capacity * batch_size * input_size;
     const size_t chunk_output_capacity = chunk_capacity * bh_elements;
-    const bool store_gate_cache = (gate_cache_host != nullptr);
+    const bool store_checkpoints = (gate_cache_host != nullptr);
     const bool needs_y_fallback = (y_tensor_host != nullptr);
 
     const int threads = 256;
@@ -455,11 +463,11 @@ void StreamingLstmForward(
             "cudaHostRegister y_tensor_host"
         );
     }
-    if (store_gate_cache) {
+    if (store_checkpoints) {
         gate_host_registration.reset(
             gate_cache_host,
-            gate_cache_elements * sizeof(__half),
-            "cudaHostRegister gate_cache_host"
+            checkpoint_elements * sizeof(__half),
+            "cudaHostRegister checkpoint_cache_host"
         );
     }
 
@@ -467,12 +475,6 @@ void StreamingLstmForward(
     DeviceBuffer<__half> z_chunk_device_buffer;
     AllocateDeviceBuffer(z_chunk_device_buffer, z_chunk_elements, "cudaMalloc z_chunk");
     __half *z_chunk_device = z_chunk_device_buffer.ptr;
-
-    const size_t gate_cache_chunk_elements = chunk_capacity * batch_size * gate_dim;
-    DeviceBuffer<__half> gate_cache_chunks[2];
-    if (store_gate_cache) {
-        AllocateDeviceBufferArray(gate_cache_chunks, gate_cache_chunk_elements, "cudaMalloc gate_cache_chunk");
-    }
 
     DeviceBuffer<float> h0_float;
     DeviceBuffer<float> c0_float;
@@ -544,13 +546,21 @@ void StreamingLstmForward(
         AllocateDeviceBufferArray(y_chunk_half, chunk_output_capacity, "cudaMalloc y_chunk_half");
     }
 
+    const size_t max_checkpoints_per_chunk = std::max<size_t>(1, (chunk_capacity + checkpoint_stride - 1) / checkpoint_stride + 1);
+    const size_t checkpoint_entry_elements = 2 * bh_elements;
+    DeviceBuffer<__half> checkpoint_chunks[2];
+    if (store_checkpoints) {
+        AllocateDeviceBufferArray(checkpoint_chunks, max_checkpoints_per_chunk * checkpoint_entry_elements, "cudaMalloc checkpoint_chunk");
+    }
+    CudaEvent checkpoint_copy_done[2];
+    bool checkpoint_copy_inflight[2] = {false, false};
+    size_t checkpoint_counts[2] = {0, 0};
+    size_t checkpoint_host_offsets[2] = {0, 0};
     CudaEvent x_ready[2];
     CudaEvent compute_done[2];
     CudaEvent y_copy_done[2];
-    CudaEvent gate_copy_done[2];
     bool compute_done_valid[2] = {false, false};
     bool y_copy_inflight[2] = {false, false};
-    bool gate_copy_inflight[2] = {false, false};
     size_t chunk_steps[2] = {0, 0};
 
     const size_t total_chunks = (time_steps + chunk_capacity - 1) / chunk_capacity;
@@ -590,12 +600,11 @@ void StreamingLstmForward(
                       "wait y copy before compute");
             y_copy_inflight[slot] = false;
         }
-        if (store_gate_cache && gate_copy_inflight[slot]) {
-            CheckCuda(cudaStreamWaitEvent(compute_stream, gate_copy_done[slot].evt, 0),
-                      "wait gate cache copy before compute");
-            gate_copy_inflight[slot] = false;
+        if (store_checkpoints && checkpoint_copy_inflight[slot]) {
+            CheckCuda(cudaStreamWaitEvent(compute_stream, checkpoint_copy_done[slot].evt, 0),
+                      "wait checkpoint copy before compute");
+            checkpoint_copy_inflight[slot] = false;
         }
-
         CheckCuda(cudaStreamWaitEvent(compute_stream, x_ready[slot].evt, 0), "wait x chunk ready");
 
         const size_t chunk_start_step = chunk_idx * chunk_capacity;
@@ -624,14 +633,60 @@ void StreamingLstmForward(
             CheckCuda(cudaGetLastError(), "SeedHiddenColumnKernel chunk");
         }
 
+        size_t next_checkpoint_step = static_cast<size_t>(-1);
+        size_t checkpoint_global_index = 0;
+        if (store_checkpoints && checkpoint_stride > 0) {
+            const size_t chunk_end_step = chunk_start_step + steps_in_chunk;
+            size_t aligned = (chunk_start_step + checkpoint_stride - 1) / checkpoint_stride;
+            next_checkpoint_step = aligned * checkpoint_stride;
+            if (next_checkpoint_step < chunk_start_step) {
+                next_checkpoint_step += checkpoint_stride;
+            }
+            if (next_checkpoint_step >= chunk_end_step) {
+                next_checkpoint_step = static_cast<size_t>(-1);
+            } else {
+                checkpoint_global_index = next_checkpoint_step / checkpoint_stride;
+            }
+            checkpoint_counts[slot] = 0;
+        }
+
         for (size_t step = 0; step < steps_in_chunk; ++step) {
             const size_t global_step = chunk_start_step + step;
             const size_t column_offset = step * batch_size;
             const __half *z_step = z_chunk_device + column_offset * z_rows;
             float *y_step = y_chunk_float[slot].ptr + step * bh_elements;
-            __half *gate_cache_step = (store_gate_cache)
-                                          ? (gate_cache_chunks[slot].ptr + step * batch_size * gate_dim)
-                                          : nullptr;
+            __half *gate_cache_step = nullptr;
+
+            if (store_checkpoints && next_checkpoint_step != static_cast<size_t>(-1) &&
+                global_step == next_checkpoint_step) {
+                if (checkpoint_global_index < checkpoint_count) {
+                    const size_t checkpoint_slot_offset = checkpoint_counts[slot] * checkpoint_entry_elements;
+                    __half *checkpoint_dst = checkpoint_chunks[slot].ptr + checkpoint_slot_offset;
+                    FloatToHalfKernel<<<bh_blocks, threads, 0, compute_stream>>>(
+                        h_prev.ptr,
+                        checkpoint_dst,
+                        bh_elements
+                    );
+                    CheckCuda(cudaGetLastError(), "FloatToHalfKernel checkpoint h");
+                    FloatToHalfKernel<<<bh_blocks, threads, 0, compute_stream>>>(
+                        c_prev.ptr,
+                        checkpoint_dst + bh_elements,
+                        bh_elements
+                    );
+                    CheckCuda(cudaGetLastError(), "FloatToHalfKernel checkpoint c");
+                    if (checkpoint_counts[slot] == 0) {
+                        checkpoint_host_offsets[slot] = checkpoint_global_index;
+                    }
+                    ++checkpoint_counts[slot];
+                    next_checkpoint_step += checkpoint_stride;
+                    ++checkpoint_global_index;
+                    if (next_checkpoint_step >= chunk_start_step + steps_in_chunk) {
+                        next_checkpoint_step = static_cast<size_t>(-1);
+                    }
+                } else {
+                    next_checkpoint_step = static_cast<size_t>(-1);
+                }
+            }
 
             CheckCublas(cublasGemmEx(
                             cublas.handle,
@@ -654,6 +709,7 @@ void StreamingLstmForward(
                             CUBLAS_COMPUTE_32F,
                             CUBLAS_GEMM_DEFAULT_TENSOR_OP),
                         "cublasGemmEx gates");
+            profiler.AddUseful(mfu::GemmFlops(gate_dim, batch_size, z_rows));
 
             const bool has_next_column = (step + 1 < steps_in_chunk);
             const size_t next_column_offset = has_next_column ? ((step + 1) * batch_size) : 0;
@@ -701,21 +757,21 @@ void StreamingLstmForward(
 
         CheckCuda(cudaStreamWaitEvent(d2h_stream, compute_done[slot].evt, 0), "wait compute_done on d2h");
 
-        if (store_gate_cache) {
-            const size_t elements = steps_in_chunk * batch_size * gate_dim;
-            if (elements > 0) {
-                const size_t offset = chunk_start_step * batch_size * gate_dim;
-                __half *dst = gate_cache_host + offset;
-                const __half *src = gate_cache_chunks[slot].ptr;
+        if (store_checkpoints) {
+            const size_t checkpoint_count_chunk = checkpoint_counts[slot];
+            if (checkpoint_count_chunk > 0) {
+                const size_t elements = checkpoint_count_chunk * checkpoint_entry_elements;
+                __half *dst = gate_cache_host + checkpoint_host_offsets[slot] * checkpoint_entry_elements;
+                const __half *src = checkpoint_chunks[slot].ptr;
                 CheckCuda(cudaMemcpyAsync(
                               dst,
                               src,
                               elements * sizeof(__half),
                               cudaMemcpyDeviceToHost,
                               d2h_stream),
-                          "copy gate cache chunk");
-                CheckCuda(cudaEventRecord(gate_copy_done[slot].evt, d2h_stream), "record gate_copy_done");
-                gate_copy_inflight[slot] = true;
+                          "copy checkpoint chunk");
+                CheckCuda(cudaEventRecord(checkpoint_copy_done[slot].evt, d2h_stream), "record checkpoint_copy_done");
+                checkpoint_copy_inflight[slot] = true;
             }
         }
 
@@ -768,6 +824,7 @@ void StreamingLstmForward(
     CheckCuda(cudaStreamSynchronize(h2d_stream), "final h2d transfer sync");
     CheckCuda(cudaStreamSynchronize(d2h_stream), "final d2h transfer sync");
     CheckCuda(cudaStreamSynchronize(compute_stream), "final compute sync");
+    profiler.Finish();
 }
 
 } // namespace flstm
@@ -777,6 +834,7 @@ extern "C" void flstm_StreamingLstmForward(
     const size_t batch_size,
     const size_t input_size,
     const size_t hidden_size,
+    const size_t recompute_interval,
 
     const __half *x_tensor_host,
     const __half *h0_device,
@@ -803,6 +861,7 @@ extern "C" void flstm_StreamingLstmForward(
             batch_size,
             input_size,
             hidden_size,
+            recompute_interval,
             x_tensor_host,
             h0_device,
             c0_device,

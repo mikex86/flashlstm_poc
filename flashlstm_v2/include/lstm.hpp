@@ -4,7 +4,13 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime_api.h>
 
+enum flstmGateCacheType : int {
+    FLSTM_GATE_CACHE_FLOAT32 = 0,
+    FLSTM_GATE_CACHE_FLOAT64 = 1,
+};
+
 namespace flstm {
+using GateCacheType = flstmGateCacheType;
 
 /**
  * Forward pass for a single-layer LSTM operating entirely on CUDA buffers.
@@ -17,7 +23,7 @@ namespace flstm {
  *
  * Outputs:
  *   - y_tensor_host:     (T, B, H) in pinned host memory (__half)
- *   - gate_cache_host:   checkpoint buffer storing (⌈T / R⌉, 2, B, H) FP32
+ *   - gate_cache_host:   checkpoint buffer storing (⌈T / R⌉, 2, B, H) FP32/FP64
  *                        states (h and c) where R is `recompute_interval`
  *                        controlling how frequently backward checkpoints are
  *                        materialised to host.
@@ -43,7 +49,8 @@ void StreamingLstmForward(
 
     __half *y_tensor_host,
 
-    float *gate_cache_host,
+    void *gate_cache_host,
+    GateCacheType gate_cache_type,
     __half *hy_device,
     __half *cy_device,
 
@@ -57,7 +64,7 @@ void StreamingLstmForward(
  *
  * Inputs:
  *   - x_tensor_host:    (T, B, I) inputs in pinned host memory (__half)
- *   - gate_cache_host:  checkpoint buffer storing (⌈T / R⌉, 2, B, H) FP32
+ *   - gate_cache_host:  checkpoint buffer storing (⌈T / R⌉, 2, B, H) FP32/FP64
  *                       states (h and c) captured every `recompute_interval`
  *                       steps to seed backward recomputation.
  *   - dY_tensor_host:   upstream grads w.r.t outputs in host half precision
@@ -84,7 +91,8 @@ void StreamingLstmBackward(
 
     const __half *x_tensor_host,
     const __half *y_tensor_host,
-    const float *gate_cache_host,
+    const void *gate_cache_host,
+    GateCacheType gate_cache_type,
 
     const __half *dY_tensor_host,
     const __half *d_hn_device,
@@ -132,7 +140,8 @@ void flstm_StreamingLstmForward(
 
     __half *y_tensor_host,
 
-    float *gate_cache_host,
+    void *gate_cache_host,
+    flstmGateCacheType gate_cache_type,
     __half *hy_device,
     __half *cy_device,
 
@@ -150,7 +159,8 @@ void flstm_StreamingLstmBackward(
 
     const __half *x_tensor_host,
     const __half *y_tensor_host,
-    const float *gate_cache_host,
+    const void *gate_cache_host,
+    flstmGateCacheType gate_cache_type,
 
     const __half *dY_tensor_host,
     const __half *d_hn_device,

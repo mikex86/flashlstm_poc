@@ -10,6 +10,7 @@ import torch
 import torch.nn.functional as F
 
 RECOMPUTE = 4
+GATE_CACHE_FLOAT32 = 0
 
 
 def _find_library(root: Path) -> Path:
@@ -64,6 +65,7 @@ def _prepare_functions(lib: ctypes.CDLL) -> None:
         ctypes.c_void_p,  # bias_hh
         ctypes.c_void_p,  # y host
         ctypes.c_void_p,  # gate cache host
+        ctypes.c_int,     # gate cache dtype
         ctypes.c_void_p,  # hy device
         ctypes.c_void_p,  # cy device
         ctypes.c_void_p,  # compute stream
@@ -83,6 +85,7 @@ def _prepare_functions(lib: ctypes.CDLL) -> None:
         ctypes.c_void_p,  # x host
         ctypes.c_void_p,  # y host
         ctypes.c_void_p,  # gate cache host
+        ctypes.c_int,     # gate cache dtype
 
         ctypes.c_void_p,  # dY host
         ctypes.c_void_p,  # dHN device (nullable)
@@ -208,6 +211,7 @@ def _run_case_forward_only(lib: ctypes.CDLL, cfg: LstmConfig):
         _as_void_p(bias_hh),
         _as_void_p(y_host),
         _as_void_p(gate_cache),
+        ctypes.c_int(GATE_CACHE_FLOAT32),
         _as_void_p(hy_device),
         _as_void_p(cy_device),
         ctypes.c_void_p(compute_stream.cuda_stream),
@@ -297,6 +301,7 @@ def _run_case_backward(lib: ctypes.CDLL, cfg: LstmConfig):
         _as_void_p(x_host),
         _as_void_p(y_host),
         _as_void_p(gate_cache),
+        ctypes.c_int(GATE_CACHE_FLOAT32),
         _as_void_p(dY_host),
         _as_void_p(dHN_dev),
         _as_void_p(dCN_dev),

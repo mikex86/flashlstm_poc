@@ -10,6 +10,12 @@ from torch.autograd import Function
 from . import streaming_lstm_backward as _streaming_lstm_backward
 from . import streaming_lstm_forward as _streaming_lstm_forward
 
+_GATE_CACHE_DTYPE_TO_ENUM = {
+    torch.float32: 0,
+    torch.float64: 1,
+}
+_GATE_CACHE_ALLOWED_DTYPES: Tuple[torch.dtype, ...] = tuple(_GATE_CACHE_DTYPE_TO_ENUM.keys())
+
 
 def _check_pinned_half(tensor: torch.Tensor, name: str) -> None:
     if tensor.device.type != "cpu":
@@ -20,11 +26,14 @@ def _check_pinned_half(tensor: torch.Tensor, name: str) -> None:
         raise ValueError(f"{name} must be allocated in pinned memory (tensor.pin_memory()).")
 
 
-def _check_pinned_float(tensor: torch.Tensor, name: str) -> None:
+def _check_pinned_float(
+    tensor: torch.Tensor, name: str, allowed_dtypes: Tuple[torch.dtype, ...] = (torch.float32,)
+) -> None:
     if tensor.device.type != "cpu":
         raise ValueError(f"{name} must reside on the CPU (pinned host memory).")
-    if tensor.dtype != torch.float32:
-        raise ValueError(f"{name} must use dtype torch.float32, got {tensor.dtype}.")
+    if tensor.dtype not in allowed_dtypes:
+        allowed = ", ".join(str(d) for d in allowed_dtypes)
+        raise ValueError(f"{name} must use dtype in {{{allowed}}}, got {tensor.dtype}.")
     if not tensor.is_pinned():
         raise ValueError(f"{name} must be allocated in pinned memory (tensor.pin_memory()).")
 
@@ -57,6 +66,7 @@ class _StreamingLSTMFunction(Function):
         bias_ih: torch.Tensor,
         bias_hh: torch.Tensor,
         recompute_interval: int,
+        gate_cache_dtype: torch.dtype,
     ):
         _check_pinned_half(x_host, "x_host")
         if not x_host.is_contiguous():
@@ -64,6 +74,13 @@ class _StreamingLSTMFunction(Function):
 
         if recompute_interval <= 0:
             raise ValueError(f"recompute_interval must be >= 1, got {recompute_interval}")
+
+        if gate_cache_dtype not in _GATE_CACHE_DTYPE_TO_ENUM:
+            allowed = ", ".join(str(d) for d in _GATE_CACHE_ALLOWED_DTYPES)
+            raise ValueError(
+                f"gate_cache_dtype must be one of {{{allowed}}}, got {gate_cache_dtype}."
+            )
+        gate_cache_type_id = _GATE_CACHE_DTYPE_TO_ENUM[gate_cache_dtype]
 
         for name, param in (
             ("weight_ih", weight_ih),
@@ -104,7 +121,7 @@ class _StreamingLSTMFunction(Function):
         )
         gate_cache_host = torch.empty(
             (checkpoint_steps, 2, batch_size, hidden_size),
-            dtype=torch.float32,
+            dtype=gate_cache_dtype,
             pin_memory=True,
         )
         hy_device = torch.empty(
@@ -133,6 +150,7 @@ class _StreamingLSTMFunction(Function):
             bias_hh.data_ptr(),
             y_host.data_ptr(),
             gate_cache_host.data_ptr(),
+            gate_cache_type_id,
             hy_device.data_ptr(),
             cy_device.data_ptr(),
             compute_stream.cuda_stream,
@@ -156,7 +174,7 @@ class _StreamingLSTMFunction(Function):
             y_host,
             gate_cache_host,
         )
-        ctx.meta = (time_steps, batch_size, input_size, hidden_size, recompute_interval)
+        ctx.meta = (time_steps, batch_size, input_size, hidden_size, recompute_interval, gate_cache_type_id)
         ctx.mark_non_differentiable(gate_cache_host)
 
         return y_host, gate_cache_host, hy_device, cy_device
@@ -180,8 +198,15 @@ class _StreamingLSTMFunction(Function):
             y_host,
             gate_cache_host,
         ) = ctx.saved_tensors
-        time_steps, batch_size, input_size, hidden_size, recompute_interval = ctx.meta
-        _check_pinned_float(gate_cache_host, "gate_cache_host")
+        (
+            time_steps,
+            batch_size,
+            input_size,
+            hidden_size,
+            recompute_interval,
+            gate_cache_type_id,
+        ) = ctx.meta
+        _check_pinned_float(gate_cache_host, "gate_cache_host", _GATE_CACHE_ALLOWED_DTYPES)
 
         if grad_y_host is None:
             grad_y_host = torch.zeros_like(y_host)
@@ -243,6 +268,7 @@ class _StreamingLSTMFunction(Function):
             x_host.data_ptr(),
             y_host.data_ptr(),
             gate_cache_host.data_ptr(),
+            gate_cache_type_id,
             grad_y_host.data_ptr(),
             grad_hy_ptr,
             grad_cy_ptr,
@@ -294,6 +320,7 @@ def streaming_lstm(
     bias_hh: torch.Tensor,
     *,
     recompute_interval: int = 1,
+    gate_cache_dtype: torch.dtype = torch.float32,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Functional wrapper for the streaming LSTM kernels.
@@ -308,6 +335,7 @@ def streaming_lstm(
         bias_ih,
         bias_hh,
         recompute_interval,
+        gate_cache_dtype,
     )
 
 
@@ -344,6 +372,7 @@ class StreamingLSTM(nn.Module):
         c0: Optional[torch.Tensor] = None,
         *,
         recompute_interval: int = 1,
+        gate_cache_dtype: torch.dtype = torch.float32,
     ) -> Tuple[torch.Tensor, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         _check_pinned_half(x_host, "x_host")
         batch_size = x_host.size(1)
@@ -359,5 +388,6 @@ class StreamingLSTM(nn.Module):
             self.bias_ih,
             self.bias_hh,
             recompute_interval=recompute_interval,
+            gate_cache_dtype=gate_cache_dtype,
         )
         return y_host, gate_cache_host, (hy, cy)

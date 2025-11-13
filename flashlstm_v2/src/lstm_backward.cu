@@ -10,6 +10,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 
 namespace {
     inline const char *CublasStatusString(const cublasStatus_t status) {
@@ -478,7 +479,18 @@ namespace {
         }
     }
 
+    template <typename CacheT>
+    __global__ void CastCacheToFloatKernel(const CacheT *src, float *dst, size_t count) {
+        const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+        if (idx >= count) {
+            return;
+        }
+        dst[idx] = static_cast<float>(src[idx]);
+    }
+
+
     // Holds references shared between copy slots so double-buffered H2D transfers stay readable.
+    template <typename CacheT>
     struct ChunkCopyParams {
         size_t time_steps;
         size_t chunk_capacity;
@@ -487,11 +499,12 @@ namespace {
         size_t gate_dim;
         size_t input_size;
         size_t bh_elements;
-        const float *checkpoint_cache_host;
+        const CacheT *checkpoint_cache_host;
         const __half *x_tensor_host;
         const __half *y_tensor_host;
         const __half *dY_tensor_host;
         DeviceBuffer<float> *checkpoint_half;
+        DeviceBuffer<CacheT> *checkpoint_cache_tmp;
         DeviceBuffer<__half> *x_chunk_half;
         DeviceBuffer<__half> *y_chunk_half;
         DeviceBuffer<__half> *dY_chunk_half;
@@ -503,10 +516,12 @@ namespace {
         size_t *chunk_ids;
         size_t *prefix_steps;
         size_t *recompute_steps;
+        int threads_per_block;
     };
 
     // Schedules host-to-device copies for one chunk slot, waiting on outstanding compute if needed.
-    size_t IssueChunkCopy(const ssize_t chunk_id, const int slot, const ChunkCopyParams &params) {
+    template <typename CacheT>
+    size_t IssueChunkCopy(const ssize_t chunk_id, const int slot, const ChunkCopyParams<CacheT> &params) {
         if (chunk_id < 0) {
             params.chunk_ids[slot] = static_cast<size_t>(-1);
             params.prefix_steps[slot] = 0;
@@ -578,14 +593,37 @@ namespace {
         }
 
         if (params.checkpoint_cache_host != nullptr && params.checkpoint_half[slot].ptr != nullptr) {
-            const float *checkpoint_src = params.checkpoint_cache_host + checkpoint_index * 2 * params.bh_elements;
-            CheckCuda(cudaMemcpyAsync(
-                          params.checkpoint_half[slot].ptr,
-                          checkpoint_src,
-                          2 * params.bh_elements * sizeof(float),
-                          cudaMemcpyHostToDevice,
-                          params.h2d_stream),
-                      "copy checkpoint state");
+            const size_t checkpoint_elements = 2 * params.bh_elements;
+            const CacheT *checkpoint_src = params.checkpoint_cache_host + checkpoint_index * checkpoint_elements;
+            float *checkpoint_float_dst = params.checkpoint_half[slot].ptr;
+            if constexpr (std::is_same_v<CacheT, float>) {
+                CheckCuda(cudaMemcpyAsync(
+                              checkpoint_float_dst,
+                              checkpoint_src,
+                              checkpoint_elements * sizeof(float),
+                              cudaMemcpyHostToDevice,
+                              params.h2d_stream),
+                          "copy checkpoint state");
+            } else {
+                if (params.checkpoint_cache_tmp == nullptr || params.checkpoint_cache_tmp[slot].ptr == nullptr) {
+                    throw std::runtime_error("FP64 gate cache requires staging buffers");
+                }
+                CacheT *checkpoint_tmp = params.checkpoint_cache_tmp[slot].ptr;
+                CheckCuda(cudaMemcpyAsync(
+                              checkpoint_tmp,
+                              checkpoint_src,
+                              checkpoint_elements * sizeof(CacheT),
+                              cudaMemcpyHostToDevice,
+                              params.h2d_stream),
+                          "copy checkpoint state (fp64)");
+                const int blocks = BlocksFor(checkpoint_elements, params.threads_per_block);
+                CastCacheToFloatKernel<<<blocks, params.threads_per_block, 0, params.h2d_stream>>>(
+                    checkpoint_tmp,
+                    checkpoint_float_dst,
+                    checkpoint_elements
+                );
+                CheckCuda(cudaGetLastError(), "Cast checkpoint cache to float");
+            }
         }
 
         CheckCuda(cudaEventRecord(params.h2d_ready[slot].evt, params.h2d_stream), "record h2d_ready");
@@ -597,7 +635,8 @@ namespace {
 } // namespace
 
 namespace flstm {
-    void StreamingLstmBackward(
+    template <typename CacheT>
+    void StreamingLstmBackwardImpl(
         size_t time_steps,
         size_t batch_size,
         size_t input_size,
@@ -606,7 +645,7 @@ namespace flstm {
 
         const __half *x_tensor_host,
         const __half *y_tensor_host,
-        const float *gate_cache_host,
+        const CacheT *gate_cache_host,
 
         const __half *dY_tensor_host,
         const __half *d_hn_device,
@@ -631,6 +670,8 @@ namespace flstm {
         cudaStream_t h2d_stream,
         cudaStream_t d2h_stream
     ) {
+        static_assert(std::is_same_v<CacheT, float> || std::is_same_v<CacheT, double>,
+                      "gate cache must be float32 or float64");
         GPUTX_RANGE("StreamingLstmBackward");
         mfu::Profiler profiler("backward");
         if (time_steps == 0 || batch_size == 0 || input_size == 0 || hidden_size == 0) {
@@ -742,6 +783,7 @@ namespace flstm {
         DeviceBuffer<__half> dx_chunk_half[2];
         DeviceBuffer<__half> y_prev_half[2];
         DeviceBuffer<float> checkpoint_half[2];
+        DeviceBuffer<CacheT> checkpoint_cache_tmp[2];
         DeviceBuffer<float> recompute_h_prev;
         DeviceBuffer<float> recompute_h_next;
         DeviceBuffer<float> recompute_c_prev;
@@ -769,6 +811,11 @@ namespace flstm {
         AllocateDeviceBufferArray(dG_chunk_half, dG_chunk_elements, "cudaMalloc dG_chunk_half");
         AllocateDeviceBufferArray(y_prev_half, bh_elements, "cudaMalloc y_prev_half");
         AllocateDeviceBufferArray(checkpoint_half, checkpoint_half_elements, "cudaMalloc checkpoint_half");
+        DeviceBuffer<CacheT> *checkpoint_cache_tmp_ptr = nullptr;
+        if constexpr (!std::is_same_v<CacheT, float>) {
+            AllocateDeviceBufferArray(checkpoint_cache_tmp, checkpoint_half_elements, "cudaMalloc checkpoint_cache_tmp");
+            checkpoint_cache_tmp_ptr = checkpoint_cache_tmp;
+        }
         AllocateDeviceBuffer(bias_fused, gate_dim, "cudaMalloc bias_fused");
         AllocateDeviceBuffer(recompute_h_prev, bh_elements, "cudaMalloc recompute_h_prev");
         AllocateDeviceBuffer(recompute_h_next, bh_elements, "cudaMalloc recompute_h_next");
@@ -811,7 +858,7 @@ namespace flstm {
         size_t chunk_recompute_steps[2] = {0, 0};
 
         // Shared metadata for the double-buffered copy helper.
-        ChunkCopyParams chunk_params{
+        ChunkCopyParams<CacheT> chunk_params{
             .time_steps = time_steps,
             .chunk_capacity = chunk_capacity,
             .recompute_stride = recompute_stride,
@@ -824,6 +871,7 @@ namespace flstm {
             .y_tensor_host = y_tensor_host,
             .dY_tensor_host = dY_tensor_host,
             .checkpoint_half = checkpoint_half,
+            .checkpoint_cache_tmp = checkpoint_cache_tmp_ptr,
             .x_chunk_half = x_chunk_half,
             .y_chunk_half = y_chunk_half,
             .dY_chunk_half = dY_chunk_half,
@@ -834,7 +882,8 @@ namespace flstm {
             .compute_done = compute_done,
             .chunk_ids = chunk_ids,
             .prefix_steps = chunk_prefix_steps,
-            .recompute_steps = chunk_recompute_steps
+            .recompute_steps = chunk_recompute_steps,
+            .threads_per_block = threads
         };
 
         const size_t total_chunks = (time_steps + chunk_capacity - 1) / chunk_capacity;
@@ -842,7 +891,7 @@ namespace flstm {
         ssize_t next_chunk = static_cast<ssize_t>(total_chunks) - 1;
         for (int pre = 0; pre < static_cast<int>(std::min<size_t>(total_chunks, 2)); ++pre) {
             const int slot = pre % 2;
-            chunk_steps[slot] = IssueChunkCopy(next_chunk, slot, chunk_params);
+            chunk_steps[slot] = IssueChunkCopy<CacheT>(next_chunk, slot, chunk_params);
             --next_chunk;
         }
 
@@ -1195,7 +1244,7 @@ namespace flstm {
             ++processed_chunks;
 
             if (next_chunk >= 0) {
-                chunk_steps[slot] = IssueChunkCopy(next_chunk, slot, chunk_params);
+                chunk_steps[slot] = IssueChunkCopy<CacheT>(next_chunk, slot, chunk_params);
                 --next_chunk;
             } else {
                 chunk_steps[slot] = 0;
@@ -1239,6 +1288,109 @@ namespace flstm {
         CheckCuda(cudaStreamSynchronize(compute_stream), "final backward sync");
         profiler.Finish();
     }
+void StreamingLstmBackward(
+    size_t time_steps,
+    size_t batch_size,
+    size_t input_size,
+    size_t hidden_size,
+    size_t recompute_interval,
+
+    const __half *x_tensor_host,
+    const __half *y_tensor_host,
+    const void *gate_cache_host,
+    GateCacheType gate_cache_type,
+
+    const __half *dY_tensor_host,
+    const __half *d_hn_device,
+    const __half *d_cn_device,
+    const __half *h0_device,
+    const __half *c0_device,
+
+    const float *weights_ih,
+    const float *weights_hh,
+    const float *bias_ih,
+    const float *bias_hh,
+
+    __half *dx_tensor_host,
+    float *dW_ih,
+    float *dW_hh,
+    float *db_ih,
+    float *db_hh,
+    float *dh0_out,
+    float *dc0_out,
+
+    cudaStream_t compute_stream,
+    cudaStream_t h2d_stream,
+    cudaStream_t d2h_stream
+) {
+    switch (gate_cache_type) {
+        case FLSTM_GATE_CACHE_FLOAT32:
+            StreamingLstmBackwardImpl<float>(
+                time_steps,
+                batch_size,
+                input_size,
+                hidden_size,
+                recompute_interval,
+                x_tensor_host,
+                y_tensor_host,
+                static_cast<const float *>(gate_cache_host),
+                dY_tensor_host,
+                d_hn_device,
+                d_cn_device,
+                h0_device,
+                c0_device,
+                weights_ih,
+                weights_hh,
+                bias_ih,
+                bias_hh,
+                dx_tensor_host,
+                dW_ih,
+                dW_hh,
+                db_ih,
+                db_hh,
+                dh0_out,
+                dc0_out,
+                compute_stream,
+                h2d_stream,
+                d2h_stream
+            );
+            break;
+        case FLSTM_GATE_CACHE_FLOAT64:
+            StreamingLstmBackwardImpl<double>(
+                time_steps,
+                batch_size,
+                input_size,
+                hidden_size,
+                recompute_interval,
+                x_tensor_host,
+                y_tensor_host,
+                static_cast<const double *>(gate_cache_host),
+                dY_tensor_host,
+                d_hn_device,
+                d_cn_device,
+                h0_device,
+                c0_device,
+                weights_ih,
+                weights_hh,
+                bias_ih,
+                bias_hh,
+                dx_tensor_host,
+                dW_ih,
+                dW_hh,
+                db_ih,
+                db_hh,
+                dh0_out,
+                dc0_out,
+                compute_stream,
+                h2d_stream,
+                d2h_stream
+            );
+            break;
+        default:
+            throw std::runtime_error("Unsupported gate cache type for StreamingLstmBackward");
+    }
+}
+
 } // namespace flstm
 
 extern "C" void flstm_StreamingLstmBackward(
@@ -1250,7 +1402,8 @@ extern "C" void flstm_StreamingLstmBackward(
 
     const __half *x_tensor_host,
     const __half *y_tensor_host,
-    const float *gate_cache_host,
+    const void *gate_cache_host,
+    const flstmGateCacheType gate_cache_type,
 
     const __half *dY_tensor_host,
     const __half *d_hn_device,
@@ -1285,6 +1438,7 @@ extern "C" void flstm_StreamingLstmBackward(
             x_tensor_host,
             y_tensor_host,
             gate_cache_host,
+            gate_cache_type,
             dY_tensor_host,
             d_hn_device,
             d_cn_device,

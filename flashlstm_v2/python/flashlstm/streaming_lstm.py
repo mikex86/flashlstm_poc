@@ -190,7 +190,8 @@ class _StreamingLSTMFunction(Function):
             gate_cache_scale_host,
         ) = ctx.saved_tensors
         time_steps, batch_size, input_size, hidden_size, recompute_interval = ctx.meta
-        _check_pinned_float(gate_cache_host, "gate_cache_host")
+        _check_pinned_half(gate_cache_host, "gate_cache_host")
+        _check_pinned_float(gate_cache_scale_host, "gate_cache_scale_host")
 
         if grad_y_host is None:
             grad_y_host = torch.zeros_like(y_host)

@@ -166,13 +166,14 @@ class _StreamingLSTMFunction(Function):
         ctx.meta = (time_steps, batch_size, input_size, hidden_size, recompute_interval)
         ctx.mark_non_differentiable(gate_cache_host, gate_cache_scale_host)
 
-        return y_host, gate_cache_host, hy_device, cy_device
+        return y_host, gate_cache_host, gate_cache_scale_host, hy_device, cy_device
 
     @staticmethod
     def backward(  # type: ignore[override]
         ctx,
         grad_y_host: Optional[torch.Tensor],
         _grad_gate_cache: Optional[torch.Tensor],
+        _grad_gate_scale: Optional[torch.Tensor],
         grad_hy: Optional[torch.Tensor],
         grad_cy: Optional[torch.Tensor],
     ):
@@ -303,12 +304,13 @@ def streaming_lstm(
     bias_hh: torch.Tensor,
     *,
     recompute_interval: int = 1,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Functional wrapper for the streaming LSTM kernels.
-    Returns pinned host outputs, gate cache, and the final CUDA states (hy, cy).
+    Returns the pinned host outputs, the half-precision checkpoint cache plus
+    its scale factors, and the final CUDA states (hy, cy).
     """
-    return _StreamingLSTMFunction.apply(
+    y_host, gate_cache_host, gate_cache_scale_host, hy, cy = _StreamingLSTMFunction.apply(
         x_host,
         h0,
         c0,
@@ -318,6 +320,7 @@ def streaming_lstm(
         bias_hh,
         recompute_interval,
     )
+    return y_host, gate_cache_host, gate_cache_scale_host, hy, cy
 
 
 class StreamingLSTM(nn.Module):
@@ -353,13 +356,18 @@ class StreamingLSTM(nn.Module):
         c0: Optional[torch.Tensor] = None,
         *,
         recompute_interval: int = 1,
-    ) -> Tuple[torch.Tensor, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        Tuple[torch.Tensor, torch.Tensor],
+    ]:
         _check_pinned_half(x_host, "x_host")
         batch_size = x_host.size(1)
         h0 = _ensure_half_cuda(h0, (batch_size, self.hidden_size), "h0")
         c0 = _ensure_half_cuda(c0, (batch_size, self.hidden_size), "c0")
 
-        y_host, gate_cache_host, hy, cy = streaming_lstm(
+        y_host, gate_cache_host, gate_cache_scale_host, hy, cy = streaming_lstm(
             x_host,
             h0,
             c0,
@@ -369,4 +377,4 @@ class StreamingLSTM(nn.Module):
             self.bias_hh,
             recompute_interval=recompute_interval,
         )
-        return y_host, gate_cache_host, (hy, cy)
+        return y_host, gate_cache_host, gate_cache_scale_host, (hy, cy)

@@ -288,7 +288,6 @@ int main() {
     constexpr size_t y_elements = time_steps * batch_size * hidden_size;
     constexpr size_t checkpoint_steps = (time_steps + recompute_interval - 1) / recompute_interval;
     constexpr size_t gate_elements = checkpoint_steps * batch_size * hidden_size * 2;
-    constexpr size_t gate_scale_elements = checkpoint_steps * batch_size;
     constexpr size_t state_elements = batch_size * hidden_size;
 
     auto *x_host = CudaMallocHost<__half>(x_elements, "cudaMallocHost x_host");
@@ -349,8 +348,7 @@ int main() {
     __half *hy_device_out = CudaMallocDevice<__half>(state_elements, "cudaMalloc hy_device");
     __half *cy_device_out = CudaMallocDevice<__half>(state_elements, "cudaMalloc cy_device");
 
-    __half *gate_cache_host = CudaMallocHost<__half>(gate_elements, "cudaMallocHost gate_cache");
-    float *gate_cache_scale_host = CudaMallocHost<float>(gate_scale_elements, "cudaMallocHost gate_scale");
+    float *gate_cache_host = CudaMallocHost<float>(gate_elements, "cudaMallocHost gate_cache");
 
     CheckCuda(cudaMemcpy(h0_device, h0_host.data(), state_elements * sizeof(__half), cudaMemcpyHostToDevice),
               "memcpy h0");
@@ -387,7 +385,6 @@ int main() {
         bias_hh_device,
         y_host,
         gate_cache_host,
-        gate_cache_scale_host,
         hy_device_out,
         cy_device_out,
         compute_stream,
@@ -411,7 +408,6 @@ int main() {
         bias_hh_device,
         y_host,
         gate_cache_host,
-        gate_cache_scale_host,
         hy_device_out,
         cy_device_out,
         compute_stream,
@@ -485,7 +481,6 @@ int main() {
         x_host,
         y_host,
         gate_cache_host,
-        gate_cache_scale_host,
         dY_host,
         dHN_device,
         dCN_device,
@@ -517,7 +512,6 @@ int main() {
         x_host,
         y_host,
         gate_cache_host,
-        gate_cache_scale_host,
         dY_host,
         dHN_device,
         dCN_device,

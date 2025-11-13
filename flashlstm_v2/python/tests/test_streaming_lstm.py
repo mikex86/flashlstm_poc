@@ -36,7 +36,7 @@ def test_streaming_lstm_matches_torch_lstm():
     module.zero_grad(set_to_none=True)
     reference.zero_grad(set_to_none=True)
 
-    y_host, _, _, (hy, cy) = module(x_host, h0, c0)
+    y_host, _, (hy, cy) = module(x_host, h0, c0)
     y = y_host.to(device="cuda", dtype=torch.float32)
     hy_f = hy.to(dtype=torch.float32)
     cy_f = cy.to(dtype=torch.float32)

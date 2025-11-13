@@ -104,11 +104,6 @@ class _StreamingLSTMFunction(Function):
         )
         gate_cache_host = torch.empty(
             (checkpoint_steps, 2, batch_size, hidden_size),
-            dtype=torch.float16,
-            pin_memory=True,
-        )
-        gate_cache_scale_host = torch.empty(
-            (checkpoint_steps, batch_size),
             dtype=torch.float32,
             pin_memory=True,
         )
@@ -138,7 +133,6 @@ class _StreamingLSTMFunction(Function):
             bias_hh.data_ptr(),
             y_host.data_ptr(),
             gate_cache_host.data_ptr(),
-            gate_cache_scale_host.data_ptr(),
             hy_device.data_ptr(),
             cy_device.data_ptr(),
             compute_stream.cuda_stream,
@@ -161,19 +155,17 @@ class _StreamingLSTMFunction(Function):
             bias_hh,
             y_host,
             gate_cache_host,
-            gate_cache_scale_host,
         )
         ctx.meta = (time_steps, batch_size, input_size, hidden_size, recompute_interval)
-        ctx.mark_non_differentiable(gate_cache_host, gate_cache_scale_host)
+        ctx.mark_non_differentiable(gate_cache_host)
 
-        return y_host, gate_cache_host, gate_cache_scale_host, hy_device, cy_device
+        return y_host, gate_cache_host, hy_device, cy_device
 
     @staticmethod
     def backward(  # type: ignore[override]
         ctx,
         grad_y_host: Optional[torch.Tensor],
         _grad_gate_cache: Optional[torch.Tensor],
-        _grad_gate_scale: Optional[torch.Tensor],
         grad_hy: Optional[torch.Tensor],
         grad_cy: Optional[torch.Tensor],
     ):
@@ -187,11 +179,9 @@ class _StreamingLSTMFunction(Function):
             bias_hh,
             y_host,
             gate_cache_host,
-            gate_cache_scale_host,
         ) = ctx.saved_tensors
         time_steps, batch_size, input_size, hidden_size, recompute_interval = ctx.meta
-        _check_pinned_half(gate_cache_host, "gate_cache_host")
-        _check_pinned_float(gate_cache_scale_host, "gate_cache_scale_host")
+        _check_pinned_float(gate_cache_host, "gate_cache_host")
 
         if grad_y_host is None:
             grad_y_host = torch.zeros_like(y_host)
@@ -253,7 +243,6 @@ class _StreamingLSTMFunction(Function):
             x_host.data_ptr(),
             y_host.data_ptr(),
             gate_cache_host.data_ptr(),
-            gate_cache_scale_host.data_ptr(),
             grad_y_host.data_ptr(),
             grad_hy_ptr,
             grad_cy_ptr,
@@ -305,13 +294,12 @@ def streaming_lstm(
     bias_hh: torch.Tensor,
     *,
     recompute_interval: int = 1,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Functional wrapper for the streaming LSTM kernels.
-    Returns the pinned host outputs, the half-precision checkpoint cache plus
-    its scale factors, and the final CUDA states (hy, cy).
+    Returns pinned host outputs, gate cache, and the final CUDA states (hy, cy).
     """
-    y_host, gate_cache_host, gate_cache_scale_host, hy, cy = _StreamingLSTMFunction.apply(
+    return _StreamingLSTMFunction.apply(
         x_host,
         h0,
         c0,
@@ -321,7 +309,6 @@ def streaming_lstm(
         bias_hh,
         recompute_interval,
     )
-    return y_host, gate_cache_host, gate_cache_scale_host, hy, cy
 
 
 class StreamingLSTM(nn.Module):
@@ -357,18 +344,13 @@ class StreamingLSTM(nn.Module):
         c0: Optional[torch.Tensor] = None,
         *,
         recompute_interval: int = 1,
-    ) -> Tuple[
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        Tuple[torch.Tensor, torch.Tensor],
-    ]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         _check_pinned_half(x_host, "x_host")
         batch_size = x_host.size(1)
         h0 = _ensure_half_cuda(h0, (batch_size, self.hidden_size), "h0")
         c0 = _ensure_half_cuda(c0, (batch_size, self.hidden_size), "c0")
 
-        y_host, gate_cache_host, gate_cache_scale_host, hy, cy = streaming_lstm(
+        y_host, gate_cache_host, hy, cy = streaming_lstm(
             x_host,
             h0,
             c0,
@@ -378,4 +360,4 @@ class StreamingLSTM(nn.Module):
             self.bias_hh,
             recompute_interval=recompute_interval,
         )
-        return y_host, gate_cache_host, gate_cache_scale_host, (hy, cy)
+        return y_host, gate_cache_host, (hy, cy)

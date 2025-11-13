@@ -339,6 +339,36 @@ namespace {
         }
     }
 
+    __global__ void DequantizeCheckpointKernel(
+        const __half *checkpoint_src, // (N, 2, B, H) half
+        const float *column_scale, // (N * B,) scale factors
+        float *checkpoint_dst, // (N, 2, B, H) float
+        size_t checkpoints,
+        size_t batch_size,
+        size_t hidden_size
+    ) {
+        const size_t column = blockIdx.x;
+        const size_t total_columns = checkpoints * batch_size;
+        if (column >= total_columns) {
+            return;
+        }
+        const size_t checkpoint_idx = column / batch_size;
+        const size_t batch_idx = column % batch_size;
+        const size_t bh = batch_size * hidden_size;
+        const size_t checkpoint_offset = checkpoint_idx * 2 * bh;
+        const __half *h_src = checkpoint_src + checkpoint_offset + batch_idx * hidden_size;
+        const __half *c_src = checkpoint_src + checkpoint_offset + bh + batch_idx * hidden_size;
+        float *h_dst = checkpoint_dst + checkpoint_offset + batch_idx * hidden_size;
+        float *c_dst = checkpoint_dst + checkpoint_offset + bh + batch_idx * hidden_size;
+        const float scale = column_scale[column];
+        const float safe_scale = (scale > 0.0f) ? scale : 1.0f;
+
+        for (size_t idx = threadIdx.x; idx < hidden_size; idx += blockDim.x) {
+            h_dst[idx] = __half2float(h_src[idx]) * safe_scale;
+            c_dst[idx] = __half2float(c_src[idx]) * safe_scale;
+        }
+    }
+
     __global__ void RecomputePointwiseKernel(
         const float *gate_col, // (4H, B) column-major
         const float *bias, // (4H,)
@@ -364,11 +394,11 @@ namespace {
         const float scale = column_scale[col];
         const float gi = gate_col[row_base + col * gate_dim] * scale + bias[row_base + 0 * hidden_size];
         const float gf =
-            gate_col[row_base + hidden_size + col * gate_dim] * scale + bias[row_base + 1 * hidden_size];
+                gate_col[row_base + hidden_size + col * gate_dim] * scale + bias[row_base + 1 * hidden_size];
         const float gg =
-            gate_col[row_base + 2 * hidden_size + col * gate_dim] * scale + bias[row_base + 2 * hidden_size];
+                gate_col[row_base + 2 * hidden_size + col * gate_dim] * scale + bias[row_base + 2 * hidden_size];
         const float go =
-            gate_col[row_base + 3 * hidden_size + col * gate_dim] * scale + bias[row_base + 3 * hidden_size];
+                gate_col[row_base + 3 * hidden_size + col * gate_dim] * scale + bias[row_base + 3 * hidden_size];
 
         const float i_gate = 1.0f / (1.0f + expf(-gi));
         const float f_gate = 1.0f / (1.0f + expf(-gf));
@@ -487,11 +517,15 @@ namespace {
         size_t gate_dim;
         size_t input_size;
         size_t bh_elements;
-        const float *checkpoint_cache_host;
+        size_t hidden_size;
+        const __half *checkpoint_cache_host;
+        const float *checkpoint_scale_host;
         const __half *x_tensor_host;
         const __half *y_tensor_host;
         const __half *dY_tensor_host;
-        DeviceBuffer<float> *checkpoint_half;
+        DeviceBuffer<float> *checkpoint_states;
+        DeviceBuffer<__half> *checkpoint_compressed;
+        DeviceBuffer<float> *checkpoint_scale;
         DeviceBuffer<__half> *x_chunk_half;
         DeviceBuffer<__half> *y_chunk_half;
         DeviceBuffer<__half> *dY_chunk_half;
@@ -577,15 +611,39 @@ namespace {
                       "copy y_prev");
         }
 
-        if (params.checkpoint_cache_host != nullptr && params.checkpoint_half[slot].ptr != nullptr) {
-            const float *checkpoint_src = params.checkpoint_cache_host + checkpoint_index * 2 * params.bh_elements;
+        if (params.checkpoint_cache_host != nullptr &&
+            params.checkpoint_compressed[slot].ptr != nullptr &&
+            params.checkpoint_scale[slot].ptr != nullptr &&
+            params.checkpoint_states[slot].ptr != nullptr) {
+            const __half *checkpoint_src = params.checkpoint_cache_host + checkpoint_index * 2 * params.bh_elements;
             CheckCuda(cudaMemcpyAsync(
-                          params.checkpoint_half[slot].ptr,
+                          params.checkpoint_compressed[slot].ptr,
                           checkpoint_src,
-                          2 * params.bh_elements * sizeof(float),
+                          2 * params.bh_elements * sizeof(__half),
                           cudaMemcpyHostToDevice,
                           params.h2d_stream),
                       "copy checkpoint state");
+            const float *scale_src = params.checkpoint_scale_host + checkpoint_index * params.batch_size;
+            CheckCuda(cudaMemcpyAsync(
+                          params.checkpoint_scale[slot].ptr,
+                          scale_src,
+                          params.batch_size * sizeof(float),
+                          cudaMemcpyHostToDevice,
+                          params.h2d_stream),
+                      "copy checkpoint scales");
+            if (params.batch_size > 0) {
+                const int checkpoint_threads = 128;
+                const dim3 checkpoint_grid(static_cast<unsigned int>(params.batch_size));
+                DequantizeCheckpointKernel<<<checkpoint_grid, checkpoint_threads, 0, params.h2d_stream>>>(
+                    params.checkpoint_compressed[slot].ptr,
+                    params.checkpoint_scale[slot].ptr,
+                    params.checkpoint_states[slot].ptr,
+                    1,
+                    params.batch_size,
+                    params.hidden_size
+                );
+                CheckCuda(cudaGetLastError(), "DequantizeCheckpointKernel");
+            }
         }
 
         CheckCuda(cudaEventRecord(params.h2d_ready[slot].evt, params.h2d_stream), "record h2d_ready");
@@ -606,7 +664,8 @@ namespace flstm {
 
         const __half *x_tensor_host,
         const __half *y_tensor_host,
-        const float *gate_cache_host,
+        const __half *gate_cache_host,
+        const float *gate_cache_scale_host,
 
         const __half *dY_tensor_host,
         const __half *d_hn_device,
@@ -636,6 +695,11 @@ namespace flstm {
         if (time_steps == 0 || batch_size == 0 || input_size == 0 || hidden_size == 0) {
             return;
         }
+        if ((gate_cache_host == nullptr) != (gate_cache_scale_host == nullptr)) {
+            throw std::runtime_error(
+                "StreamingLstmBackward requires gate_cache_host and gate_cache_scale_host together");
+        }
+        const bool has_checkpoints = (gate_cache_host != nullptr);
         if (recompute_interval == 0) {
             throw std::runtime_error("StreamingLstmBackward requires recompute_interval >= 1");
         }
@@ -741,7 +805,9 @@ namespace flstm {
         DeviceBuffer<float> dX_chunk_col[2];
         DeviceBuffer<__half> dx_chunk_half[2];
         DeviceBuffer<__half> y_prev_half[2];
-        DeviceBuffer<float> checkpoint_half[2];
+        DeviceBuffer<float> checkpoint_states[2];
+        DeviceBuffer<__half> checkpoint_compressed[2];
+        DeviceBuffer<float> checkpoint_scale[2];
         DeviceBuffer<float> recompute_h_prev;
         DeviceBuffer<float> recompute_h_next;
         DeviceBuffer<float> recompute_c_prev;
@@ -768,7 +834,12 @@ namespace flstm {
         AllocateDeviceBufferArray(dG_chunk_col, dG_chunk_elements, "cudaMalloc dG_chunk_col");
         AllocateDeviceBufferArray(dG_chunk_half, dG_chunk_elements, "cudaMalloc dG_chunk_half");
         AllocateDeviceBufferArray(y_prev_half, bh_elements, "cudaMalloc y_prev_half");
-        AllocateDeviceBufferArray(checkpoint_half, checkpoint_half_elements, "cudaMalloc checkpoint_half");
+        if (has_checkpoints) {
+            AllocateDeviceBufferArray(checkpoint_states, checkpoint_half_elements, "cudaMalloc checkpoint_state");
+            AllocateDeviceBufferArray(checkpoint_compressed, checkpoint_half_elements,
+                                      "cudaMalloc checkpoint_compressed");
+            AllocateDeviceBufferArray(checkpoint_scale, batch_size, "cudaMalloc checkpoint_scale");
+        }
         AllocateDeviceBuffer(bias_fused, gate_dim, "cudaMalloc bias_fused");
         AllocateDeviceBuffer(recompute_h_prev, bh_elements, "cudaMalloc recompute_h_prev");
         AllocateDeviceBuffer(recompute_h_next, bh_elements, "cudaMalloc recompute_h_next");
@@ -819,11 +890,15 @@ namespace flstm {
             .gate_dim = gate_dim,
             .input_size = input_size,
             .bh_elements = bh_elements,
+            .hidden_size = hidden_size,
             .checkpoint_cache_host = gate_cache_host,
+            .checkpoint_scale_host = gate_cache_scale_host,
             .x_tensor_host = x_tensor_host,
             .y_tensor_host = y_tensor_host,
             .dY_tensor_host = dY_tensor_host,
-            .checkpoint_half = checkpoint_half,
+            .checkpoint_states = checkpoint_states,
+            .checkpoint_compressed = checkpoint_compressed,
+            .checkpoint_scale = checkpoint_scale,
             .x_chunk_half = x_chunk_half,
             .y_chunk_half = y_chunk_half,
             .dY_chunk_half = dY_chunk_half,
@@ -918,14 +993,14 @@ namespace flstm {
             if (recompute_steps > 0) {
                 CheckCuda(cudaMemcpyAsync(
                               recompute_h_prev.ptr,
-                              checkpoint_half[slot].ptr,
+                              checkpoint_states[slot].ptr,
                               bh_elements * sizeof(float),
                               cudaMemcpyDeviceToDevice,
                               compute_stream),
                           "copy checkpoint h");
                 CheckCuda(cudaMemcpyAsync(
                               recompute_c_prev.ptr,
-                              checkpoint_half[slot].ptr + bh_elements,
+                              checkpoint_states[slot].ptr + bh_elements,
                               bh_elements * sizeof(float),
                               cudaMemcpyDeviceToDevice,
                               compute_stream),
@@ -1250,7 +1325,8 @@ extern "C" void flstm_StreamingLstmBackward(
 
     const __half *x_tensor_host,
     const __half *y_tensor_host,
-    const float *gate_cache_host,
+    const __half *gate_cache_host,
+    const float *gate_cache_scale_host,
 
     const __half *dY_tensor_host,
     const __half *d_hn_device,
@@ -1285,6 +1361,7 @@ extern "C" void flstm_StreamingLstmBackward(
             x_tensor_host,
             y_tensor_host,
             gate_cache_host,
+            gate_cache_scale_host,
             dY_tensor_host,
             d_hn_device,
             d_cn_device,

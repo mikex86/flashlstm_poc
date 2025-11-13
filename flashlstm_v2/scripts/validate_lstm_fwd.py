@@ -63,6 +63,7 @@ def _prepare_function(lib: ctypes.CDLL) -> None:
         ctypes.c_void_p,  # bias_hh
         ctypes.c_void_p,  # y host
         ctypes.c_void_p,  # gate cache host
+        ctypes.c_void_p,  # gate cache scales
         ctypes.c_void_p,  # hy device
         ctypes.c_void_p,  # cy device
         ctypes.c_void_p,  # compute stream
@@ -139,6 +140,11 @@ def _run_case(lib: ctypes.CDLL, cfg: LstmConfig):
         2,
         cfg.batch_size,
         cfg.hidden_size,
+        dtype=torch.float16,
+    ).contiguous().pin_memory()
+    gate_cache_scale = torch.empty(
+        checkpoint_steps,
+        cfg.batch_size,
         dtype=torch.float32,
     ).contiguous().pin_memory()
 
@@ -173,6 +179,7 @@ def _run_case(lib: ctypes.CDLL, cfg: LstmConfig):
         _as_void_p(bias_hh),
         _as_void_p(y_host),
         _as_void_p(gate_cache),
+        _as_void_p(gate_cache_scale),
         _as_void_p(hy_device),
         _as_void_p(cy_device),
         ctypes.c_void_p(compute_stream.cuda_stream),

@@ -104,6 +104,11 @@ class _StreamingLSTMFunction(Function):
         )
         gate_cache_host = torch.empty(
             (checkpoint_steps, 2, batch_size, hidden_size),
+            dtype=torch.float16,
+            pin_memory=True,
+        )
+        gate_cache_scale_host = torch.empty(
+            (checkpoint_steps, batch_size),
             dtype=torch.float32,
             pin_memory=True,
         )
@@ -133,6 +138,7 @@ class _StreamingLSTMFunction(Function):
             bias_hh.data_ptr(),
             y_host.data_ptr(),
             gate_cache_host.data_ptr(),
+            gate_cache_scale_host.data_ptr(),
             hy_device.data_ptr(),
             cy_device.data_ptr(),
             compute_stream.cuda_stream,
@@ -155,9 +161,10 @@ class _StreamingLSTMFunction(Function):
             bias_hh,
             y_host,
             gate_cache_host,
+            gate_cache_scale_host,
         )
         ctx.meta = (time_steps, batch_size, input_size, hidden_size, recompute_interval)
-        ctx.mark_non_differentiable(gate_cache_host)
+        ctx.mark_non_differentiable(gate_cache_host, gate_cache_scale_host)
 
         return y_host, gate_cache_host, hy_device, cy_device
 
@@ -179,6 +186,7 @@ class _StreamingLSTMFunction(Function):
             bias_hh,
             y_host,
             gate_cache_host,
+            gate_cache_scale_host,
         ) = ctx.saved_tensors
         time_steps, batch_size, input_size, hidden_size, recompute_interval = ctx.meta
         _check_pinned_float(gate_cache_host, "gate_cache_host")
@@ -243,6 +251,7 @@ class _StreamingLSTMFunction(Function):
             x_host.data_ptr(),
             y_host.data_ptr(),
             gate_cache_host.data_ptr(),
+            gate_cache_scale_host.data_ptr(),
             grad_y_host.data_ptr(),
             grad_hy_ptr,
             grad_cy_ptr,

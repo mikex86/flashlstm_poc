@@ -17,10 +17,10 @@ namespace flstm {
  *
  * Outputs:
  *   - y_tensor_host:     (T, B, H) in pinned host memory (__half)
- *   - gate_cache_host:   checkpoint buffer storing (⌈T / R⌉, 2, B, H) FP32
- *                        states (h and c) where R is `recompute_interval`
- *                        controlling how frequently backward checkpoints are
- *                        materialised to host.
+ *   - gate_cache_host:   checkpoint buffer storing (⌈T / R⌉, 2, B, H) FP16
+ *                        states paired with per-(checkpoint,batch) FP32 scale
+ *                        factors (`gate_cache_scale_host`). Each checkpoint
+ *                        column is block-quantised independently.
  *   - compute_stream / h2d_stream / d2h_stream: distinct CUDA streams used for
  *         GEMMs, host→device transfers, and device→host transfers respectively.
  *         All three stream handles must be different to enable overlap.
@@ -43,7 +43,8 @@ void StreamingLstmForward(
 
     __half *y_tensor_host,
 
-    float *gate_cache_host,
+    __half *gate_cache_host,
+    float *gate_cache_scale_host,
     __half *hy_device,
     __half *cy_device,
 
@@ -57,9 +58,11 @@ void StreamingLstmForward(
  *
  * Inputs:
  *   - x_tensor_host:    (T, B, I) inputs in pinned host memory (__half)
- *   - gate_cache_host:  checkpoint buffer storing (⌈T / R⌉, 2, B, H) FP32
- *                       states (h and c) captured every `recompute_interval`
- *                       steps to seed backward recomputation.
+ *   - gate_cache_host / gate_cache_scale_host: compressed checkpoints in
+ *                       pinned host memory. For every checkpoint and batch,
+ *                       the 2×H half-precision values are paired with a scale
+ *                       factor that restores FP32 accuracy prior to backward
+ *                       recomputation.
  *   - dY_tensor_host:   upstream grads w.r.t outputs in host half precision
  *   - d_hn_device / d_cn_device: grads for final states (nullable)
  *   - c0_device:        initial cell state provided in half precision (B, H)
@@ -84,7 +87,8 @@ void StreamingLstmBackward(
 
     const __half *x_tensor_host,
     const __half *y_tensor_host,
-    const float *gate_cache_host,
+    const __half *gate_cache_host,
+    const float *gate_cache_scale_host,
 
     const __half *dY_tensor_host,
     const __half *d_hn_device,
@@ -132,7 +136,8 @@ void flstm_StreamingLstmForward(
 
     __half *y_tensor_host,
 
-    float *gate_cache_host,
+    __half *gate_cache_host,
+    float *gate_cache_scale_host,
     __half *hy_device,
     __half *cy_device,
 
@@ -150,7 +155,8 @@ void flstm_StreamingLstmBackward(
 
     const __half *x_tensor_host,
     const __half *y_tensor_host,
-    const float *gate_cache_host,
+    const __half *gate_cache_host,
+    const float *gate_cache_scale_host,
 
     const __half *dY_tensor_host,
     const __half *d_hn_device,

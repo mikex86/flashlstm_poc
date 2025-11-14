@@ -48,6 +48,37 @@ inline int BlocksFor(size_t count, int threads = 256) {
     return static_cast<int>((count + threads - 1) / threads);
 }
 
+inline const char *GateCacheDTypeName(flstm::GateCacheDType dtype) {
+    switch (dtype) {
+        case flstm::GateCacheDType::kFloat32: return "float32";
+        case flstm::GateCacheDType::kFloat16: return "float16";
+    }
+    return "unknown";
+}
+
+inline size_t GateCacheDTypeSize(flstm::GateCacheDType dtype) {
+    switch (dtype) {
+        case flstm::GateCacheDType::kFloat32: return sizeof(float);
+        case flstm::GateCacheDType::kFloat16: return sizeof(__half);
+    }
+    throw std::runtime_error("Unsupported gate cache dtype");
+}
+
+inline void ValidateGateCacheOptions(const flstm::StreamingLstmOptions &options) {
+    auto validate = [](flstm::GateCacheDType dtype, const char *label) {
+        switch (dtype) {
+            case flstm::GateCacheDType::kFloat32:
+            case flstm::GateCacheDType::kFloat16:
+                return;
+            default:
+                throw std::runtime_error(std::string("Unsupported gate cache dtype for ") + label
+                                         + ": " + GateCacheDTypeName(dtype));
+        }
+    };
+    validate(options.h_dtype, "h");
+    validate(options.c_dtype, "c");
+}
+
 bool RegisterHostMemoryOrThrow(const void *ptr, size_t bytes, const char *what) {
     if (ptr == nullptr || bytes == 0) {
         return false;
@@ -474,7 +505,8 @@ void StreamingLstmForward(
 
     __half *y_tensor_host,
 
-    float *gate_cache_host,
+    GateCacheHost gate_cache_host,
+    StreamingLstmOptions options,
     __half *hy_device,
     __half *cy_device,
 
@@ -487,6 +519,7 @@ void StreamingLstmForward(
     if (time_steps == 0 || batch_size == 0 || input_size == 0 || hidden_size == 0) {
         return;
     }
+    ValidateGateCacheOptions(options);
     if (recompute_interval == 0) {
         throw std::runtime_error("StreamingLstmForward requires recompute_interval >= 1");
     }
@@ -499,14 +532,17 @@ void StreamingLstmForward(
     const size_t bh_elements = batch_size * hidden_size;
     const size_t checkpoint_stride = recompute_interval;
     const size_t checkpoint_count = (time_steps + checkpoint_stride - 1) / checkpoint_stride;
-    const size_t checkpoint_elements = checkpoint_count * 2 * bh_elements;
+    const size_t checkpoint_h_elements = checkpoint_count * bh_elements;
+    const size_t checkpoint_c_elements = checkpoint_count * bh_elements;
+    const size_t checkpoint_h_bytes = checkpoint_h_elements * GateCacheDTypeSize(options.h_dtype);
+    const size_t checkpoint_c_bytes = checkpoint_c_elements * GateCacheDTypeSize(options.c_dtype);
     const size_t x_step_bytes = batch_size * input_size * sizeof(__half);
     const size_t y_step_bytes = bh_elements * sizeof(__half);
     constexpr size_t kChunkSteps = 32;
     const size_t chunk_capacity = kChunkSteps;
     const size_t chunk_input_capacity = chunk_capacity * batch_size * input_size;
     const size_t chunk_output_capacity = chunk_capacity * bh_elements;
-    const bool store_checkpoints = (gate_cache_host != nullptr);
+    const bool store_checkpoints = (gate_cache_host.h_ptr != nullptr && gate_cache_host.c_ptr != nullptr);
     const bool needs_y_fallback = (y_tensor_host != nullptr);
 
     const int threads = 256;
@@ -514,7 +550,8 @@ void StreamingLstmForward(
 
     HostRegistration x_host_registration;
     HostRegistration y_host_registration;
-    HostRegistration gate_host_registration;
+    HostRegistration gate_h_host_registration;
+    HostRegistration gate_c_host_registration;
 
     x_host_registration.reset(
         x_tensor_host,
@@ -529,10 +566,15 @@ void StreamingLstmForward(
         );
     }
     if (store_checkpoints) {
-        gate_host_registration.reset(
-            gate_cache_host,
-            checkpoint_elements * sizeof(float),
-            "cudaHostRegister checkpoint_cache_host"
+        gate_h_host_registration.reset(
+            gate_cache_host.h_ptr,
+            checkpoint_h_bytes,
+            "cudaHostRegister checkpoint_cache_h_host"
+        );
+        gate_c_host_registration.reset(
+            gate_cache_host.c_ptr,
+            checkpoint_c_bytes,
+            "cudaHostRegister checkpoint_cache_c_host"
         );
     }
 
@@ -614,10 +656,21 @@ void StreamingLstmForward(
     }
 
     const size_t max_checkpoints_per_chunk = std::max<size_t>(1, (chunk_capacity + checkpoint_stride - 1) / checkpoint_stride + 1);
-    const size_t checkpoint_entry_elements = 2 * bh_elements;
-    DeviceBuffer<float> checkpoint_chunks[2];
+    DeviceBuffer<float> checkpoint_chunks_h[2];
+    DeviceBuffer<float> checkpoint_chunks_c[2];
+    DeviceBuffer<__half> checkpoint_chunks_h_half[2];
+    DeviceBuffer<__half> checkpoint_chunks_c_half[2];
+    const bool h_cache_uses_half = (options.h_dtype == flstm::GateCacheDType::kFloat16);
+    const bool c_cache_uses_half = (options.c_dtype == flstm::GateCacheDType::kFloat16);
     if (store_checkpoints) {
-        AllocateDeviceBufferArray(checkpoint_chunks, max_checkpoints_per_chunk * checkpoint_entry_elements, "cudaMalloc checkpoint_chunk");
+        AllocateDeviceBufferArray(checkpoint_chunks_h, max_checkpoints_per_chunk * bh_elements, "cudaMalloc checkpoint_chunk_h");
+        AllocateDeviceBufferArray(checkpoint_chunks_c, max_checkpoints_per_chunk * bh_elements, "cudaMalloc checkpoint_chunk_c");
+        if (h_cache_uses_half) {
+            AllocateDeviceBufferArray(checkpoint_chunks_h_half, max_checkpoints_per_chunk * bh_elements, "cudaMalloc checkpoint_chunk_h_half");
+        }
+        if (c_cache_uses_half) {
+            AllocateDeviceBufferArray(checkpoint_chunks_c_half, max_checkpoints_per_chunk * bh_elements, "cudaMalloc checkpoint_chunk_c_half");
+        }
     }
     CudaEvent checkpoint_copy_done[2];
     bool checkpoint_copy_inflight[2] = {false, false};
@@ -740,17 +793,17 @@ void StreamingLstmForward(
             if (store_checkpoints && next_checkpoint_step != static_cast<size_t>(-1) &&
                 global_step == next_checkpoint_step) {
                 if (checkpoint_global_index < checkpoint_count) {
-                    const size_t checkpoint_slot_offset = checkpoint_counts[slot] * checkpoint_entry_elements;
-                    float *checkpoint_dst = checkpoint_chunks[slot].ptr + checkpoint_slot_offset;
+                    float *checkpoint_dst_h = checkpoint_chunks_h[slot].ptr + checkpoint_counts[slot] * bh_elements;
+                    float *checkpoint_dst_c = checkpoint_chunks_c[slot].ptr + checkpoint_counts[slot] * bh_elements;
                     CheckCuda(cudaMemcpyAsync(
-                                  checkpoint_dst,
+                                  checkpoint_dst_h,
                                   h_prev.ptr,
                                   bh_elements * sizeof(float),
                                   cudaMemcpyDeviceToDevice,
                                   compute_stream),
                               "copy checkpoint h");
                     CheckCuda(cudaMemcpyAsync(
-                                  checkpoint_dst + bh_elements,
+                                  checkpoint_dst_c,
                                   c_prev.ptr,
                                   bh_elements * sizeof(float),
                                   cudaMemcpyDeviceToDevice,
@@ -822,6 +875,31 @@ void StreamingLstmForward(
             std::swap(c_prev.ptr, c_next.ptr);
         }
 
+        if (store_checkpoints) {
+            const size_t checkpoint_count_chunk = checkpoint_counts[slot];
+            if (checkpoint_count_chunk > 0) {
+                const size_t checkpoint_elements_chunk = checkpoint_count_chunk * bh_elements;
+                if (h_cache_uses_half) {
+                    const int convert_blocks = BlocksFor(checkpoint_elements_chunk, threads);
+                    FloatToHalfKernel<<<convert_blocks, threads, 0, compute_stream>>>(
+                        checkpoint_chunks_h[slot].ptr,
+                        checkpoint_chunks_h_half[slot].ptr,
+                        checkpoint_elements_chunk
+                    );
+                    CheckCuda(cudaGetLastError(), "FloatToHalfKernel checkpoint h");
+                }
+                if (c_cache_uses_half) {
+                    const int convert_blocks = BlocksFor(checkpoint_elements_chunk, threads);
+                    FloatToHalfKernel<<<convert_blocks, threads, 0, compute_stream>>>(
+                        checkpoint_chunks_c[slot].ptr,
+                        checkpoint_chunks_c_half[slot].ptr,
+                        checkpoint_elements_chunk
+                    );
+                    CheckCuda(cudaGetLastError(), "FloatToHalfKernel checkpoint c");
+                }
+            }
+        }
+
         CheckCuda(cudaEventRecord(compute_done[slot].evt, compute_stream), "record compute_done");
         compute_done_valid[slot] = true;
 
@@ -830,16 +908,52 @@ void StreamingLstmForward(
         if (store_checkpoints) {
             const size_t checkpoint_count_chunk = checkpoint_counts[slot];
             if (checkpoint_count_chunk > 0) {
-                const size_t elements = checkpoint_count_chunk * checkpoint_entry_elements;
-                float *dst = gate_cache_host + checkpoint_host_offsets[slot] * checkpoint_entry_elements;
-                const float *src = checkpoint_chunks[slot].ptr;
-                CheckCuda(cudaMemcpyAsync(
-                              dst,
-                              src,
-                              elements * sizeof(float),
-                              cudaMemcpyDeviceToHost,
-                              d2h_stream),
-                          "copy checkpoint chunk");
+                const size_t dst_offset = checkpoint_host_offsets[slot] * bh_elements;
+                const size_t chunk_elements = checkpoint_count_chunk * bh_elements;
+                if (!h_cache_uses_half) {
+                    float *dst = reinterpret_cast<float *>(gate_cache_host.h_ptr) + dst_offset;
+                    const float *src = checkpoint_chunks_h[slot].ptr;
+                    CheckCuda(cudaMemcpyAsync(
+                                  dst,
+                                  src,
+                                  chunk_elements * sizeof(float),
+                                  cudaMemcpyDeviceToHost,
+                                  d2h_stream),
+                              "copy checkpoint h chunk");
+                } else {
+                    __half *dst = reinterpret_cast<__half *>(gate_cache_host.h_ptr) + dst_offset;
+                    const __half *src = checkpoint_chunks_h_half[slot].ptr;
+                    CheckCuda(cudaMemcpyAsync(
+                                  dst,
+                                  src,
+                                  chunk_elements * sizeof(__half),
+                                  cudaMemcpyDeviceToHost,
+                                  d2h_stream),
+                              "copy checkpoint h chunk half");
+                }
+
+                if (!c_cache_uses_half) {
+                    float *dst = reinterpret_cast<float *>(gate_cache_host.c_ptr) + dst_offset;
+                    const float *src = checkpoint_chunks_c[slot].ptr;
+                    CheckCuda(cudaMemcpyAsync(
+                                  dst,
+                                  src,
+                                  chunk_elements * sizeof(float),
+                                  cudaMemcpyDeviceToHost,
+                                  d2h_stream),
+                              "copy checkpoint c chunk");
+                } else {
+                    __half *dst = reinterpret_cast<__half *>(gate_cache_host.c_ptr) + dst_offset;
+                    const __half *src = checkpoint_chunks_c_half[slot].ptr;
+                    CheckCuda(cudaMemcpyAsync(
+                                  dst,
+                                  src,
+                                  chunk_elements * sizeof(__half),
+                                  cudaMemcpyDeviceToHost,
+                                  d2h_stream),
+                              "copy checkpoint c chunk half");
+                }
+
                 CheckCuda(cudaEventRecord(checkpoint_copy_done[slot].evt, d2h_stream), "record checkpoint_copy_done");
                 checkpoint_copy_inflight[slot] = true;
             }
@@ -917,7 +1031,8 @@ extern "C" void flstm_StreamingLstmForward(
 
     __half *y_tensor_host,
 
-    float *gate_cache_host,
+    flstm_GateCacheHost gate_cache_host,
+    const flstm_StreamingLstmOptions *options,
     __half *hy_device,
     __half *cy_device,
 
@@ -926,6 +1041,15 @@ extern "C" void flstm_StreamingLstmForward(
     const cudaStream_t d2h_stream
 ) {
     try {
+        flstm::GateCacheHost cache_host{
+            gate_cache_host.h_ptr,
+            gate_cache_host.c_ptr,
+        };
+        flstm::StreamingLstmOptions opts;
+        if (options != nullptr) {
+            opts.h_dtype = static_cast<flstm::GateCacheDType>(options->h_dtype);
+            opts.c_dtype = static_cast<flstm::GateCacheDType>(options->c_dtype);
+        }
         flstm::StreamingLstmForward(
             time_steps,
             batch_size,
@@ -940,7 +1064,8 @@ extern "C" void flstm_StreamingLstmForward(
             bias_ih,
             bias_hh,
             y_tensor_host,
-            gate_cache_host,
+            cache_host,
+            opts,
             hy_device,
             cy_device,
             compute_stream,

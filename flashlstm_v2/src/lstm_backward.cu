@@ -47,6 +47,29 @@ namespace {
         return static_cast<int>((count + threads - 1) / threads);
     }
 
+    const char *GateCacheDTypeName(flstm::GateCacheDType dtype) {
+        switch (dtype) {
+            case flstm::GateCacheDType::kFloat32: return "float32";
+            case flstm::GateCacheDType::kFloat16: return "float16";
+        }
+        return "unknown";
+    }
+
+    void ValidateGateCacheOptions(const flstm::StreamingLstmOptions &options) {
+        auto validate = [](flstm::GateCacheDType dtype, const char *label) {
+            switch (dtype) {
+                case flstm::GateCacheDType::kFloat32:
+                case flstm::GateCacheDType::kFloat16:
+                    return;
+                default:
+                    throw std::runtime_error(std::string("Unsupported gate cache dtype for ") + label
+                                             + ": " + GateCacheDTypeName(dtype));
+            }
+        };
+        validate(options.h_dtype, "h");
+        validate(options.c_dtype, "c");
+    }
+
     template<typename T>
     struct DeviceBuffer {
         T *ptr{nullptr};
@@ -487,11 +510,15 @@ namespace {
         size_t gate_dim;
         size_t input_size;
         size_t bh_elements;
-        const float *checkpoint_cache_host;
+        flstm::GateCacheHost checkpoint_cache_host;
+        flstm::StreamingLstmOptions options;
+        int threads;
         const __half *x_tensor_host;
         const __half *y_tensor_host;
         const __half *dY_tensor_host;
         DeviceBuffer<float> *checkpoint_half;
+        DeviceBuffer<__half> *checkpoint_h_half_quantized;
+        DeviceBuffer<__half> *checkpoint_c_half_quantized;
         DeviceBuffer<__half> *x_chunk_half;
         DeviceBuffer<__half> *y_chunk_half;
         DeviceBuffer<__half> *dY_chunk_half;
@@ -577,15 +604,71 @@ namespace {
                       "copy y_prev");
         }
 
-        if (params.checkpoint_cache_host != nullptr && params.checkpoint_half[slot].ptr != nullptr) {
-            const float *checkpoint_src = params.checkpoint_cache_host + checkpoint_index * 2 * params.bh_elements;
-            CheckCuda(cudaMemcpyAsync(
-                          params.checkpoint_half[slot].ptr,
-                          checkpoint_src,
-                          2 * params.bh_elements * sizeof(float),
-                          cudaMemcpyHostToDevice,
-                          params.h2d_stream),
-                      "copy checkpoint state");
+        if (params.checkpoint_cache_host.h_ptr != nullptr && params.checkpoint_cache_host.c_ptr != nullptr &&
+            params.checkpoint_half[slot].ptr != nullptr) {
+            const size_t checkpoint_offset = checkpoint_index * params.bh_elements;
+            float *checkpoint_dst_h = params.checkpoint_half[slot].ptr;
+            float *checkpoint_dst_c = params.checkpoint_half[slot].ptr + params.bh_elements;
+
+            if (params.options.h_dtype == flstm::GateCacheDType::kFloat32) {
+                const float *checkpoint_src_h =
+                        reinterpret_cast<const float *>(params.checkpoint_cache_host.h_ptr) + checkpoint_offset;
+                CheckCuda(cudaMemcpyAsync(
+                              checkpoint_dst_h,
+                              checkpoint_src_h,
+                              params.bh_elements * sizeof(float),
+                              cudaMemcpyHostToDevice,
+                              params.h2d_stream),
+                          "copy checkpoint h state");
+            } else {
+                __half *quantized = params.checkpoint_h_half_quantized[slot].ptr;
+                const __half *checkpoint_src_h =
+                        reinterpret_cast<const __half *>(params.checkpoint_cache_host.h_ptr) + checkpoint_offset;
+                CheckCuda(cudaMemcpyAsync(
+                              quantized,
+                              checkpoint_src_h,
+                              params.bh_elements * sizeof(__half),
+                              cudaMemcpyHostToDevice,
+                              params.h2d_stream),
+                          "copy checkpoint h state half");
+                const int convert_blocks = BlocksFor(params.bh_elements, params.threads);
+                HalfToFloatKernel<<<convert_blocks, params.threads, 0, params.h2d_stream>>>(
+                    quantized,
+                    checkpoint_dst_h,
+                    params.bh_elements
+                );
+                CheckCuda(cudaGetLastError(), "HalfToFloatKernel checkpoint h");
+            }
+
+            if (params.options.c_dtype == flstm::GateCacheDType::kFloat32) {
+                const float *checkpoint_src_c =
+                        reinterpret_cast<const float *>(params.checkpoint_cache_host.c_ptr) + checkpoint_offset;
+                CheckCuda(cudaMemcpyAsync(
+                              checkpoint_dst_c,
+                              checkpoint_src_c,
+                              params.bh_elements * sizeof(float),
+                              cudaMemcpyHostToDevice,
+                              params.h2d_stream),
+                          "copy checkpoint c state");
+            } else {
+                __half *quantized = params.checkpoint_c_half_quantized[slot].ptr;
+                const __half *checkpoint_src_c =
+                        reinterpret_cast<const __half *>(params.checkpoint_cache_host.c_ptr) + checkpoint_offset;
+                CheckCuda(cudaMemcpyAsync(
+                              quantized,
+                              checkpoint_src_c,
+                              params.bh_elements * sizeof(__half),
+                              cudaMemcpyHostToDevice,
+                              params.h2d_stream),
+                          "copy checkpoint c state half");
+                const int convert_blocks = BlocksFor(params.bh_elements, params.threads);
+                HalfToFloatKernel<<<convert_blocks, params.threads, 0, params.h2d_stream>>>(
+                    quantized,
+                    checkpoint_dst_c,
+                    params.bh_elements
+                );
+                CheckCuda(cudaGetLastError(), "HalfToFloatKernel checkpoint c");
+            }
         }
 
         CheckCuda(cudaEventRecord(params.h2d_ready[slot].evt, params.h2d_stream), "record h2d_ready");
@@ -606,7 +689,8 @@ namespace flstm {
 
         const __half *x_tensor_host,
         const __half *y_tensor_host,
-        const float *gate_cache_host,
+        GateCacheHost gate_cache_host,
+        StreamingLstmOptions options,
 
         const __half *dY_tensor_host,
         const __half *d_hn_device,
@@ -636,10 +720,12 @@ namespace flstm {
         if (time_steps == 0 || batch_size == 0 || input_size == 0 || hidden_size == 0) {
             return;
         }
+        ValidateGateCacheOptions(options);
         if (recompute_interval == 0) {
             throw std::runtime_error("StreamingLstmBackward requires recompute_interval >= 1");
         }
-        if (x_tensor_host == nullptr || y_tensor_host == nullptr || gate_cache_host == nullptr ||
+        if (x_tensor_host == nullptr || y_tensor_host == nullptr || gate_cache_host.h_ptr == nullptr ||
+            gate_cache_host.c_ptr == nullptr ||
             dY_tensor_host == nullptr || h0_device == nullptr || c0_device == nullptr) {
             throw std::runtime_error("StreamingLstmBackward requires forward caches");
         }
@@ -742,6 +828,8 @@ namespace flstm {
         DeviceBuffer<__half> dx_chunk_half[2];
         DeviceBuffer<__half> y_prev_half[2];
         DeviceBuffer<float> checkpoint_half[2];
+        DeviceBuffer<__half> checkpoint_h_half_quantized[2];
+        DeviceBuffer<__half> checkpoint_c_half_quantized[2];
         DeviceBuffer<float> recompute_h_prev;
         DeviceBuffer<float> recompute_h_next;
         DeviceBuffer<float> recompute_c_prev;
@@ -769,6 +857,14 @@ namespace flstm {
         AllocateDeviceBufferArray(dG_chunk_half, dG_chunk_elements, "cudaMalloc dG_chunk_half");
         AllocateDeviceBufferArray(y_prev_half, bh_elements, "cudaMalloc y_prev_half");
         AllocateDeviceBufferArray(checkpoint_half, checkpoint_half_elements, "cudaMalloc checkpoint_half");
+        const bool checkpoint_h_is_half = (options.h_dtype == flstm::GateCacheDType::kFloat16);
+        const bool checkpoint_c_is_half = (options.c_dtype == flstm::GateCacheDType::kFloat16);
+        if (checkpoint_h_is_half) {
+            AllocateDeviceBufferArray(checkpoint_h_half_quantized, bh_elements, "cudaMalloc checkpoint_h_quantized");
+        }
+        if (checkpoint_c_is_half) {
+            AllocateDeviceBufferArray(checkpoint_c_half_quantized, bh_elements, "cudaMalloc checkpoint_c_quantized");
+        }
         AllocateDeviceBuffer(bias_fused, gate_dim, "cudaMalloc bias_fused");
         AllocateDeviceBuffer(recompute_h_prev, bh_elements, "cudaMalloc recompute_h_prev");
         AllocateDeviceBuffer(recompute_h_next, bh_elements, "cudaMalloc recompute_h_next");
@@ -820,10 +916,14 @@ namespace flstm {
             .input_size = input_size,
             .bh_elements = bh_elements,
             .checkpoint_cache_host = gate_cache_host,
+            .options = options,
+            .threads = threads,
             .x_tensor_host = x_tensor_host,
             .y_tensor_host = y_tensor_host,
             .dY_tensor_host = dY_tensor_host,
             .checkpoint_half = checkpoint_half,
+            .checkpoint_h_half_quantized = checkpoint_h_half_quantized,
+            .checkpoint_c_half_quantized = checkpoint_c_half_quantized,
             .x_chunk_half = x_chunk_half,
             .y_chunk_half = y_chunk_half,
             .dY_chunk_half = dY_chunk_half,
@@ -1250,7 +1350,7 @@ extern "C" void flstm_StreamingLstmBackward(
 
     const __half *x_tensor_host,
     const __half *y_tensor_host,
-    const float *gate_cache_host,
+    flstm_GateCacheHost gate_cache_host,
 
     const __half *dY_tensor_host,
     const __half *d_hn_device,
@@ -1273,9 +1373,19 @@ extern "C" void flstm_StreamingLstmBackward(
 
     const cudaStream_t compute_stream,
     const cudaStream_t h2d_stream,
-    const cudaStream_t d2h_stream
+    const cudaStream_t d2h_stream,
+    const flstm_StreamingLstmOptions *options
 ) {
     try {
+        flstm::GateCacheHost cache_host{
+            gate_cache_host.h_ptr,
+            gate_cache_host.c_ptr,
+        };
+        flstm::StreamingLstmOptions opts;
+        if (options != nullptr) {
+            opts.h_dtype = static_cast<flstm::GateCacheDType>(options->h_dtype);
+            opts.c_dtype = static_cast<flstm::GateCacheDType>(options->c_dtype);
+        }
         flstm::StreamingLstmBackward(
             time_steps,
             batch_size,
@@ -1284,7 +1394,8 @@ extern "C" void flstm_StreamingLstmBackward(
             recompute_interval,
             x_tensor_host,
             y_tensor_host,
-            gate_cache_host,
+            cache_host,
+            opts,
             dY_tensor_host,
             d_hn_device,
             d_cn_device,

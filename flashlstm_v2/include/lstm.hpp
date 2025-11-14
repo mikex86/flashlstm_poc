@@ -6,6 +6,21 @@
 
 namespace flstm {
 
+enum class GateCacheDType : int {
+    kFloat32 = 0,
+    kFloat16 = 1,
+};
+
+struct GateCacheHost {
+    void *h_ptr;
+    void *c_ptr;
+};
+
+struct StreamingLstmOptions {
+    GateCacheDType h_dtype = GateCacheDType::kFloat32;
+    GateCacheDType c_dtype = GateCacheDType::kFloat32;
+};
+
 /**
  * Forward pass for a single-layer LSTM operating entirely on CUDA buffers.
  *
@@ -17,10 +32,10 @@ namespace flstm {
  *
  * Outputs:
  *   - y_tensor_host:     (T, B, H) in pinned host memory (__half)
- *   - gate_cache_host:   checkpoint buffer storing (⌈T / R⌉, 2, B, H) FP32
- *                        states (h and c) where R is `recompute_interval`
- *                        controlling how frequently backward checkpoints are
- *                        materialised to host.
+ *   - gate_cache_host:   pair of pinned buffers storing (⌈T / R⌉, B, H) h and c
+ *                        checkpoints captured every `recompute_interval`
+ *                        steps. Each buffer's dtype is selected via
+ *                        StreamingLstmOptions allowing mixed-precision caches.
  *   - compute_stream / h2d_stream / d2h_stream: distinct CUDA streams used for
  *         GEMMs, host→device transfers, and device→host transfers respectively.
  *         All three stream handles must be different to enable overlap.
@@ -43,7 +58,8 @@ void StreamingLstmForward(
 
     __half *y_tensor_host,
 
-    float *gate_cache_host,
+    GateCacheHost gate_cache_host,
+    StreamingLstmOptions options,
     __half *hy_device,
     __half *cy_device,
 
@@ -57,9 +73,9 @@ void StreamingLstmForward(
  *
  * Inputs:
  *   - x_tensor_host:    (T, B, I) inputs in pinned host memory (__half)
- *   - gate_cache_host:  checkpoint buffer storing (⌈T / R⌉, 2, B, H) FP32
- *                       states (h and c) captured every `recompute_interval`
- *                       steps to seed backward recomputation.
+ *   - gate_cache_host:  pinned buffers containing the h and c checkpoints
+ *                       captured during the forward pass using the dtype
+ *                       configured in StreamingLstmOptions.
  *   - dY_tensor_host:   upstream grads w.r.t outputs in host half precision
  *   - d_hn_device / d_cn_device: grads for final states (nullable)
  *   - c0_device:        initial cell state provided in half precision (B, H)
@@ -84,7 +100,8 @@ void StreamingLstmBackward(
 
     const __half *x_tensor_host,
     const __half *y_tensor_host,
-    const float *gate_cache_host,
+    GateCacheHost gate_cache_host,
+    StreamingLstmOptions options,
 
     const __half *dY_tensor_host,
     const __half *d_hn_device,
@@ -114,6 +131,21 @@ void StreamingLstmBackward(
 
 extern "C" {
 
+typedef enum {
+    FLSTM_GATE_CACHE_FLOAT32 = 0,
+    FLSTM_GATE_CACHE_FLOAT16 = 1,
+} flstm_GateCacheDType;
+
+typedef struct {
+    void *h_ptr;
+    void *c_ptr;
+} flstm_GateCacheHost;
+
+typedef struct {
+    flstm_GateCacheDType h_dtype;
+    flstm_GateCacheDType c_dtype;
+} flstm_StreamingLstmOptions;
+
 void flstm_StreamingLstmForward(
     size_t time_steps,
     size_t batch_size,
@@ -132,7 +164,8 @@ void flstm_StreamingLstmForward(
 
     __half *y_tensor_host,
 
-    float *gate_cache_host,
+    flstm_GateCacheHost gate_cache_host,
+    const flstm_StreamingLstmOptions *options,
     __half *hy_device,
     __half *cy_device,
 
@@ -150,7 +183,7 @@ void flstm_StreamingLstmBackward(
 
     const __half *x_tensor_host,
     const __half *y_tensor_host,
-    const float *gate_cache_host,
+    flstm_GateCacheHost gate_cache_host,
 
     const __half *dY_tensor_host,
     const __half *d_hn_device,
@@ -173,7 +206,8 @@ void flstm_StreamingLstmBackward(
 
     cudaStream_t compute_stream,
     cudaStream_t h2d_stream,
-    cudaStream_t d2h_stream
+    cudaStream_t d2h_stream,
+    const flstm_StreamingLstmOptions *options
 );
 
 } // extern "C"

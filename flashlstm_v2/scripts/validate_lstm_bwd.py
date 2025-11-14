@@ -32,6 +32,28 @@ def _as_void_p(tensor: torch.Tensor) -> ctypes.c_void_p:
     return ctypes.c_void_p(tensor.data_ptr())
 
 
+class GateCacheHost(ctypes.Structure):
+    _fields_ = [
+        ("h_ptr", ctypes.c_void_p),
+        ("c_ptr", ctypes.c_void_p),
+    ]
+
+
+class StreamingLstmOptions(ctypes.Structure):
+    _fields_ = [
+        ("h_dtype", ctypes.c_int),
+        ("c_dtype", ctypes.c_int),
+    ]
+
+
+def _gate_dtype_enum(dtype: torch.dtype) -> int:
+    if dtype == torch.float32:
+        return 0
+    if dtype == torch.float16:
+        return 1
+    raise ValueError(f"Unsupported gate cache dtype: {dtype}")
+
+
 @dataclass(frozen=True)
 class LstmConfig:
     time_steps: int
@@ -63,7 +85,8 @@ def _prepare_functions(lib: ctypes.CDLL) -> None:
         ctypes.c_void_p,  # bias_ih
         ctypes.c_void_p,  # bias_hh
         ctypes.c_void_p,  # y host
-        ctypes.c_void_p,  # gate cache host
+        GateCacheHost,    # gate cache host
+        ctypes.POINTER(StreamingLstmOptions),  # gate cache options
         ctypes.c_void_p,  # hy device
         ctypes.c_void_p,  # cy device
         ctypes.c_void_p,  # compute stream
@@ -82,7 +105,7 @@ def _prepare_functions(lib: ctypes.CDLL) -> None:
 
         ctypes.c_void_p,  # x host
         ctypes.c_void_p,  # y host
-        ctypes.c_void_p,  # gate cache host
+        GateCacheHost,    # gate cache host
 
         ctypes.c_void_p,  # dY host
         ctypes.c_void_p,  # dHN device (nullable)
@@ -106,6 +129,7 @@ def _prepare_functions(lib: ctypes.CDLL) -> None:
         ctypes.c_void_p,  # compute stream
         ctypes.c_void_p,  # h2d stream
         ctypes.c_void_p,  # d2h stream
+        ctypes.POINTER(StreamingLstmOptions),  # gate cache options
     ]
 
 
@@ -172,13 +196,23 @@ def _run_case_forward_only(lib: ctypes.CDLL, cfg: LstmConfig):
 
     y_host = torch.empty(cfg.time_steps, cfg.batch_size, cfg.hidden_size, dtype=torch.float16).contiguous().pin_memory()
     checkpoint_steps = (cfg.time_steps + RECOMPUTE - 1) // RECOMPUTE
-    gate_cache = torch.empty(
+    gate_cache_h = torch.empty(
         checkpoint_steps,
-        2,
+        cfg.batch_size,
+        cfg.hidden_size,
+        dtype=torch.float16,
+    ).contiguous().pin_memory()
+    gate_cache_c = torch.empty(
+        checkpoint_steps,
         cfg.batch_size,
         cfg.hidden_size,
         dtype=torch.float32,
     ).contiguous().pin_memory()
+    gate_cache_struct = GateCacheHost(_as_void_p(gate_cache_h), _as_void_p(gate_cache_c))
+    gate_cache_options = StreamingLstmOptions(
+        _gate_dtype_enum(gate_cache_h.dtype),
+        _gate_dtype_enum(gate_cache_c.dtype),
+    )
     hy_device = torch.empty(cfg.batch_size, cfg.hidden_size, dtype=torch.float16, device=device).contiguous()
     cy_device = torch.empty_like(hy_device)
 
@@ -207,7 +241,8 @@ def _run_case_forward_only(lib: ctypes.CDLL, cfg: LstmConfig):
         _as_void_p(bias_ih),
         _as_void_p(bias_hh),
         _as_void_p(y_host),
-        _as_void_p(gate_cache),
+        gate_cache_struct,
+        ctypes.byref(gate_cache_options),
         _as_void_p(hy_device),
         _as_void_p(cy_device),
         ctypes.c_void_p(compute_stream.cuda_stream),
@@ -241,7 +276,8 @@ def _run_case_forward_only(lib: ctypes.CDLL, cfg: LstmConfig):
     return (y_delta, h_delta, c_delta, h_state_delta,
             x_host, h0_device, c0_device, weight_ih, weight_hh, bias_ih, bias_hh,
             y_host,
-            gate_cache)
+            gate_cache_h,
+            gate_cache_c)
 
 
 def _run_case_backward(lib: ctypes.CDLL, cfg: LstmConfig):
@@ -249,7 +285,8 @@ def _run_case_backward(lib: ctypes.CDLL, cfg: LstmConfig):
     (y_diff, h_diff, c_diff, hs_diff,
      x_host, h0_device, c0_device, weight_ih, weight_hh, bias_ih, bias_hh,
      y_host,
-     gate_cache) = _run_case_forward_only(lib, cfg)
+     gate_cache_h,
+     gate_cache_c) = _run_case_forward_only(lib, cfg)
 
     device = torch.device("cuda")
 
@@ -287,6 +324,12 @@ def _run_case_backward(lib: ctypes.CDLL, cfg: LstmConfig):
     if len(stream_handles) != 3:
         raise RuntimeError("Streaming LSTM backward requires three distinct CUDA streams")
 
+    gate_cache_struct = GateCacheHost(_as_void_p(gate_cache_h), _as_void_p(gate_cache_c))
+    gate_cache_options = StreamingLstmOptions(
+        _gate_dtype_enum(gate_cache_h.dtype),
+        _gate_dtype_enum(gate_cache_c.dtype),
+    )
+
     lib.flstm_StreamingLstmBackward(
         ctypes.c_size_t(cfg.time_steps),
         ctypes.c_size_t(cfg.batch_size),
@@ -296,7 +339,7 @@ def _run_case_backward(lib: ctypes.CDLL, cfg: LstmConfig):
 
         _as_void_p(x_host),
         _as_void_p(y_host),
-        _as_void_p(gate_cache),
+        gate_cache_struct,
         _as_void_p(dY_host),
         _as_void_p(dHN_dev),
         _as_void_p(dCN_dev),
@@ -316,6 +359,7 @@ def _run_case_backward(lib: ctypes.CDLL, cfg: LstmConfig):
         ctypes.c_void_p(compute_stream.cuda_stream),
         ctypes.c_void_p(h2d_stream.cuda_stream),
         ctypes.c_void_p(d2h_stream.cuda_stream),
+        ctypes.byref(gate_cache_options),
     )
     torch.cuda.synchronize()
 

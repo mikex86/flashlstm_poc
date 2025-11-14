@@ -348,7 +348,15 @@ int main() {
     __half *hy_device_out = CudaMallocDevice<__half>(state_elements, "cudaMalloc hy_device");
     __half *cy_device_out = CudaMallocDevice<__half>(state_elements, "cudaMalloc cy_device");
 
-    float *gate_cache_host = CudaMallocHost<float>(gate_elements, "cudaMallocHost gate_cache");
+    float *gate_cache_h_host = CudaMallocHost<float>(gate_elements, "cudaMallocHost gate_cache_h");
+    float *gate_cache_c_host = CudaMallocHost<float>(gate_elements, "cudaMallocHost gate_cache_c");
+    flstm_GateCacheHost gate_cache_host{
+        .h_ptr = gate_cache_h_host,
+        .c_ptr = gate_cache_c_host,
+    };
+    flstm_StreamingLstmOptions gate_cache_options{};
+    gate_cache_options.h_dtype = FLSTM_GATE_CACHE_FLOAT32;
+    gate_cache_options.c_dtype = FLSTM_GATE_CACHE_FLOAT32;
 
     CheckCuda(cudaMemcpy(h0_device, h0_host.data(), state_elements * sizeof(__half), cudaMemcpyHostToDevice),
               "memcpy h0");
@@ -385,6 +393,7 @@ int main() {
         bias_hh_device,
         y_host,
         gate_cache_host,
+        &gate_cache_options,
         hy_device_out,
         cy_device_out,
         compute_stream,
@@ -408,6 +417,7 @@ int main() {
         bias_hh_device,
         y_host,
         gate_cache_host,
+        &gate_cache_options,
         hy_device_out,
         cy_device_out,
         compute_stream,
@@ -499,7 +509,8 @@ int main() {
         dc0_out_device,
         compute_stream,
         h2d_stream,
-        d2h_stream
+        d2h_stream,
+        &gate_cache_options
     );
     CheckCuda(cudaDeviceSynchronize(), "backward warmup synchronize");
 
@@ -530,7 +541,8 @@ int main() {
         dc0_out_device,
         compute_stream,
         h2d_stream,
-        d2h_stream
+        d2h_stream,
+        &gate_cache_options
     );
     CheckCuda(cudaDeviceSynchronize(), "backward synchronize");
 
@@ -563,7 +575,8 @@ int main() {
         h0_host_float.data(),
         c0_host_float.data(),
         y_host,
-        gate_cache_host,
+        gate_cache_h_host,
+        gate_cache_c_host,
         hy_host_final.data(),
         cy_host_final.data()
     );
@@ -599,7 +612,8 @@ int main() {
         h0_host_float.data(),
         c0_host_float.data(),
         y_host,
-        gate_cache_host,
+        gate_cache_h_host,
+        gate_cache_c_host,
         dY_host,
         dHN_host,
         dCN_host,
@@ -673,7 +687,8 @@ int main() {
     CudaFreeHostWrapper(dx_host);
     CudaFreeHostWrapper(dY_host);
     CudaFreeHostWrapper(y_host);
-    CudaFreeHostWrapper(gate_cache_host);
+    CudaFreeHostWrapper(gate_cache_h_host);
+    CudaFreeHostWrapper(gate_cache_c_host);
     CudaFreeHostWrapper(x_host);
     cudaFree(dW_ih_device);
     cudaFree(dW_hh_device);

@@ -29,7 +29,6 @@ PyObject *StreamingLstmForward(PyObject *, PyObject *args) {
     unsigned long long bias_hh{};
     unsigned long long y_tensor_host{};
     unsigned long long gate_cache_host{};
-    unsigned long long gate_cache_type{};
     unsigned long long hy_device{};
     unsigned long long cy_device{};
     unsigned long long compute_stream{};
@@ -38,7 +37,7 @@ PyObject *StreamingLstmForward(PyObject *, PyObject *args) {
 
     if (!PyArg_ParseTuple(
             args,
-            "KKKKKKKKKKKKKKKKKKKK",
+            "KKKKKKKKKKKKKKKKKKK",
             &time_steps,
             &batch_size,
             &input_size,
@@ -53,7 +52,6 @@ PyObject *StreamingLstmForward(PyObject *, PyObject *args) {
             &bias_hh,
             &y_tensor_host,
             &gate_cache_host,
-            &gate_cache_type,
             &hy_device,
             &cy_device,
             &compute_stream,
@@ -77,8 +75,7 @@ PyObject *StreamingLstmForward(PyObject *, PyObject *args) {
         PtrFromUnsigned<const float *>(bias_ih),
         PtrFromUnsigned<const float *>(bias_hh),
         PtrFromUnsigned<__half *>(y_tensor_host),
-        PtrFromUnsigned<void *>(gate_cache_host),
-        static_cast<flstmGateCacheType>(gate_cache_type),
+        PtrFromUnsigned<float *>(gate_cache_host),
         PtrFromUnsigned<__half *>(hy_device),
         PtrFromUnsigned<__half *>(cy_device),
         PtrFromUnsigned<cudaStream_t>(compute_stream),
@@ -99,7 +96,6 @@ PyObject *StreamingLstmBackward(PyObject *, PyObject *args) {
     unsigned long long x_tensor_host{};
     unsigned long long y_tensor_host{};
     unsigned long long gate_cache_host{};
-    unsigned long long gate_cache_type{};
     unsigned long long dY_tensor_host{};
     unsigned long long d_hn_device{};
     unsigned long long d_cn_device{};
@@ -122,7 +118,7 @@ PyObject *StreamingLstmBackward(PyObject *, PyObject *args) {
 
     if (!PyArg_ParseTuple(
             args,
-            "KKKKKKKKKKKKKKKKKKKKKKKKKKKK",
+            "KKKKKKKKKKKKKKKKKKKKKKKKKKK",
             &time_steps,
             &batch_size,
             &input_size,
@@ -131,7 +127,6 @@ PyObject *StreamingLstmBackward(PyObject *, PyObject *args) {
             &x_tensor_host,
             &y_tensor_host,
             &gate_cache_host,
-            &gate_cache_type,
             &dY_tensor_host,
             &d_hn_device,
             &d_cn_device,
@@ -163,8 +158,7 @@ PyObject *StreamingLstmBackward(PyObject *, PyObject *args) {
         static_cast<size_t>(recompute_interval),
         PtrFromUnsigned<const __half *>(x_tensor_host),
         PtrFromUnsigned<const __half *>(y_tensor_host),
-        PtrFromUnsigned<const void *>(gate_cache_host),
-        static_cast<flstmGateCacheType>(gate_cache_type),
+        PtrFromUnsigned<const float *>(gate_cache_host),
         PtrFromUnsigned<const __half *>(dY_tensor_host),
         PtrFromUnsigned<const __half *>(d_hn_device),
         PtrFromUnsigned<const __half *>(d_cn_device),

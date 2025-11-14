@@ -660,8 +660,8 @@ void StreamingLstmForward(
     DeviceBuffer<float> checkpoint_chunks_c[2];
     DeviceBuffer<__half> checkpoint_chunks_h_half[2];
     DeviceBuffer<__half> checkpoint_chunks_c_half[2];
-    const bool h_cache_uses_half = (options.h_dtype == flstm::GateCacheDType::kFloat16);
-    const bool c_cache_uses_half = (options.c_dtype == flstm::GateCacheDType::kFloat16);
+    const bool h_cache_uses_half = (options.h_dtype == GateCacheDType::kFloat16);
+    const bool c_cache_uses_half = (options.c_dtype == GateCacheDType::kFloat16);
     if (store_checkpoints) {
         AllocateDeviceBufferArray(checkpoint_chunks_h, max_checkpoints_per_chunk * bh_elements, "cudaMalloc checkpoint_chunk_h");
         AllocateDeviceBufferArray(checkpoint_chunks_c, max_checkpoints_per_chunk * bh_elements, "cudaMalloc checkpoint_chunk_c");

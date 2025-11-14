@@ -340,6 +340,7 @@ class _StreamingLSTMFunction(Function):
             db_ih,
             db_hh,
             None,
+            None,
         )
 
 

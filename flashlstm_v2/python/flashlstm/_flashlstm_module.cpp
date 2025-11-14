@@ -40,7 +40,7 @@ PyObject *StreamingLstmForward(PyObject *, PyObject *args) {
 
     if (!PyArg_ParseTuple(
             args,
-            "KKKKKKKKKKKKKKKKKKKKK",
+            "KKKKKKKKKKKKKKKKKKKKKK",
             &time_steps,
             &batch_size,
             &input_size,

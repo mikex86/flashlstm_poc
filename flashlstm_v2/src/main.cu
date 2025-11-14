@@ -281,7 +281,7 @@ int main() {
     constexpr size_t batch_size = 1024;
     constexpr size_t input_size = 1024;
     constexpr size_t hidden_size = 1024;
-    constexpr size_t recompute_interval = 4;
+    constexpr size_t recompute_interval = 8;
     constexpr size_t gate_dim = 4 * hidden_size;
 
     constexpr size_t x_elements = time_steps * batch_size * input_size;

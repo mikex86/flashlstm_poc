@@ -359,6 +359,7 @@ __global__ void ForwardPointwiseKernel(
     const float *gate_col,         // (4H, B) column-major
     const float *bias,             // (4H,)
     const float *c_prev,           // (B, H) row-major
+    const float *h_prev,           // (B, H) row-major
     float *h_next,                 // (B, H) row-major
     float *c_next,                 // (B, H) row-major
     __half *y_half_out,            // (B, H) row-major half or nullptr
@@ -367,6 +368,8 @@ __global__ void ForwardPointwiseKernel(
     __half *c_cache,               // (T+1, B, H) row-major
     float *z_cache_col,            // (I+H, T*B) column-major float staging
     const float *column_scale,     // (B,) scaling factors for this step
+    float *checkpoint_dst_h,       // (B, H) row-major float or nullptr
+    float *checkpoint_dst_c,       // (B, H) row-major float or nullptr
     size_t z_rows,
     size_t input_size,
     int has_next_column,
@@ -385,6 +388,7 @@ __global__ void ForwardPointwiseKernel(
     const size_t gate_dim = 4 * hidden_size;
     const size_t col = batch_idx;
     const size_t row_base = hidden_idx;
+    const size_t state_index = batch_idx * hidden_size + hidden_idx;
 
     const float scale = column_scale[col];
     const float gi = gate_col[row_base + col * gate_dim] * scale + bias[row_base + 0 * hidden_size];
@@ -398,15 +402,21 @@ __global__ void ForwardPointwiseKernel(
     const float i_gate = 1.0f / (1.0f + expf(-gi));
     const float f_gate = 1.0f / (1.0f + expf(-gf));
     const float g_gate = tanhf(gg);
-    const float c_prev_val = c_prev[batch_idx * hidden_size + hidden_idx];
+    const float c_prev_val = c_prev[state_index];
+    if (checkpoint_dst_c != nullptr) {
+        checkpoint_dst_c[state_index] = c_prev_val;
+    }
+    if (checkpoint_dst_h != nullptr && h_prev != nullptr) {
+        checkpoint_dst_h[state_index] = h_prev[state_index];
+    }
     const float c_val = f_gate * c_prev_val + i_gate * g_gate;
     const float o_gate = 1.0f / (1.0f + expf(-go));
     const float h_val = o_gate * tanhf(c_val);
 
-    h_next[batch_idx * hidden_size + hidden_idx] = h_val;
-    c_next[batch_idx * hidden_size + hidden_idx] = c_val;
+    h_next[state_index] = h_val;
+    c_next[state_index] = c_val;
     if (y_half_out != nullptr) {
-        y_half_out[batch_idx * hidden_size + hidden_idx] = __float2half(h_val);
+        y_half_out[state_index] = __float2half(h_val);
     }
 
     if (gate_cache_step != nullptr) {
@@ -789,26 +799,14 @@ void StreamingLstmForward(
                 y_step = y_chunk_half[slot].ptr + step * bh_elements;
             }
             __half *gate_cache_step = nullptr;
+            float *checkpoint_dst_h = nullptr;
+            float *checkpoint_dst_c = nullptr;
 
             if (store_checkpoints && next_checkpoint_step != static_cast<size_t>(-1) &&
                 global_step == next_checkpoint_step) {
                 if (checkpoint_global_index < checkpoint_count) {
-                    float *checkpoint_dst_h = checkpoint_chunks_h[slot].ptr + checkpoint_counts[slot] * bh_elements;
-                    float *checkpoint_dst_c = checkpoint_chunks_c[slot].ptr + checkpoint_counts[slot] * bh_elements;
-                    CheckCuda(cudaMemcpyAsync(
-                                  checkpoint_dst_h,
-                                  h_prev.ptr,
-                                  bh_elements * sizeof(float),
-                                  cudaMemcpyDeviceToDevice,
-                                  compute_stream),
-                              "copy checkpoint h");
-                    CheckCuda(cudaMemcpyAsync(
-                                  checkpoint_dst_c,
-                                  c_prev.ptr,
-                                  bh_elements * sizeof(float),
-                                  cudaMemcpyDeviceToDevice,
-                                  compute_stream),
-                              "copy checkpoint c");
+                    checkpoint_dst_h = checkpoint_chunks_h[slot].ptr + checkpoint_counts[slot] * bh_elements;
+                    checkpoint_dst_c = checkpoint_chunks_c[slot].ptr + checkpoint_counts[slot] * bh_elements;
                     if (checkpoint_counts[slot] == 0) {
                         checkpoint_host_offsets[slot] = checkpoint_global_index;
                     }
@@ -853,6 +851,7 @@ void StreamingLstmForward(
                 gate_pre_col.ptr,
                 bias_fused.ptr,
                 c_prev.ptr,
+                h_prev.ptr,
                 h_next.ptr,
                 c_next.ptr,
                 y_step,
@@ -861,6 +860,8 @@ void StreamingLstmForward(
                 nullptr,
                 z_chunk_float,
                 column_scale_buffer.ptr,
+                checkpoint_dst_h,
+                checkpoint_dst_c,
                 z_rows,
                 input_size,
                 has_next_column ? 1 : 0,

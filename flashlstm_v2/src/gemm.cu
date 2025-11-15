@@ -6,7 +6,9 @@
 #include <cutlass/gemm/device/gemm.h>
 #include <cutlass/layout/matrix.h>
 #include <cutlass/numeric_types.h>
+#include <cublas_v2.h>
 
+#include <cstdlib>
 #include <cstdio>
 #include <stdexcept>
 #include <string>
@@ -128,6 +130,49 @@ struct GemmContext {
     }
 };
 
+inline const char *CublasStatusString(const cublasStatus_t status) {
+    switch (status) {
+        case CUBLAS_STATUS_SUCCESS: return "success";
+        case CUBLAS_STATUS_NOT_INITIALIZED: return "not initialized";
+        case CUBLAS_STATUS_ALLOC_FAILED: return "alloc failed";
+        case CUBLAS_STATUS_INVALID_VALUE: return "invalid value";
+        case CUBLAS_STATUS_ARCH_MISMATCH: return "arch mismatch";
+        case CUBLAS_STATUS_MAPPING_ERROR: return "mapping error";
+        case CUBLAS_STATUS_EXECUTION_FAILED: return "execution failed";
+        case CUBLAS_STATUS_INTERNAL_ERROR: return "internal error";
+#if CUBLAS_VERSION >= 11000
+        case CUBLAS_STATUS_NOT_SUPPORTED: return "not supported";
+        case CUBLAS_STATUS_LICENSE_ERROR: return "license error";
+#endif
+        default: return "unknown";
+    }
+}
+
+inline void CheckCublas(cublasStatus_t status, const char *what) {
+    if (status != CUBLAS_STATUS_SUCCESS) {
+        throw std::runtime_error(std::string(what) + ": " + CublasStatusString(status));
+    }
+}
+
+struct CublasHandle {
+    cublasHandle_t handle{nullptr};
+    CublasHandle() {
+        CheckCublas(cublasCreate(&handle), "cublasCreate");
+        // Match the previous tensor-op math path from the cublas implementation.
+        CheckCublas(cublasSetMathMode(handle, CUBLAS_TENSOR_OP_MATH), "cublasSetMathMode");
+    }
+    ~CublasHandle() {
+        if (handle != nullptr) {
+            cublasDestroy(handle);
+        }
+    }
+};
+
+inline bool UseCublasGemm() {
+    static const bool use = (std::getenv("FLASHLSTM_USE_CUBLAS_GEMM") != nullptr);
+    return use;
+}
+
 template <
     typename PrimaryTensor,
     typename SecondaryTensor,
@@ -219,6 +264,33 @@ void GemmTN(
     float beta,
     cudaStream_t stream
 ) {
+    if (UseCublasGemm()) {
+        static CublasHandle cublas;
+        CheckCublas(cublasSetStream(cublas.handle, stream), "cublasSetStream GemmTN");
+        CheckCublas(
+            cublasGemmEx(
+                cublas.handle,
+                CUBLAS_OP_T,
+                CUBLAS_OP_N,
+                m,
+                n,
+                k,
+                &alpha,
+                A,
+                CUDA_R_16F,
+                k,
+                B,
+                CUDA_R_16F,
+                k,
+                &beta,
+                C,
+                CUDA_R_32F,
+                m,
+                CUBLAS_COMPUTE_32F,
+                CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+            "cublasGemmEx GemmTN");
+        return;
+    }
     using Primary = TensorOpGemm<
         RowMajor,
         ColumnMajor,
@@ -270,6 +342,33 @@ void GemmNN(
     float beta,
     cudaStream_t stream
 ) {
+    if (UseCublasGemm()) {
+        static CublasHandle cublas;
+        CheckCublas(cublasSetStream(cublas.handle, stream), "cublasSetStream GemmNN");
+        CheckCublas(
+            cublasGemmEx(
+                cublas.handle,
+                CUBLAS_OP_N,
+                CUBLAS_OP_N,
+                m,
+                n,
+                k,
+                &alpha,
+                A,
+                CUDA_R_16F,
+                m,
+                B,
+                CUDA_R_16F,
+                k,
+                &beta,
+                C,
+                CUDA_R_32F,
+                m,
+                CUBLAS_COMPUTE_32F,
+                CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+            "cublasGemmEx GemmNN");
+        return;
+    }
     using Primary = TensorOpGemm<
         ColumnMajor,
         ColumnMajor,
@@ -321,6 +420,33 @@ void GemmNT(
     float beta,
     cudaStream_t stream
 ) {
+    if (UseCublasGemm()) {
+        static CublasHandle cublas;
+        CheckCublas(cublasSetStream(cublas.handle, stream), "cublasSetStream GemmNT");
+        CheckCublas(
+            cublasGemmEx(
+                cublas.handle,
+                CUBLAS_OP_N,
+                CUBLAS_OP_T,
+                m,
+                n,
+                k,
+                &alpha,
+                A,
+                CUDA_R_16F,
+                m,
+                B,
+                CUDA_R_16F,
+                k,
+                &beta,
+                C,
+                CUDA_R_32F,
+                m,
+                CUBLAS_COMPUTE_32F,
+                CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+            "cublasGemmEx GemmNT");
+        return;
+    }
     using Primary = TensorOpGemm<
         ColumnMajor,
         RowMajor,

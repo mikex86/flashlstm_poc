@@ -1,0 +1,3 @@
+[submodule "flashlstm_v2/third_party/cutlass"]
+	path = flashlstm_v2/third_party/cutlass
+	url = https://github.com/NVIDIA/cutlass.git

@@ -1,10 +1,10 @@
-#include "lstm.hpp"
+#include "gemm.h"
 #include "gputx.h"
+#include "lstm.hpp"
 #include "mfu_profiler.hpp"
 
 #include <algorithm>
 #include <cmath>
-#include <cublas_v2.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime_api.h>
 #include <limits>
@@ -13,33 +13,9 @@
 
 namespace {
 
-inline const char *CublasStatusString(const cublasStatus_t status) {
-    switch (status) {
-        case CUBLAS_STATUS_SUCCESS: return "success";
-        case CUBLAS_STATUS_NOT_INITIALIZED: return "not initialized";
-        case CUBLAS_STATUS_ALLOC_FAILED: return "alloc failed";
-        case CUBLAS_STATUS_INVALID_VALUE: return "invalid value";
-        case CUBLAS_STATUS_ARCH_MISMATCH: return "arch mismatch";
-        case CUBLAS_STATUS_MAPPING_ERROR: return "mapping error";
-        case CUBLAS_STATUS_EXECUTION_FAILED: return "execution failed";
-        case CUBLAS_STATUS_INTERNAL_ERROR: return "internal error";
-#if CUBLAS_VERSION >= 11000
-        case CUBLAS_STATUS_NOT_SUPPORTED: return "not supported";
-        case CUBLAS_STATUS_LICENSE_ERROR: return "license error";
-#endif
-        default: return "unknown";
-    }
-}
-
 inline void CheckCuda(cudaError_t err, const char *what) {
     if (err != cudaSuccess) {
         throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(err));
-    }
-}
-
-inline void CheckCublas(cublasStatus_t status, const char *what) {
-    if (status != CUBLAS_STATUS_SUCCESS) {
-        throw std::runtime_error(std::string(what) + ": " + CublasStatusString(status));
     }
 }
 
@@ -181,18 +157,6 @@ struct HostRegistration {
     ~HostRegistration() {
         if (ptr != nullptr) {
             cudaHostUnregister(const_cast<void *>(ptr));
-        }
-    }
-};
-
-struct CublasHandle {
-    cublasHandle_t handle{nullptr};
-    CublasHandle() = default;
-    CublasHandle(const CublasHandle &) = delete;
-    CublasHandle &operator=(const CublasHandle &) = delete;
-    ~CublasHandle() {
-        if (handle != nullptr) {
-            cublasDestroy(handle);
         }
     }
 };
@@ -651,9 +615,6 @@ void StreamingLstmForward(
     FuseBiasKernel<<<bias_blocks, threads, 0, compute_stream>>>(bias_ih, bias_hh, bias_fused.ptr, hidden_size);
     CheckCuda(cudaGetLastError(), "FuseBiasKernel");
 
-    CublasHandle cublas;
-    CheckCublas(cublasCreate(&cublas.handle), "cublasCreate");
-    CheckCublas(cublasSetStream(cublas.handle, compute_stream), "cublasSetStream");
     const float alpha_f = 1.0f;
     const float beta_zero_f = 0.0f;
     const int seed_blocks = BlocksFor(bh_elements, threads);
@@ -821,27 +782,20 @@ void StreamingLstmForward(
                 }
             }
 
-            CheckCublas(cublasGemmEx(
-                            cublas.handle,
-                            CUBLAS_OP_T,
-                            CUBLAS_OP_N,
-                            static_cast<int>(gate_dim),
-                            static_cast<int>(batch_size),
-                            static_cast<int>(z_rows),
-                            &alpha_f,
-                            weight_cat_half.ptr,
-                            CUDA_R_16F,
-                            static_cast<int>(z_rows),
-                            z_step_half_buffer.ptr,
-                            CUDA_R_16F,
-                            static_cast<int>(z_rows),
-                            &beta_zero_f,
-                            gate_pre_col.ptr,
-                            CUDA_R_32F,
-                            static_cast<int>(gate_dim),
-                            CUBLAS_COMPUTE_32F,
-                            CUBLAS_GEMM_DEFAULT_TENSOR_OP),
-                        "cublasGemmEx gates");
+            flstm::GemmTN(
+                static_cast<int>(gate_dim),
+                static_cast<int>(batch_size),
+                static_cast<int>(z_rows),
+                weight_cat_half.ptr,
+                static_cast<int>(z_rows),
+                z_step_half_buffer.ptr,
+                static_cast<int>(z_rows),
+                gate_pre_col.ptr,
+                static_cast<int>(gate_dim),
+                alpha_f,
+                beta_zero_f,
+                compute_stream
+            );
             profiler.AddUseful(mfu::GemmFlops(gate_dim, batch_size, z_rows));
 
             const bool has_next_column = (step + 1 < steps_in_chunk);

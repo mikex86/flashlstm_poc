@@ -10,10 +10,16 @@ endif()
 
 find_package(Python COMPONENTS Interpreter Development.Module REQUIRED)
 
-add_library(flashlstm SHARED src/lstm_forward.cu src/lstm_backward.cu)
+set(CUTLASS_ENABLE_HEADERS_ONLY ON CACHE BOOL "flashlstm embeds header-only CUTLASS build" FORCE)
+add_subdirectory(third_party/cutlass)
+
+add_library(flashlstm SHARED src/gemm.cu src/lstm_forward.cu src/lstm_backward.cu)
 target_include_directories(flashlstm PUBLIC include)
 set_target_properties(flashlstm PROPERTIES POSITION_INDEPENDENT_CODE ON)
-target_link_libraries(flashlstm PUBLIC cudnn cublasLt cublas ${NVTX_LIBRARY})
+target_link_libraries(flashlstm PUBLIC cudnn nvidia::cutlass::cutlass ${NVTX_LIBRARY})
+target_compile_options(flashlstm PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
+list(GET CMAKE_CUDA_ARCHITECTURES 0 FLASHLSTM_FIRST_ARCH)
+target_compile_definitions(flashlstm PRIVATE FLASHLSTM_CUDA_ARCH=${FLASHLSTM_FIRST_ARCH})
 set_target_properties(flashlstm PROPERTIES BUILD_RPATH "$ORIGIN" INSTALL_RPATH "$ORIGIN")
 
 add_executable(test_flashlstm src/main.cu src/cudnn_reference.cpp)

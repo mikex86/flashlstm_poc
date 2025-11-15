@@ -1,10 +1,10 @@
-#include "lstm.hpp"
+#include "gemm.h"
 #include "gputx.h"
+#include "lstm.hpp"
 #include "mfu_profiler.hpp"
 
 #include <algorithm>
 #include <cmath>
-#include <cublas_v2.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime_api.h>
 #include <limits>
@@ -12,33 +12,9 @@
 #include <string>
 
 namespace {
-    inline const char *CublasStatusString(const cublasStatus_t status) {
-        switch (status) {
-            case CUBLAS_STATUS_SUCCESS: return "success";
-            case CUBLAS_STATUS_NOT_INITIALIZED: return "not initialized";
-            case CUBLAS_STATUS_ALLOC_FAILED: return "alloc failed";
-            case CUBLAS_STATUS_INVALID_VALUE: return "invalid value";
-            case CUBLAS_STATUS_ARCH_MISMATCH: return "arch mismatch";
-            case CUBLAS_STATUS_MAPPING_ERROR: return "mapping error";
-            case CUBLAS_STATUS_EXECUTION_FAILED: return "execution failed";
-            case CUBLAS_STATUS_INTERNAL_ERROR: return "internal error";
-#if CUBLAS_VERSION >= 11000
-            case CUBLAS_STATUS_NOT_SUPPORTED: return "not supported";
-            case CUBLAS_STATUS_LICENSE_ERROR: return "license error";
-#endif
-            default: return "unknown";
-        }
-    }
-
     void CheckCuda(const cudaError_t err, const char *what) {
         if (err != cudaSuccess) {
             throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(err));
-        }
-    }
-
-    void CheckCublas(const cublasStatus_t status, const char *what) {
-        if (status != CUBLAS_STATUS_SUCCESS) {
-            throw std::runtime_error(std::string(what) + ": " + CublasStatusString(status));
         }
     }
 
@@ -128,22 +104,6 @@ namespace {
         ~CudaEvent() {
             if (evt != nullptr) {
                 cudaEventDestroy(evt);
-            }
-        }
-    };
-
-    struct CublasHandle {
-        cublasHandle_t handle{nullptr};
-
-        CublasHandle() = default;
-
-        CublasHandle(const CublasHandle &) = delete;
-
-        CublasHandle &operator=(const CublasHandle &) = delete;
-
-        ~CublasHandle() {
-            if (handle != nullptr) {
-                cublasDestroy(handle);
             }
         }
     };
@@ -887,9 +847,6 @@ namespace flstm {
         ZeroDeviceMemory(dW_ih, static_cast<size_t>(gate_dim) * input_size, compute_stream, "memset dW_ih");
         ZeroDeviceMemory(dW_hh, static_cast<size_t>(gate_dim) * hidden_size, compute_stream, "memset dW_hh");
 
-        CublasHandle cublas;
-        CheckCublas(cublasCreate(&cublas.handle), "cublasCreate");
-        CheckCublas(cublasSetStream(cublas.handle, compute_stream), "cublasSetStream");
         const float alpha = 1.0f;
         const float beta_zero = 0.0f;
         const float beta_one = 1.0f;
@@ -1061,27 +1018,20 @@ namespace flstm {
                         batch_size
                     );
                     CheckCuda(cudaGetLastError(), "ScaleAndPackColumnsKernel recompute");
-                    CheckCublas(cublasGemmEx(
-                                    cublas.handle,
-                                    CUBLAS_OP_T,
-                                    CUBLAS_OP_N,
-                                    static_cast<int>(gate_dim),
-                                    static_cast<int>(batch_size),
-                                    static_cast<int>(z_rows),
-                                    &alpha,
-                                    weight_cat_col.ptr,
-                                    CUDA_R_16F,
-                                    static_cast<int>(z_rows),
-                                    z_step_half.ptr,
-                                    CUDA_R_16F,
-                                    static_cast<int>(z_rows),
-                                    &beta_zero,
-                                    gate_pre_col.ptr,
-                                    CUDA_R_32F,
-                                    static_cast<int>(gate_dim),
-                                    CUBLAS_COMPUTE_32F,
-                                    CUBLAS_GEMM_DEFAULT_TENSOR_OP),
-                                "cublasGemmEx recompute gates");
+                    flstm::GemmTN(
+                        static_cast<int>(gate_dim),
+                        static_cast<int>(batch_size),
+                        static_cast<int>(z_rows),
+                        weight_cat_col.ptr,
+                        static_cast<int>(z_rows),
+                        z_step_half.ptr,
+                        static_cast<int>(z_rows),
+                        gate_pre_col.ptr,
+                        static_cast<int>(gate_dim),
+                        alpha,
+                        beta_zero,
+                        compute_stream
+                    );
                     profiler.AddTotal(mfu::GemmFlops(gate_dim, batch_size, z_rows));
                     float *gate_out_ptr = nullptr;
                     if (local_step >= prefix_steps) {
@@ -1132,27 +1082,20 @@ namespace flstm {
                 CheckCuda(cudaGetLastError(), "BackwardPointwiseKernel");
 
                 const __half *W_hh_block = weight_cat_col.ptr + input_size;
-                CheckCublas(cublasGemmEx(
-                                cublas.handle,
-                                CUBLAS_OP_N,
-                                CUBLAS_OP_N,
-                                static_cast<int>(hidden_size),
-                                static_cast<int>(batch_size),
-                                static_cast<int>(gate_dim),
-                                &alpha,
-                                W_hh_block,
-                                CUDA_R_16F,
-                                static_cast<int>(z_rows),
-                                dG_half_step,
-                                CUDA_R_16F,
-                                static_cast<int>(gate_dim),
-                                &beta_one,
-                                dh_out,
-                                CUDA_R_32F,
-                                static_cast<int>(hidden_size),
-                                CUBLAS_COMPUTE_32F,
-                                CUBLAS_GEMM_DEFAULT_TENSOR_OP),
-                            "cublasGemmEx dh_prev");
+                flstm::GemmNN(
+                    static_cast<int>(hidden_size),
+                    static_cast<int>(batch_size),
+                    static_cast<int>(gate_dim),
+                    W_hh_block,
+                    static_cast<int>(z_rows),
+                    dG_half_step,
+                    static_cast<int>(gate_dim),
+                    dh_out,
+                    static_cast<int>(hidden_size),
+                    alpha,
+                    beta_one,
+                    compute_stream
+                );
                 profiler.AddUseful(mfu::GemmFlops(hidden_size, batch_size, gate_dim));
 
                 std::swap(dh_cur.ptr, dh_tmp.ptr);
@@ -1168,98 +1111,70 @@ namespace flstm {
                 const __half *h_chunk_matrix = z_chunk_base + input_size;
                 const __half *dG_chunk_half_ptr = dG_chunk_half[slot].ptr;
 
-                CheckCublas(cublasGemmEx(
-                                cublas.handle,
-                                CUBLAS_OP_N,
-                                CUBLAS_OP_T,
-                                static_cast<int>(input_size),
-                                static_cast<int>(gate_dim),
-                                zgemm_k,
-                                &alpha,
-                                x_chunk_matrix,
-                                CUDA_R_16F,
-                                static_cast<int>(z_rows),
-                                dG_chunk_half_ptr,
-                                CUDA_R_16F,
-                                static_cast<int>(gate_dim),
-                                &beta_one,
-                                dW_ih,
-                                CUDA_R_32F,
-                                static_cast<int>(input_size),
-                                CUBLAS_COMPUTE_32F,
-                                CUBLAS_GEMM_DEFAULT_TENSOR_OP),
-                            "cublasGemmEx dW_ih chunk");
+                flstm::GemmNT(
+                    static_cast<int>(input_size),
+                    static_cast<int>(gate_dim),
+                    zgemm_k,
+                    x_chunk_matrix,
+                    static_cast<int>(z_rows),
+                    dG_chunk_half_ptr,
+                    static_cast<int>(gate_dim),
+                    dW_ih,
+                    static_cast<int>(input_size),
+                    alpha,
+                    beta_one,
+                    compute_stream
+                );
                 profiler.AddUseful(mfu::GemmFlops(input_size, gate_dim, static_cast<size_t>(zgemm_k)));
 
                 if (hidden_size > 0) {
-                    CheckCublas(cublasGemmEx(
-                                    cublas.handle,
-                                    CUBLAS_OP_N,
-                                    CUBLAS_OP_T,
-                                    static_cast<int>(hidden_size),
-                                    static_cast<int>(gate_dim),
-                                    zgemm_k,
-                                    &alpha,
-                                    h_chunk_matrix,
-                                    CUDA_R_16F,
-                                    static_cast<int>(z_rows),
-                                    dG_chunk_half_ptr,
-                                    CUDA_R_16F,
-                                    static_cast<int>(gate_dim),
-                                    &beta_one,
-                                    dW_hh,
-                                    CUDA_R_32F,
-                                    static_cast<int>(hidden_size),
-                                    CUBLAS_COMPUTE_32F,
-                                    CUBLAS_GEMM_DEFAULT_TENSOR_OP),
-                                "cublasGemmEx dW_hh chunk");
+                    flstm::GemmNT(
+                        static_cast<int>(hidden_size),
+                        static_cast<int>(gate_dim),
+                        zgemm_k,
+                        h_chunk_matrix,
+                        static_cast<int>(z_rows),
+                        dG_chunk_half_ptr,
+                        static_cast<int>(gate_dim),
+                        dW_hh,
+                        static_cast<int>(hidden_size),
+                        alpha,
+                        beta_one,
+                        compute_stream
+                    );
                     profiler.AddUseful(mfu::GemmFlops(hidden_size, gate_dim, static_cast<size_t>(zgemm_k)));
                 }
 
-                CheckCublas(cublasGemmEx(
-                                cublas.handle,
-                                CUBLAS_OP_N,
-                                CUBLAS_OP_N,
-                                static_cast<int>(gate_dim),
-                                1,
-                                zgemm_k,
-                                &alpha,
-                                dG_chunk_half_ptr,
-                                CUDA_R_16F,
-                                static_cast<int>(gate_dim),
-                                ones_vec.ptr,
-                                CUDA_R_16F,
-                                zgemm_k,
-                                &beta_one,
-                                db_buffer.ptr,
-                                CUDA_R_32F,
-                                static_cast<int>(gate_dim),
-                                CUBLAS_COMPUTE_32F,
-                                CUBLAS_GEMM_DEFAULT_TENSOR_OP),
-                            "cublasGemmEx db chunk");
+                flstm::GemmNN(
+                    static_cast<int>(gate_dim),
+                    1,
+                    zgemm_k,
+                    dG_chunk_half_ptr,
+                    static_cast<int>(gate_dim),
+                    ones_vec.ptr,
+                    zgemm_k,
+                    db_buffer.ptr,
+                    static_cast<int>(gate_dim),
+                    alpha,
+                    beta_one,
+                    compute_stream
+                );
                 profiler.AddUseful(mfu::GemvFlops(gate_dim, static_cast<size_t>(zgemm_k)));
 
-                CheckCublas(cublasGemmEx(
-                                cublas.handle,
-                                CUBLAS_OP_N,
-                                CUBLAS_OP_N,
-                                static_cast<int>(input_size),
-                                zgemm_k,
-                                static_cast<int>(gate_dim),
-                                &alpha,
-                                weight_cat_col.ptr,
-                                CUDA_R_16F,
-                                static_cast<int>(z_rows),
-                                dG_chunk_half_ptr,
-                                CUDA_R_16F,
-                                static_cast<int>(gate_dim),
-                                &beta_zero,
-                                dX_chunk_col[slot].ptr,
-                                CUDA_R_32F,
-                                static_cast<int>(input_size),
-                                CUBLAS_COMPUTE_32F,
-                                CUBLAS_GEMM_DEFAULT_TENSOR_OP),
-                            "cublasGemmEx dX chunk");
+                flstm::GemmNN(
+                    static_cast<int>(input_size),
+                    zgemm_k,
+                    static_cast<int>(gate_dim),
+                    weight_cat_col.ptr,
+                    static_cast<int>(z_rows),
+                    dG_chunk_half_ptr,
+                    static_cast<int>(gate_dim),
+                    dX_chunk_col[slot].ptr,
+                    static_cast<int>(input_size),
+                    alpha,
+                    beta_zero,
+                    compute_stream
+                );
                 profiler.AddUseful(mfu::GemmFlops(input_size, static_cast<size_t>(zgemm_k), gate_dim));
 
                 dx_chunk_elems = steps_in_chunk * batch_size * input_size;

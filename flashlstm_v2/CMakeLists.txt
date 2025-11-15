@@ -26,9 +26,9 @@ add_executable(test_flashlstm src/main.cu src/cudnn_reference.cpp)
 target_link_libraries(test_flashlstm PRIVATE flashlstm)
 set_target_properties(test_flashlstm PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
-add_executable(kernel_bench src/testing.cu)
-target_link_libraries(kernel_bench PRIVATE flashlstm)
-target_compile_features(kernel_bench PRIVATE cxx_std_17)
+# add_executable(kernel_bench src/testing.cu)
+# target_link_libraries(kernel_bench PRIVATE flashlstm)
+# target_compile_features(kernel_bench PRIVATE cxx_std_17)
 
 add_library(_flashlstm MODULE python/flashlstm/_flashlstm_module.cpp)
 target_include_directories(_flashlstm PRIVATE include)

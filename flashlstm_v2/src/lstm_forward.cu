@@ -2,6 +2,7 @@
 #include "gputx.h"
 #include "lstm.hpp"
 #include "mfu_profiler.hpp"
+#include "numeric_utils.cuh"
 
 #include <algorithm>
 #include <cmath>
@@ -217,7 +218,7 @@ __global__ void FuseBiasKernel(
 }
 
 __device__ __forceinline__ float Sigmoid(float x) {
-    return 1.0f / (1.0f + __expf(-x));
+    return flstm::numeric::StableSigmoid(x);
 }
 
 __device__ __forceinline__ float WarpReduceMax(float value) {
@@ -272,8 +273,6 @@ __global__ void SeedHiddenColumnKernel(
     z_cache_col[input_size + hidden_idx + batch_idx * z_rows] = value;
 }
 
-constexpr float kFp16SafeMax = 60000.0f;
-
 __global__ void ScaleAndPackColumnsKernel(
     const float *z_cols_float,   // (I+H, B) column-major float
     __half *z_cols_half,         // (I+H, B) column-major half
@@ -292,7 +291,7 @@ __global__ void ScaleAndPackColumnsKernel(
 
     float local_max = 0.0f;
     for (size_t row = threadIdx.x; row < z_rows; row += blockDim.x) {
-        const float value = src[row];
+        const float value = flstm::numeric::FiniteOrZero(src[row]);
         local_max = fmaxf(local_max, fabsf(value));
     }
     const int lane = threadIdx.x & 31;
@@ -309,15 +308,17 @@ __global__ void ScaleAndPackColumnsKernel(
         float reduced = WarpReduceMax(val);
         if (lane == 0) {
             float inv_scale = 1.0f;
-            if (reduced > 0.0f) {
-                float scale = reduced / kFp16SafeMax;
-                if (!(scale > 0.0f)) {
+            float column_scale_value = 1.0f;
+            if (reduced > 0.0f && isfinite(reduced)) {
+                float scale = reduced / flstm::numeric::kFp16SafeMax;
+                if (!(scale > 0.0f) || !isfinite(scale)) {
                     scale = 1.0f;
                 }
                 inv_scale = 1.0f / scale;
+                column_scale_value = scale;
             }
             inv_scale_shared = inv_scale;
-            column_scale[batch_idx] = 1.0f / inv_scale;
+            column_scale[batch_idx] = column_scale_value;
         }
     }
     __syncthreads();
@@ -327,15 +328,18 @@ __global__ void ScaleAndPackColumnsKernel(
     const size_t pair_stride = blockDim.x;
     for (size_t pair_idx = threadIdx.x; pair_idx < pair_count; pair_idx += pair_stride) {
         const size_t offset = pair_idx * 2;
-        float scaled0 = fminf(fmaxf(src[offset] * inv_scale, -kFp16SafeMax), kFp16SafeMax);
-        float scaled1 = fminf(fmaxf(src[offset + 1] * inv_scale, -kFp16SafeMax), kFp16SafeMax);
+        const float value0 = flstm::numeric::FiniteOrZero(src[offset]);
+        const float value1 = flstm::numeric::FiniteOrZero(src[offset + 1]);
+        const float scaled0 = flstm::numeric::ClampToHalfRange(value0 * inv_scale);
+        const float scaled1 = flstm::numeric::ClampToHalfRange(value1 * inv_scale);
         dst[offset] = __float2half(scaled0);
         dst[offset + 1] = __float2half(scaled1);
     }
 
     if ((z_rows & 1u) && threadIdx.x == 0) {
-        const float tail = src[z_rows - 1] * inv_scale;
-        dst[z_rows - 1] = __float2half(fminf(fmaxf(tail, -kFp16SafeMax), kFp16SafeMax));
+        const float tail_value = flstm::numeric::FiniteOrZero(src[z_rows - 1]);
+        const float tail = flstm::numeric::ClampToHalfRange(tail_value * inv_scale);
+        dst[z_rows - 1] = __float2half(tail);
     }
 }
 
@@ -380,6 +384,8 @@ __device__ __forceinline__ void StorePointwiseOutputs(
     if (ctx.checkpoint_dst_h != nullptr && ctx.h_prev != nullptr) {
         ctx.checkpoint_dst_h[state_index] = ctx.h_prev[state_index];
     }
+    const float h_storable = flstm::numeric::ClampToHalfRange(h_val);
+    const float c_storable = flstm::numeric::ClampToHalfRange(c_val);
     if (ctx.h_next != nullptr) {
         ctx.h_next[state_index] = h_val;
     }
@@ -387,7 +393,7 @@ __device__ __forceinline__ void StorePointwiseOutputs(
         ctx.c_next[state_index] = c_val;
     }
     if (ctx.y_half_out != nullptr) {
-        ctx.y_half_out[state_index] = __float2half(h_val);
+        ctx.y_half_out[state_index] = __float2half(h_storable);
     }
     if (ctx.gate_cache_step != nullptr) {
         __half *gate_ptr = ctx.gate_cache_step + batch_idx * gate_dim;
@@ -398,15 +404,15 @@ __device__ __forceinline__ void StorePointwiseOutputs(
     }
     if (ctx.h_cache != nullptr) {
         __half *dst = ctx.h_cache + cache_index * (batch_size * hidden_size);
-        dst[batch_idx * hidden_size + hidden_idx] = __float2half(h_val);
+        dst[batch_idx * hidden_size + hidden_idx] = __float2half(h_storable);
     }
     if (ctx.c_cache != nullptr) {
         __half *dst = ctx.c_cache + cache_index * (batch_size * hidden_size);
-        dst[batch_idx * hidden_size + hidden_idx] = __float2half(c_val);
+        dst[batch_idx * hidden_size + hidden_idx] = __float2half(c_storable);
     }
     if (has_next_column && ctx.z_cache_col != nullptr) {
         const size_t column = next_column_offset + batch_idx;
-        ctx.z_cache_col[input_size + hidden_idx + column * z_rows] = h_val;
+        ctx.z_cache_col[input_size + hidden_idx + column * z_rows] = flstm::numeric::FiniteOrZero(h_val);
     }
 }
 
@@ -435,7 +441,10 @@ __global__ void ForwardPointwiseKernel(
     const size_t row_base = hidden_idx;
     const size_t state_index = batch_idx * hidden_size + hidden_idx;
 
-    const float scale = column_scale[col];
+    float scale = flstm::numeric::FiniteOrDefault(column_scale[col], 1.0f);
+    if (scale == 0.0f) {
+        scale = 1.0f;
+    }
     const size_t col_offset = col * gate_dim + row_base;
     const float gi = fmaf(gate_col[col_offset + 0 * hidden_size], scale, bias[row_base + 0 * hidden_size]);
     const float gf = fmaf(gate_col[col_offset + 1 * hidden_size], scale, bias[row_base + 1 * hidden_size]);
@@ -497,7 +506,10 @@ __global__ void ScalePackAndPointwiseKernel(
     const size_t gate_dim = 4 * hidden_size;
     const size_t state_base = batch_idx * hidden_size;
 
-    const float scale = column_scale_cur[batch_idx];
+    float scale = flstm::numeric::FiniteOrDefault(column_scale_cur[batch_idx], 1.0f);
+    if (scale == 0.0f) {
+        scale = 1.0f;
+    }
     const size_t col_offset = batch_idx * gate_dim;
     for (size_t hidden_idx = threadIdx.x; hidden_idx < hidden_size; hidden_idx += blockDim.x) {
         const size_t row_base = hidden_idx;
@@ -543,7 +555,8 @@ __global__ void ScalePackAndPointwiseKernel(
         const float *src = next_z_cols_float + batch_idx * z_rows;
         float local_max = 0.0f;
         for (size_t row = threadIdx.x; row < z_rows; row += blockDim.x) {
-            local_max = fmaxf(local_max, fabsf(src[row]));
+            const float value = flstm::numeric::FiniteOrZero(src[row]);
+            local_max = fmaxf(local_max, fabsf(value));
         }
         const int lane = threadIdx.x & 31;
         const int warp_id = threadIdx.x / warpSize;
@@ -558,22 +571,25 @@ __global__ void ScalePackAndPointwiseKernel(
             float reduced = WarpReduceMax(value);
             if (lane == 0) {
                 float inv_scale = 1.0f;
-                if (reduced > 0.0f) {
-                    float scale = reduced / kFp16SafeMax;
-                    if (!(scale > 0.0f)) {
-                        scale = 1.0f;
+                float column_scale_value = 1.0f;
+                if (reduced > 0.0f && isfinite(reduced)) {
+                    float next_scale = reduced / flstm::numeric::kFp16SafeMax;
+                    if (!(next_scale > 0.0f) || !isfinite(next_scale)) {
+                        next_scale = 1.0f;
                     }
-                    inv_scale = 1.0f / scale;
+                    inv_scale = 1.0f / next_scale;
+                    column_scale_value = next_scale;
                 }
                 inv_scale_shared = inv_scale;
-                column_scale_next[batch_idx] = 1.0f / inv_scale;
+                column_scale_next[batch_idx] = column_scale_value;
             }
         }
         __syncthreads();
         const float inv_scale = inv_scale_shared;
         __half *dst = next_z_cols_half + batch_idx * z_rows;
         for (size_t row = threadIdx.x; row < z_rows; row += blockDim.x) {
-            float scaled = fminf(fmaxf(src[row] * inv_scale, -kFp16SafeMax), kFp16SafeMax);
+            const float value = flstm::numeric::FiniteOrZero(src[row]);
+            const float scaled = flstm::numeric::ClampToHalfRange(value * inv_scale);
             dst[row] = __float2half(scaled);
         }
     }

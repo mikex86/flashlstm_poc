@@ -224,14 +224,14 @@ void GemmTN(
         ColumnMajor,
         cutlass::gemm::GemmShape<128, 64, 64>,
         cutlass::gemm::GemmShape<64, 32, 64>,
-        cutlass::gemm::GemmShape<16, 8, 16>,
+        cutlass::gemm::GemmShape<16, 8, 8>,
         3>;
     using Secondary = TensorOpGemm<
         RowMajor,
         ColumnMajor,
-        cutlass::gemm::GemmShape<64, 64, 64>,
-        cutlass::gemm::GemmShape<32, 32, 64>,
-        cutlass::gemm::GemmShape<16, 8, 16>,
+        cutlass::gemm::GemmShape<64, 64, 32>,
+        cutlass::gemm::GemmShape<32, 32, 32>,
+        cutlass::gemm::GemmShape<16, 8, 8>,
         2>;
     using Simt = SimtGemm<RowMajor, ColumnMajor>;
     static GemmContext<Primary> primary_ctx;
@@ -273,15 +273,15 @@ void GemmNN(
     using Primary = TensorOpGemm<
         ColumnMajor,
         ColumnMajor,
-        cutlass::gemm::GemmShape<128, 128, 64>,
-        cutlass::gemm::GemmShape<64, 64, 64>,
+        cutlass::gemm::GemmShape<128, 64, 64>,
+        cutlass::gemm::GemmShape<64, 32, 64>,
         cutlass::gemm::GemmShape<16, 8, 16>,
-        4>;
+        3>;
     using Secondary = TensorOpGemm<
         ColumnMajor,
         ColumnMajor,
-        cutlass::gemm::GemmShape<64, 128, 32>,
-        cutlass::gemm::GemmShape<32, 64, 32>,
+        cutlass::gemm::GemmShape<64, 64, 32>,
+        cutlass::gemm::GemmShape<32, 32, 32>,
         cutlass::gemm::GemmShape<16, 8, 16>,
         3>;
     using Simt = SimtGemm<ColumnMajor, ColumnMajor>;
@@ -324,16 +324,16 @@ void GemmNT(
     using Primary = TensorOpGemm<
         ColumnMajor,
         RowMajor,
-        cutlass::gemm::GemmShape<128, 128, 32>,
-        cutlass::gemm::GemmShape<64, 64, 32>,
-        cutlass::gemm::GemmShape<16, 8, 16>,
+        cutlass::gemm::GemmShape<64, 128, 64>,
+        cutlass::gemm::GemmShape<32, 64, 64>,
+        cutlass::gemm::GemmShape<16, 8, 8>,
         3>;
     using Secondary = TensorOpGemm<
         ColumnMajor,
         RowMajor,
-        cutlass::gemm::GemmShape<64, 128, 32>,
+        cutlass::gemm::GemmShape<64, 64, 32>,
         cutlass::gemm::GemmShape<32, 64, 32>,
-        cutlass::gemm::GemmShape<16, 8, 16>,
+        cutlass::gemm::GemmShape<16, 8, 8>,
         2>;
     using Simt = SimtGemm<ColumnMajor, RowMajor>;
     static GemmContext<Primary> primary_ctx;

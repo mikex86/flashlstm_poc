@@ -212,44 +212,6 @@ namespace {
         dc_prev_row[idx] = dc_prev;
     }
 
-    __global__ void PackInputStepKernel(
-        const __half *x_step, // (B, I) row-major
-        float *z_step, // (I+H, B) column-major float staging
-        const size_t batch_size,
-        const size_t input_size,
-        const size_t hidden_size
-    ) {
-        const size_t total = batch_size * input_size;
-        const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-        if (idx >= total) {
-            return;
-        }
-        const size_t tmp = idx;
-        const size_t input_idx = tmp % input_size;
-        const size_t batch_idx = tmp / input_size;
-        const size_t z_rows = input_size + hidden_size;
-        z_step[input_idx + batch_idx * z_rows] = __half2float(x_step[idx]);
-    }
-
-    __global__ void PackHiddenStateKernel(
-        const float *h_prev, // (B, H) row-major
-        float *z_step, // (I+H, B) column-major float staging
-        const size_t batch_size,
-        const size_t input_size,
-        const size_t hidden_size
-    ) {
-        const size_t total = batch_size * hidden_size;
-        const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-        if (idx >= total) {
-            return;
-        }
-        const size_t batch_idx = idx / hidden_size;
-        const size_t hidden_idx = idx % hidden_size;
-        const size_t z_rows = input_size + hidden_size;
-        const float h_value = h_prev[idx];
-        z_step[input_size + hidden_idx + batch_idx * z_rows] = h_value;
-    }
-
     constexpr float kFp16SafeMax = 60000.0f;
 
     __global__ void ScaleAndPackColumnsKernel(
@@ -390,63 +352,57 @@ namespace {
         dx_half[idx] = __float2half(value);
     }
 
-    __global__ void ConvertInputToZChunkKernel(
-        const __half *x_src, // (chunk_steps, B, I)
-        __half *z_chunk_col, // (I+H, chunk_tb) column-major
-        const size_t chunk_steps,
-        const size_t batch_size,
-        const size_t input_size,
-        const size_t hidden_size
-    ) {
-        const size_t total = chunk_steps * batch_size * input_size;
-        const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-        if (idx >= total) {
-            return;
-        }
-        size_t tmp = idx;
-        const size_t input_idx = tmp % input_size;
-        tmp /= input_size;
-        const size_t batch_idx = tmp % batch_size;
-        const size_t step_idx = tmp / batch_size;
-
-        const size_t column = step_idx * batch_size + batch_idx;
-        const size_t z_rows = input_size + hidden_size;
-        z_chunk_col[input_idx + column * z_rows] = x_src[idx];
-    }
-
-    __global__ void FillHiddenPartForZChunkKernel(
+    __global__ void BuildZChunkKernel(
+        const __half *x_src, // (chunk_steps, B, I) row-major
         const __half *y_chunk, // (chunk_steps, B, H) row-major
         const __half *first_prev, // (B, H) row-major
         const size_t chunk_steps,
         const size_t batch_size,
-        const size_t hidden_size,
         const size_t input_size,
+        const size_t hidden_size,
         __half *z_chunk_col // (I+H, chunk_tb) column-major
     ) {
-        const size_t total = chunk_steps * batch_size * hidden_size;
-        const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-        if (idx >= total) {
-            return;
-        }
-
-        size_t tmp = idx;
-        const size_t hidden_idx = tmp % hidden_size;
-        tmp /= hidden_size;
-        const size_t batch_idx = tmp % batch_size;
-        const size_t step_idx = tmp / batch_size;
-
-        const size_t column = step_idx * batch_size + batch_idx;
+        const size_t columns = chunk_steps * batch_size;
         const size_t z_rows = input_size + hidden_size;
+        for (size_t column = blockIdx.x; column < columns; column += gridDim.x) {
+            const size_t batch_idx = column % batch_size;
+            const size_t step_idx = column / batch_size;
 
-        __half h_prev{};
-        if (step_idx == 0) {
-            h_prev = first_prev[batch_idx * hidden_size + hidden_idx];
-        } else {
-            const __half *y_prev = y_chunk + ((step_idx - 1) * batch_size + batch_idx) * hidden_size;
-            h_prev = y_prev[hidden_idx];
+            const __half *x_step = x_src + column * input_size;
+            __half *dst = z_chunk_col + column * z_rows;
+            for (size_t row = threadIdx.x; row < input_size; row += blockDim.x) {
+                dst[row] = x_step[row];
+            }
+
+            const __half *hidden_src = (step_idx == 0)
+                                           ? (first_prev + batch_idx * hidden_size)
+                                           : (y_chunk + ((step_idx - 1) * batch_size + batch_idx) * hidden_size);
+            for (size_t row = threadIdx.x; row < hidden_size; row += blockDim.x) {
+                dst[input_size + row] = hidden_src[row];
+            }
         }
+    }
 
-        z_chunk_col[input_size + hidden_idx + column * z_rows] = h_prev;
+    __global__ void BuildZStepKernel(
+        const __half *x_step, // (B, I) row-major
+        const float *h_prev, // (B, H) row-major
+        float *z_step, // (I+H, B) column-major float staging
+        const size_t batch_size,
+        const size_t input_size,
+        const size_t hidden_size
+    ) {
+        const size_t z_rows = input_size + hidden_size;
+        for (size_t batch_idx = blockIdx.x; batch_idx < batch_size; batch_idx += gridDim.x) {
+            float *dst = z_step + batch_idx * z_rows;
+            const __half *x_col = x_step + batch_idx * input_size;
+            for (size_t row = threadIdx.x; row < input_size; row += blockDim.x) {
+                dst[row] = __half2float(x_col[row]);
+            }
+            const float *h_col = h_prev + batch_idx * hidden_size;
+            for (size_t row = threadIdx.x; row < hidden_size; row += blockDim.x) {
+                dst[input_size + row] = h_col[row];
+            }
+        }
     }
 
     __global__ void FillOnesKernel(__half *dst, const size_t count) {
@@ -989,42 +945,28 @@ namespace flstm {
             const size_t prefix_steps = chunk_prefix_steps[slot];
             const size_t recompute_steps = chunk_recompute_steps[slot];
 
-            const size_t chunk_hidden_elems = steps_in_chunk * bh_elements;
-
-            const size_t chunk_input_elems = steps_in_chunk * batch_size * input_size;
-            if (chunk_input_elems > 0 && x_chunk_half[slot].ptr != nullptr) {
-                const int convert_blocks = BlocksFor(chunk_input_elems, threads);
-                const __half *x_grad_src = x_chunk_half[slot].ptr + prefix_steps * batch_size * input_size;
-                ConvertInputToZChunkKernel<<<convert_blocks, threads, 0, compute_stream>>>(
-                    x_grad_src,
-                    z_chunk_col[slot].ptr,
-                    steps_in_chunk,
-                    batch_size,
-                    input_size,
-                    hidden_size
-                );
-                CheckCuda(cudaGetLastError(), "ConvertInputToZChunkKernel");
-            }
-
             const __half *first_prev_ptr = nullptr;
             if (chunk_start_step == 0) {
                 first_prev_ptr = h0_device;
             } else {
                 first_prev_ptr = y_prev_half[slot].ptr;
             }
-
-            if (chunk_hidden_elems > 0) {
-                const int hidden_blocks = BlocksFor(chunk_hidden_elems, threads);
-                FillHiddenPartForZChunkKernel<<<hidden_blocks, threads, 0, compute_stream>>>(
+            if (steps_in_chunk > 0 && x_chunk_half[slot].ptr != nullptr) {
+                const __half *x_grad_src = x_chunk_half[slot].ptr + prefix_steps * batch_size * input_size;
+                const size_t column_count = steps_in_chunk * batch_size;
+                const int column_blocks =
+                    static_cast<int>(std::max<size_t>(1, std::min<size_t>(column_count, 65535)));
+                BuildZChunkKernel<<<column_blocks, threads, 0, compute_stream>>>(
+                    x_grad_src,
                     y_chunk_half[slot].ptr,
                     first_prev_ptr,
                     steps_in_chunk,
                     batch_size,
-                    hidden_size,
                     input_size,
+                    hidden_size,
                     z_chunk_col[slot].ptr
                 );
-                CheckCuda(cudaGetLastError(), "FillHiddenPartForZChunkKernel");
+                CheckCuda(cudaGetLastError(), "BuildZChunkKernel");
             }
 
             if (recompute_steps > 0) {
@@ -1046,23 +988,16 @@ namespace flstm {
                 for (size_t local_step = 0; local_step < recompute_steps; ++local_step) {
                     const __half *x_step_half =
                             x_chunk_half[slot].ptr + local_step * batch_size * input_size;
-                    const int input_blocks = BlocksFor(batch_size * input_size, threads);
-                    PackInputStepKernel<<<input_blocks, threads, 0, compute_stream>>>(
+                    const int pack_blocks = static_cast<int>(std::max<size_t>(1, std::min<size_t>(batch_size, 65535)));
+                    BuildZStepKernel<<<pack_blocks, threads, 0, compute_stream>>>(
                         x_step_half,
-                        z_step_float.ptr,
-                        batch_size,
-                        input_size,
-                        hidden_size
-                    );
-                    CheckCuda(cudaGetLastError(), "PackInputStepKernel");
-                    PackHiddenStateKernel<<<point_blocks, threads, 0, compute_stream>>>(
                         recompute_h_prev.ptr,
                         z_step_float.ptr,
                         batch_size,
                         input_size,
                         hidden_size
                     );
-                    CheckCuda(cudaGetLastError(), "PackHiddenStateKernel");
+                    CheckCuda(cudaGetLastError(), "BuildZStepKernel");
                     const int scale_blocks = static_cast<int>(batch_size);
                     ScaleAndPackColumnsKernel<<<scale_blocks, threads, 0, compute_stream>>>(
                         z_step_float.ptr,

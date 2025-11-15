@@ -216,6 +216,17 @@ __global__ void FuseBiasKernel(
     bias_out[idx] = bias_ih[idx] + bias_hh[idx];
 }
 
+__device__ __forceinline__ float Sigmoid(float x) {
+    return 1.0f / (1.0f + __expf(-x));
+}
+
+__device__ __forceinline__ float WarpReduceMax(float value) {
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+        value = fmaxf(value, __shfl_down_sync(0xffffffff, value, offset));
+    }
+    return value;
+}
+
 __global__ void ConvertInputToZCacheKernel(
     const __half *x_src,           // (chunk_steps, B, I) half
     float *z_cache_col,            // (I+H, T*B) column-major float staging
@@ -225,21 +236,21 @@ __global__ void ConvertInputToZCacheKernel(
     size_t input_size,
     size_t hidden_size
 ) {
-    const size_t total = chunk_steps * batch_size * input_size;
-    const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= total) {
+    const size_t column_count = chunk_steps * batch_size;
+    const size_t column = blockIdx.x;
+    if (column >= column_count) {
         return;
     }
-    size_t tmp = idx;
-    const size_t input_idx = tmp % input_size;
-    tmp /= input_size;
-    const size_t batch_idx = tmp % batch_size;
-    const size_t step_idx = tmp / batch_size;
-    const size_t time_idx = time_offset + step_idx;
+    const size_t step_idx = column / batch_size;
+    const size_t batch_idx = column % batch_size;
+    const size_t global_column = (time_offset + step_idx) * batch_size + batch_idx;
 
-    const size_t column = time_idx * batch_size + batch_idx;
-    const size_t z_rows = input_size + hidden_size;
-    z_cache_col[input_idx + column * z_rows] = __half2float(x_src[idx]);
+    const __half *src = x_src + (step_idx * batch_size + batch_idx) * input_size;
+    float *dst = z_cache_col + global_column * (input_size + hidden_size);
+
+    for (size_t row = threadIdx.x; row < input_size; row += blockDim.x) {
+        dst[row] = __half2float(src[row]);
+    }
 }
 
 __global__ void SeedHiddenColumnKernel(
@@ -274,7 +285,8 @@ __global__ void ScaleAndPackColumnsKernel(
     if (batch_idx >= batch_size) {
         return;
     }
-    extern __shared__ float shared[];
+    __shared__ float warp_max_shared[32];
+    __shared__ float inv_scale_shared;
     const float *src = z_cols_float + batch_idx * z_rows;
     __half *dst = z_cols_half + batch_idx * z_rows;
 
@@ -283,57 +295,126 @@ __global__ void ScaleAndPackColumnsKernel(
         const float value = src[row];
         local_max = fmaxf(local_max, fabsf(value));
     }
-    shared[threadIdx.x] = local_max;
+    const int lane = threadIdx.x & 31;
+    const int warp_id = threadIdx.x / warpSize;
+    float warp_max = WarpReduceMax(local_max);
+    if (lane == 0) {
+        warp_max_shared[warp_id] = warp_max;
+    }
     __syncthreads();
 
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) {
-            shared[threadIdx.x] = fmaxf(shared[threadIdx.x], shared[threadIdx.x + stride]);
-        }
-        __syncthreads();
-    }
-
-    float inv_scale = 1.0f;
-    if (threadIdx.x == 0) {
-        const float max_abs = shared[0];
-        float scale = 1.0f;
-        if (max_abs > 0.0f) {
-            scale = max_abs / kFp16SafeMax;
-            if (!(scale > 0.0f)) {
-                scale = 1.0f;
+    if (warp_id == 0) {
+        const int warp_count = (blockDim.x + warpSize - 1) / warpSize;
+        float val = (lane < warp_count) ? warp_max_shared[lane] : 0.0f;
+        float reduced = WarpReduceMax(val);
+        if (lane == 0) {
+            float inv_scale = 1.0f;
+            if (reduced > 0.0f) {
+                float scale = reduced / kFp16SafeMax;
+                if (!(scale > 0.0f)) {
+                    scale = 1.0f;
+                }
+                inv_scale = 1.0f / scale;
             }
-            inv_scale = 1.0f / scale;
-        } else {
-            inv_scale = 1.0f;
+            inv_scale_shared = inv_scale;
+            column_scale[batch_idx] = 1.0f / inv_scale;
         }
-        column_scale[batch_idx] = 1.0f / inv_scale;
-        shared[0] = inv_scale;
     }
     __syncthreads();
-    inv_scale = shared[0];
+    const float inv_scale = inv_scale_shared;
 
-    for (size_t row = threadIdx.x; row < z_rows; row += blockDim.x) {
-        float scaled = src[row] * inv_scale;
-        scaled = fminf(fmaxf(scaled, -kFp16SafeMax), kFp16SafeMax);
-        dst[row] = __float2half(scaled);
+    const size_t pair_count = z_rows / 2;
+    const size_t pair_stride = blockDim.x;
+    for (size_t pair_idx = threadIdx.x; pair_idx < pair_count; pair_idx += pair_stride) {
+        const size_t offset = pair_idx * 2;
+        float scaled0 = fminf(fmaxf(src[offset] * inv_scale, -kFp16SafeMax), kFp16SafeMax);
+        float scaled1 = fminf(fmaxf(src[offset + 1] * inv_scale, -kFp16SafeMax), kFp16SafeMax);
+        dst[offset] = __float2half(scaled0);
+        dst[offset + 1] = __float2half(scaled1);
+    }
+
+    if ((z_rows & 1u) && threadIdx.x == 0) {
+        const float tail = src[z_rows - 1] * inv_scale;
+        dst[z_rows - 1] = __float2half(fminf(fmaxf(tail, -kFp16SafeMax), kFp16SafeMax));
+    }
+}
+
+struct PointwiseContext {
+    float *c_prev;
+    float *h_prev;
+    float *h_next;
+    float *c_next;
+    __half *y_half_out;
+    __half *gate_cache_step;
+    __half *h_cache;
+    __half *c_cache;
+    float *z_cache_col;
+    float *checkpoint_dst_h;
+    float *checkpoint_dst_c;
+};
+
+__device__ __forceinline__ void StorePointwiseOutputs(
+    size_t state_index,
+    size_t batch_idx,
+    size_t hidden_idx,
+    size_t gate_dim,
+    size_t hidden_size,
+    size_t batch_size,
+    size_t cache_index,
+    int has_next_column,
+    size_t next_column_offset,
+    size_t input_size,
+    size_t z_rows,
+    const PointwiseContext &ctx,
+    float i_gate,
+    float f_gate,
+    float g_gate,
+    float o_gate,
+    float c_prev_val,
+    float c_val,
+    float h_val
+) {
+    if (ctx.checkpoint_dst_c != nullptr) {
+        ctx.checkpoint_dst_c[state_index] = c_prev_val;
+    }
+    if (ctx.checkpoint_dst_h != nullptr && ctx.h_prev != nullptr) {
+        ctx.checkpoint_dst_h[state_index] = ctx.h_prev[state_index];
+    }
+    if (ctx.h_next != nullptr) {
+        ctx.h_next[state_index] = h_val;
+    }
+    if (ctx.c_next != nullptr) {
+        ctx.c_next[state_index] = c_val;
+    }
+    if (ctx.y_half_out != nullptr) {
+        ctx.y_half_out[state_index] = __float2half(h_val);
+    }
+    if (ctx.gate_cache_step != nullptr) {
+        __half *gate_ptr = ctx.gate_cache_step + batch_idx * gate_dim;
+        gate_ptr[hidden_idx + 0 * hidden_size] = __float2half(i_gate);
+        gate_ptr[hidden_idx + 1 * hidden_size] = __float2half(f_gate);
+        gate_ptr[hidden_idx + 2 * hidden_size] = __float2half(g_gate);
+        gate_ptr[hidden_idx + 3 * hidden_size] = __float2half(o_gate);
+    }
+    if (ctx.h_cache != nullptr) {
+        __half *dst = ctx.h_cache + cache_index * (batch_size * hidden_size);
+        dst[batch_idx * hidden_size + hidden_idx] = __float2half(h_val);
+    }
+    if (ctx.c_cache != nullptr) {
+        __half *dst = ctx.c_cache + cache_index * (batch_size * hidden_size);
+        dst[batch_idx * hidden_size + hidden_idx] = __float2half(c_val);
+    }
+    if (has_next_column && ctx.z_cache_col != nullptr) {
+        const size_t column = next_column_offset + batch_idx;
+        ctx.z_cache_col[input_size + hidden_idx + column * z_rows] = h_val;
     }
 }
 
 __global__ void ForwardPointwiseKernel(
     const float *gate_col,         // (4H, B) column-major
     const float *bias,             // (4H,)
-    const float *c_prev,           // (B, H) row-major
-    const float *h_prev,           // (B, H) row-major
-    float *h_next,                 // (B, H) row-major
-    float *c_next,                 // (B, H) row-major
-    __half *y_half_out,            // (B, H) row-major half or nullptr
-    __half *gate_cache_step,       // (B, 4H) row-major
-    __half *h_cache,               // (T+1, B, H) row-major
-    __half *c_cache,               // (T+1, B, H) row-major
-    float *z_cache_col,            // (I+H, T*B) column-major float staging
+    PointwiseContext ctx,
     const float *column_scale,     // (B,) scaling factors for this step
-    float *checkpoint_dst_h,       // (B, H) row-major float or nullptr
-    float *checkpoint_dst_c,       // (B, H) row-major float or nullptr
     size_t z_rows,
     size_t input_size,
     int has_next_column,
@@ -355,52 +436,146 @@ __global__ void ForwardPointwiseKernel(
     const size_t state_index = batch_idx * hidden_size + hidden_idx;
 
     const float scale = column_scale[col];
-    const float gi = gate_col[row_base + col * gate_dim] * scale + bias[row_base + 0 * hidden_size];
-    const float gf =
-        gate_col[row_base + hidden_size + col * gate_dim] * scale + bias[row_base + 1 * hidden_size];
-    const float gg =
-        gate_col[row_base + 2 * hidden_size + col * gate_dim] * scale + bias[row_base + 2 * hidden_size];
-    const float go =
-        gate_col[row_base + 3 * hidden_size + col * gate_dim] * scale + bias[row_base + 3 * hidden_size];
+    const size_t col_offset = col * gate_dim + row_base;
+    const float gi = fmaf(gate_col[col_offset + 0 * hidden_size], scale, bias[row_base + 0 * hidden_size]);
+    const float gf = fmaf(gate_col[col_offset + 1 * hidden_size], scale, bias[row_base + 1 * hidden_size]);
+    const float gg = fmaf(gate_col[col_offset + 2 * hidden_size], scale, bias[row_base + 2 * hidden_size]);
+    const float go = fmaf(gate_col[col_offset + 3 * hidden_size], scale, bias[row_base + 3 * hidden_size]);
 
-    const float i_gate = 1.0f / (1.0f + expf(-gi));
-    const float f_gate = 1.0f / (1.0f + expf(-gf));
+    const float i_gate = Sigmoid(gi);
+    const float f_gate = Sigmoid(gf);
     const float g_gate = tanhf(gg);
-    const float c_prev_val = c_prev[state_index];
-    if (checkpoint_dst_c != nullptr) {
-        checkpoint_dst_c[state_index] = c_prev_val;
-    }
-    if (checkpoint_dst_h != nullptr && h_prev != nullptr) {
-        checkpoint_dst_h[state_index] = h_prev[state_index];
-    }
+    const float c_prev_val = ctx.c_prev[state_index];
     const float c_val = f_gate * c_prev_val + i_gate * g_gate;
-    const float o_gate = 1.0f / (1.0f + expf(-go));
+    const float o_gate = Sigmoid(go);
     const float h_val = o_gate * tanhf(c_val);
 
-    h_next[state_index] = h_val;
-    c_next[state_index] = c_val;
-    if (y_half_out != nullptr) {
-        y_half_out[state_index] = __float2half(h_val);
+    StorePointwiseOutputs(
+        state_index,
+        batch_idx,
+        hidden_idx,
+        gate_dim,
+        hidden_size,
+        batch_size,
+        cache_index,
+        has_next_column,
+        next_column_offset,
+        input_size,
+        z_rows,
+        ctx,
+        i_gate,
+        f_gate,
+        g_gate,
+        o_gate,
+        c_prev_val,
+        c_val,
+        h_val
+    );
+}
+
+__global__ void ScalePackAndPointwiseKernel(
+    const float *gate_col,
+    const float *bias,
+    PointwiseContext ctx,
+    const float *column_scale_cur,
+    float *column_scale_next,
+    const float *next_z_cols_float,
+    __half *next_z_cols_half,
+    size_t z_rows,
+    size_t batch_size,
+    size_t hidden_size,
+    size_t input_size,
+    size_t cache_index,
+    int scale_next,
+    int has_next_column,
+    size_t next_column_offset
+) {
+    const size_t batch_idx = blockIdx.x;
+    if (batch_idx >= batch_size) {
+        return;
+    }
+    const size_t gate_dim = 4 * hidden_size;
+    const size_t state_base = batch_idx * hidden_size;
+
+    const float scale = column_scale_cur[batch_idx];
+    const size_t col_offset = batch_idx * gate_dim;
+    for (size_t hidden_idx = threadIdx.x; hidden_idx < hidden_size; hidden_idx += blockDim.x) {
+        const size_t row_base = hidden_idx;
+        const float gi = fmaf(gate_col[col_offset + row_base + 0 * hidden_size], scale, bias[row_base + 0 * hidden_size]);
+        const float gf = fmaf(gate_col[col_offset + row_base + 1 * hidden_size], scale, bias[row_base + 1 * hidden_size]);
+        const float gg = fmaf(gate_col[col_offset + row_base + 2 * hidden_size], scale, bias[row_base + 2 * hidden_size]);
+        const float go = fmaf(gate_col[col_offset + row_base + 3 * hidden_size], scale, bias[row_base + 3 * hidden_size]);
+        const float i_gate = Sigmoid(gi);
+        const float f_gate = Sigmoid(gf);
+        const float g_gate = tanhf(gg);
+        const size_t state_index = state_base + hidden_idx;
+        const float c_prev_val = ctx.c_prev[state_index];
+        const float c_val = f_gate * c_prev_val + i_gate * g_gate;
+        const float o_gate = Sigmoid(go);
+        const float h_val = o_gate * tanhf(c_val);
+        StorePointwiseOutputs(
+            state_index,
+            batch_idx,
+            hidden_idx,
+            gate_dim,
+            hidden_size,
+            batch_size,
+            cache_index,
+            has_next_column,
+            next_column_offset,
+            input_size,
+            z_rows,
+            ctx,
+            i_gate,
+            f_gate,
+            g_gate,
+            o_gate,
+            c_prev_val,
+            c_val,
+            h_val
+        );
     }
 
-    if (gate_cache_step != nullptr) {
-        __half *gate_ptr = gate_cache_step + batch_idx * gate_dim;
-        gate_ptr[hidden_idx + 0 * hidden_size] = __float2half(i_gate);
-        gate_ptr[hidden_idx + 1 * hidden_size] = __float2half(f_gate);
-        gate_ptr[hidden_idx + 2 * hidden_size] = __float2half(g_gate);
-        gate_ptr[hidden_idx + 3 * hidden_size] = __float2half(o_gate);
-    }
-    if (h_cache != nullptr) {
-        __half *dst = h_cache + cache_index * (batch_size * hidden_size);
-        dst[batch_idx * hidden_size + hidden_idx] = __float2half(h_val);
-    }
-    if (c_cache != nullptr) {
-        __half *dst = c_cache + cache_index * (batch_size * hidden_size);
-        dst[batch_idx * hidden_size + hidden_idx] = __float2half(c_val);
-    }
-    if (has_next_column && z_cache_col != nullptr) {
-        const size_t column = next_column_offset + batch_idx;
-        z_cache_col[input_size + hidden_idx + column * z_rows] = h_val;
+    if (scale_next && next_z_cols_float != nullptr && next_z_cols_half != nullptr && column_scale_next != nullptr) {
+        __syncthreads();
+        __shared__ float warp_max_shared[32];
+        __shared__ float inv_scale_shared;
+        const float *src = next_z_cols_float + batch_idx * z_rows;
+        float local_max = 0.0f;
+        for (size_t row = threadIdx.x; row < z_rows; row += blockDim.x) {
+            local_max = fmaxf(local_max, fabsf(src[row]));
+        }
+        const int lane = threadIdx.x & 31;
+        const int warp_id = threadIdx.x / warpSize;
+        float warp_max = WarpReduceMax(local_max);
+        if (lane == 0) {
+            warp_max_shared[warp_id] = warp_max;
+        }
+        __syncthreads();
+        if (warp_id == 0) {
+            const int warp_count = (blockDim.x + warpSize - 1) / warpSize;
+            float value = (lane < warp_count) ? warp_max_shared[lane] : 0.0f;
+            float reduced = WarpReduceMax(value);
+            if (lane == 0) {
+                float inv_scale = 1.0f;
+                if (reduced > 0.0f) {
+                    float scale = reduced / kFp16SafeMax;
+                    if (!(scale > 0.0f)) {
+                        scale = 1.0f;
+                    }
+                    inv_scale = 1.0f / scale;
+                }
+                inv_scale_shared = inv_scale;
+                column_scale_next[batch_idx] = 1.0f / inv_scale;
+            }
+        }
+        __syncthreads();
+        const float inv_scale = inv_scale_shared;
+        __half *dst = next_z_cols_half + batch_idx * z_rows;
+        for (size_t row = threadIdx.x; row < z_rows; row += blockDim.x) {
+            float scaled = fminf(fmaxf(src[row] * inv_scale, -kFp16SafeMax), kFp16SafeMax);
+            dst[row] = __float2half(scaled);
+        }
     }
 }
 
@@ -458,6 +633,181 @@ static size_t IssueChunkCopy(size_t chunk_index, int slot, const ForwardChunkCop
 }
 
 } // namespace
+
+namespace flstm {
+namespace testing {
+void LaunchScalePackPointwiseKernel(
+    const float *gate_col,
+    const float *bias,
+    const float *c_prev,
+    const float *h_prev,
+    float *h_next,
+    float *c_next,
+    __half *y_half_out,
+    __half *gate_cache_step,
+    __half *h_cache,
+    __half *c_cache,
+    float *z_cache_col,
+    const float *column_scale_cur,
+    float *column_scale_next,
+    const float *next_z_cols_float,
+    __half *next_z_cols_half,
+    float *checkpoint_dst_h,
+    float *checkpoint_dst_c,
+    size_t z_rows,
+    size_t batch_size,
+    size_t hidden_size,
+    size_t input_size,
+    size_t cache_index,
+    int scale_next,
+    int has_next_column,
+    size_t next_column_offset,
+    cudaStream_t stream
+) {
+    constexpr int kThreads = 256;
+    dim3 grid(static_cast<unsigned int>(batch_size));
+    PointwiseContext ctx{};
+    ctx.c_prev = const_cast<float *>(c_prev);
+    ctx.h_prev = const_cast<float *>(h_prev);
+    ctx.h_next = h_next;
+    ctx.c_next = c_next;
+    ctx.y_half_out = y_half_out;
+    ctx.gate_cache_step = gate_cache_step;
+    ctx.h_cache = h_cache;
+    ctx.c_cache = c_cache;
+    ctx.z_cache_col = z_cache_col;
+    ctx.checkpoint_dst_h = checkpoint_dst_h;
+    ctx.checkpoint_dst_c = checkpoint_dst_c;
+    ScalePackAndPointwiseKernel<<<grid, kThreads, 0, stream>>>(
+        gate_col,
+        bias,
+        ctx,
+        column_scale_cur,
+        column_scale_next,
+        next_z_cols_float,
+        next_z_cols_half,
+        z_rows,
+        batch_size,
+        hidden_size,
+        input_size,
+        cache_index,
+        scale_next,
+        has_next_column,
+        next_column_offset
+    );
+    if (cudaError_t status = cudaGetLastError(); status != cudaSuccess) {
+        throw std::runtime_error(std::string("ScalePackAndPointwiseKernel: ") + cudaGetErrorString(status));
+    }
+}
+
+void LaunchConvertInputToZCacheKernel(
+    const __half *x_src,
+    float *z_cache_col,
+    size_t time_offset,
+    size_t chunk_steps,
+    size_t batch_size,
+    size_t input_size,
+    size_t hidden_size,
+    cudaStream_t stream
+) {
+    constexpr int kThreads = 256;
+    const size_t columns = chunk_steps * batch_size;
+    const dim3 grid(columns == 0 ? 1u : static_cast<unsigned int>(columns));
+    ConvertInputToZCacheKernel<<<grid, kThreads, 0, stream>>>(
+        x_src,
+        z_cache_col,
+        time_offset,
+        chunk_steps,
+        batch_size,
+        input_size,
+        hidden_size
+    );
+    if (cudaError_t status = cudaGetLastError(); status != cudaSuccess) {
+        throw std::runtime_error(std::string("ConvertInputToZCacheKernel: ") + cudaGetErrorString(status));
+    }
+}
+
+void LaunchScaleAndPackColumnsKernel(
+    const float *z_cols_float,
+    __half *z_cols_half,
+    float *column_scale,
+    size_t z_rows,
+    size_t batch_size,
+    cudaStream_t stream
+) {
+    constexpr int kThreads = 256;
+    dim3 grid(static_cast<unsigned int>(batch_size));
+    ScaleAndPackColumnsKernel<<<grid, kThreads, 0, stream>>>(
+        z_cols_float,
+        z_cols_half,
+        column_scale,
+        z_rows,
+        batch_size
+    );
+    if (cudaError_t status = cudaGetLastError(); status != cudaSuccess) {
+        throw std::runtime_error(std::string("ScaleAndPackColumnsKernel: ") + cudaGetErrorString(status));
+    }
+}
+
+void LaunchForwardPointwiseKernel(
+    const float *gate_col,
+    const float *bias,
+    const float *c_prev,
+    const float *h_prev,
+    float *h_next,
+    float *c_next,
+    __half *y_half_out,
+    __half *gate_cache_step,
+    __half *h_cache,
+    __half *c_cache,
+    float *z_cache_col,
+    const float *column_scale,
+    float *checkpoint_dst_h,
+    float *checkpoint_dst_c,
+    size_t z_rows,
+    size_t input_size,
+    int has_next_column,
+    size_t next_column_offset,
+    size_t cache_index,
+    size_t batch_size,
+    size_t hidden_size,
+    cudaStream_t stream
+) {
+    constexpr int kThreads = 256;
+    const size_t total = batch_size * hidden_size;
+    const int blocks = total == 0 ? 1 : static_cast<int>((total + kThreads - 1) / kThreads);
+    PointwiseContext ctx{};
+    ctx.c_prev = const_cast<float *>(c_prev);
+    ctx.h_prev = const_cast<float *>(h_prev);
+    ctx.h_next = h_next;
+    ctx.c_next = c_next;
+    ctx.y_half_out = y_half_out;
+    ctx.gate_cache_step = gate_cache_step;
+    ctx.h_cache = h_cache;
+    ctx.c_cache = c_cache;
+    ctx.z_cache_col = z_cache_col;
+    ctx.checkpoint_dst_h = checkpoint_dst_h;
+    ctx.checkpoint_dst_c = checkpoint_dst_c;
+    ForwardPointwiseKernel<<<blocks, kThreads, 0, stream>>>(
+        gate_col,
+        bias,
+        ctx,
+        column_scale,
+        z_rows,
+        input_size,
+        has_next_column,
+        next_column_offset,
+        cache_index,
+        batch_size,
+        hidden_size
+    );
+    if (cudaError_t status = cudaGetLastError(); status != cudaSuccess) {
+        throw std::runtime_error(std::string("ForwardPointwiseKernel: ") + cudaGetErrorString(status));
+    }
+}
+
+} // namespace testing
+} // namespace flstm
 
 namespace flstm {
 
@@ -559,7 +909,9 @@ void StreamingLstmForward(
     DeviceBuffer<__half> z_step_half_buffer;
     AllocateDeviceBuffer(z_step_half_buffer, z_rows * batch_size, "cudaMalloc z_step_half");
     DeviceBuffer<float> column_scale_buffer;
+    DeviceBuffer<float> column_scale_buffer_alt;
     AllocateDeviceBuffer(column_scale_buffer, batch_size, "cudaMalloc column_scale");
+    AllocateDeviceBuffer(column_scale_buffer_alt, batch_size, "cudaMalloc column_scale_alt");
 
     DeviceBuffer<float> h0_float;
     DeviceBuffer<float> c0_float;
@@ -699,10 +1051,10 @@ void StreamingLstmForward(
         CheckCuda(cudaStreamWaitEvent(compute_stream, x_ready[slot].evt, 0), "wait x chunk ready");
 
         const size_t chunk_start_step = chunk_idx * chunk_capacity;
-        const size_t chunk_input_elems = steps_in_chunk * batch_size * input_size;
-        if (chunk_input_elems > 0) {
-            const int convert_blocks = BlocksFor(chunk_input_elems, threads);
-            ConvertInputToZCacheKernel<<<convert_blocks, threads, 0, compute_stream>>>(
+        const size_t column_count = steps_in_chunk * batch_size;
+        if (column_count > 0) {
+            const dim3 convert_grid(static_cast<unsigned int>(column_count));
+            ConvertInputToZCacheKernel<<<convert_grid, threads, 0, compute_stream>>>(
                 x_chunk_buffers[slot].ptr,
                 z_chunk_float,
                 0,
@@ -724,8 +1076,24 @@ void StreamingLstmForward(
             CheckCuda(cudaGetLastError(), "SeedHiddenColumnKernel chunk");
         }
 
-        size_t next_checkpoint_step = static_cast<size_t>(-1);
-        size_t checkpoint_global_index = 0;
+        float *column_scale_cur = column_scale_buffer.ptr;
+        float *column_scale_next = column_scale_buffer_alt.ptr;
+
+        if (steps_in_chunk > 0) {
+            const float *z_step_float0 = z_chunk_float;
+            const int scale_blocks_init = static_cast<int>(batch_size);
+            ScaleAndPackColumnsKernel<<<scale_blocks_init, threads, 0, compute_stream>>>(
+                z_step_float0,
+                z_step_half_buffer.ptr,
+                column_scale_cur,
+                z_rows,
+                batch_size
+            );
+            CheckCuda(cudaGetLastError(), "ScaleAndPackColumnsKernel init");
+        }
+
+    size_t next_checkpoint_step = static_cast<size_t>(-1);
+    size_t checkpoint_global_index = 0;
         if (store_checkpoints && checkpoint_stride > 0) {
             const size_t chunk_end_step = chunk_start_step + steps_in_chunk;
             size_t aligned = (chunk_start_step + checkpoint_stride - 1) / checkpoint_stride;
@@ -743,18 +1111,6 @@ void StreamingLstmForward(
 
         for (size_t step = 0; step < steps_in_chunk; ++step) {
             const size_t global_step = chunk_start_step + step;
-            const size_t column_offset = step * batch_size;
-            float *z_step_float = z_chunk_float + column_offset * z_rows;
-            const int scale_blocks = static_cast<int>(batch_size);
-            const size_t shared_bytes = threads * sizeof(float);
-            ScaleAndPackColumnsKernel<<<scale_blocks, threads, shared_bytes, compute_stream>>>(
-                z_step_float,
-                z_step_half_buffer.ptr,
-                column_scale_buffer.ptr,
-                z_rows,
-                batch_size
-            );
-            CheckCuda(cudaGetLastError(), "ScaleAndPackColumnsKernel");
             __half *y_step = nullptr;
             if (needs_y_fallback && y_chunk_half[slot].ptr != nullptr) {
                 y_step = y_chunk_half[slot].ptr + step * bh_elements;
@@ -782,52 +1138,68 @@ void StreamingLstmForward(
                 }
             }
 
-            flstm::GemmTN(
-                static_cast<int>(gate_dim),
-                static_cast<int>(batch_size),
-                static_cast<int>(z_rows),
-                weight_cat_half.ptr,
-                static_cast<int>(z_rows),
-                z_step_half_buffer.ptr,
-                static_cast<int>(z_rows),
-                gate_pre_col.ptr,
-                static_cast<int>(gate_dim),
-                alpha_f,
-                beta_zero_f,
-                compute_stream
-            );
-            profiler.AddUseful(mfu::GemmFlops(gate_dim, batch_size, z_rows));
+        flstm::GemmTN(
+            static_cast<int>(gate_dim),
+            static_cast<int>(batch_size),
+            static_cast<int>(z_rows),
+            weight_cat_half.ptr,
+            static_cast<int>(z_rows),
+            z_step_half_buffer.ptr,
+            static_cast<int>(z_rows),
+            gate_pre_col.ptr,
+            static_cast<int>(gate_dim),
+            alpha_f,
+            beta_zero_f,
+            compute_stream
+        );
+        profiler.AddUseful(mfu::GemmFlops(gate_dim, batch_size, z_rows));
 
-            const bool has_next_column = (step + 1 < steps_in_chunk);
-            const size_t next_column_offset = has_next_column ? ((step + 1) * batch_size) : 0;
+        const bool has_next_column = (step + 1 < steps_in_chunk);
+        const size_t next_column_offset = has_next_column ? ((step + 1) * batch_size) : 0;
 
-            ForwardPointwiseKernel<<<point_blocks, threads, 0, compute_stream>>>(
-                gate_pre_col.ptr,
-                bias_fused.ptr,
-                c_prev.ptr,
-                h_prev.ptr,
-                h_next.ptr,
-                c_next.ptr,
-                y_step,
-                gate_cache_step,
-                nullptr,
-                nullptr,
-                z_chunk_float,
-                column_scale_buffer.ptr,
-                checkpoint_dst_h,
-                checkpoint_dst_c,
-                z_rows,
-                input_size,
-                has_next_column ? 1 : 0,
-                next_column_offset,
-                step + 1,
-                batch_size,
-                hidden_size
-            );
-            CheckCuda(cudaGetLastError(), "ForwardPointwiseKernel");
+        const int scale_blocks = static_cast<int>(batch_size);
+        PointwiseContext ctx{};
+        ctx.c_prev = c_prev.ptr;
+        ctx.h_prev = h_prev.ptr;
+        ctx.h_next = h_next.ptr;
+        ctx.c_next = c_next.ptr;
+        ctx.y_half_out = y_step;
+        ctx.gate_cache_step = gate_cache_step;
+        ctx.h_cache = nullptr;
+        ctx.c_cache = nullptr;
+        ctx.z_cache_col = z_chunk_float;
+        ctx.checkpoint_dst_h = checkpoint_dst_h;
+        ctx.checkpoint_dst_c = checkpoint_dst_c;
 
-            std::swap(h_prev.ptr, h_next.ptr);
-            std::swap(c_prev.ptr, c_next.ptr);
+        const bool has_next_step = (step + 1 < steps_in_chunk);
+        const float *next_z_cols = has_next_step ? (z_chunk_float + (step + 1) * batch_size * z_rows) : nullptr;
+        float *column_scale_out = has_next_step ? column_scale_next : nullptr;
+        __half *next_z_half = has_next_step ? z_step_half_buffer.ptr : nullptr;
+
+        ScalePackAndPointwiseKernel<<<scale_blocks, threads, 0, compute_stream>>>(
+            gate_pre_col.ptr,
+            bias_fused.ptr,
+            ctx,
+            column_scale_cur,
+            column_scale_out,
+            next_z_cols,
+            next_z_half,
+            z_rows,
+            batch_size,
+            hidden_size,
+            input_size,
+            step + 1,
+            has_next_step ? 1 : 0,
+            has_next_column ? 1 : 0,
+            next_column_offset
+        );
+        CheckCuda(cudaGetLastError(), "ScalePackAndPointwiseKernel");
+        if (has_next_step) {
+            std::swap(column_scale_cur, column_scale_next);
+        }
+
+        std::swap(h_prev.ptr, h_next.ptr);
+        std::swap(c_prev.ptr, c_next.ptr);
         }
 
         if (store_checkpoints) {

@@ -261,7 +261,7 @@ __global__ void SeedHiddenColumnKernel(
     z_cache_col[input_size + hidden_idx + batch_idx * z_rows] = value;
 }
 
-constexpr float kFp16SafeMax = 64000.0f;
+constexpr float kFp16SafeMax = 60000.0f;
 
 __global__ void ScaleAndPackColumnsKernel(
     const float *z_cols_float,   // (I+H, B) column-major float

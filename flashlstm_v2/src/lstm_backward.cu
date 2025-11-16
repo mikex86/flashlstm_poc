@@ -12,6 +12,7 @@
 #include <string>
 
 namespace {
+    using CellType = double;
     void CheckCuda(const cudaError_t err, const char *what) {
         if (err != cudaSuccess) {
             throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(err));
@@ -118,12 +119,36 @@ namespace {
         dst[idx] = __half2float(src[idx]);
     }
 
+    __global__ void HalfToDoubleKernel(const __half *src, double *dst, const size_t count) {
+        const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+        if (idx >= count) {
+            return;
+        }
+        dst[idx] = static_cast<double>(__half2float(src[idx]));
+    }
+
+    __global__ void DoubleToHalfKernel(const double *src, __half *dst, const size_t count) {
+        const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+        if (idx >= count) {
+            return;
+        }
+        dst[idx] = __double2half(src[idx]);
+    }
+
     __global__ void DoubleToFloatKernel(const double *src, float *dst, const size_t count) {
         const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
         if (idx >= count) {
             return;
         }
         dst[idx] = static_cast<float>(src[idx]);
+    }
+
+    __global__ void FloatToDoubleKernel(const float *src, double *dst, const size_t count) {
+        const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+        if (idx >= count) {
+            return;
+        }
+        dst[idx] = static_cast<double>(src[idx]);
     }
 
     __global__ void FuseWeightsKernel(
@@ -168,16 +193,15 @@ namespace {
     __global__ void BackwardPointwiseKernel(
         const __half *dY_row, // (B, H) row-major half
         const float *dh_next_row, // (B, H) row-major
-        const float *dc_next_row, // (B, H) row-major
+        const CellType *dc_next_row, // (B, H) row-major
         const float *gate_cache_row, // (B, 4H) row-major (i,f,g,o)
         const __half *y_row, // (B, H) row-major half
         float *dG_col_step, // (4H, B) column-major
         __half *dG_half_col_step, // (4H, B) column-major half
         float *dh_point_prev_col, // (H, B) column-major
-        float *dc_prev_row, // (B, H) row-major
+        CellType *dc_prev_row, // (B, H) row-major
         const size_t batch_size,
-        const size_t hidden_size,
-        const int use_fp64_state
+        const size_t hidden_size
     ) {
         const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
         const size_t total = batch_size * hidden_size;
@@ -188,83 +212,38 @@ namespace {
         const size_t hidden_idx = idx % hidden_size;
         const size_t gate_dim = 4 * hidden_size;
 
-        const float dh_total_f = __half2float(dY_row[idx]) + dh_next_row[idx];
-        const float dc_next_f = dc_next_row[idx];
+        const float dh_total = __half2float(dY_row[idx]) + dh_next_row[idx];
+        const float dc_next = dc_next_row[idx];
 
-        const float i_gate_f = gate_cache_row[batch_idx * gate_dim + hidden_idx + 0 * hidden_size];
-        const float f_gate_f = gate_cache_row[batch_idx * gate_dim + hidden_idx + 1 * hidden_size];
-        const float g_gate_f = gate_cache_row[batch_idx * gate_dim + hidden_idx + 2 * hidden_size];
-        const float o_gate_f = gate_cache_row[batch_idx * gate_dim + hidden_idx + 3 * hidden_size];
+        const float i_gate = gate_cache_row[batch_idx * gate_dim + hidden_idx + 0 * hidden_size];
+        const float f_gate = gate_cache_row[batch_idx * gate_dim + hidden_idx + 1 * hidden_size];
+        const float g_gate = gate_cache_row[batch_idx * gate_dim + hidden_idx + 2 * hidden_size];
+        const float o_gate = gate_cache_row[batch_idx * gate_dim + hidden_idx + 3 * hidden_size];
 
-        const float y_t_f = __half2float(y_row[idx]);
+        const float y_t = __half2float(y_row[idx]);
         constexpr float kEps = 1e-6f;
 
-        if (use_fp64_state) {
-            const double denom_o = fabs(o_gate_f) < kEps ? (o_gate_f >= 0.0f ? kEps : -kEps) : o_gate_f;
-            double tanh_c = static_cast<double>(y_t_f) / denom_o;
-            tanh_c = fmax(fmin(tanh_c, 1.0 - static_cast<double>(kEps)), -1.0 + static_cast<double>(kEps));
-            const double c_t = atanh(tanh_c);
+        const float denom_o = fabsf(o_gate) < kEps ? (o_gate >= 0.0f ? kEps : -kEps) : o_gate;
+        CellType tanh_c = static_cast<CellType>(y_t) / static_cast<CellType>(denom_o);
+        tanh_c = fmax(fmin(tanh_c, static_cast<CellType>(1.0 - kEps)), static_cast<CellType>(-1.0 + kEps));
+        const CellType c_t = atanh(tanh_c);
 
-            const double denom_f = fabs(f_gate_f) < kEps ? (f_gate_f >= 0.0f ? kEps : -kEps) : f_gate_f;
-            const double c_prev = (c_t - static_cast<double>(i_gate_f) * static_cast<double>(g_gate_f)) / denom_f;
+        const float denom_f = fabsf(f_gate) < kEps ? (f_gate >= 0.0f ? kEps : -kEps) : f_gate;
+        const CellType c_prev = (c_t - static_cast<CellType>(i_gate * g_gate)) / static_cast<CellType>(denom_f);
 
-            const double do_gate = static_cast<double>(dh_total_f) * tanh_c;
-            const double one_minus_tanh_sq = 1.0 - tanh_c * tanh_c;
-            const double dc_total = static_cast<double>(dc_next_f) + static_cast<double>(dh_total_f) *
-                    static_cast<double>(o_gate_f) * one_minus_tanh_sq;
+        const CellType do_gate = static_cast<CellType>(dh_total) * tanh_c;
+        const CellType one_minus_tanh_sq = 1.0 - tanh_c * tanh_c;
+        const CellType dc_total = dc_next + static_cast<CellType>(dh_total * o_gate) * one_minus_tanh_sq;
 
-            const double di = dc_total * static_cast<double>(g_gate_f);
-            const double df = dc_total * c_prev;
-            const double dg = dc_total * static_cast<double>(i_gate_f);
-            const double dc_prev = dc_total * static_cast<double>(f_gate_f);
+        const CellType di = dc_total * static_cast<CellType>(g_gate);
+        const CellType df = dc_total * c_prev;
+        const CellType dg = dc_total * static_cast<CellType>(i_gate);
+        const CellType dc_prev = dc_total * static_cast<CellType>(f_gate);
 
-            const double dai = di * static_cast<double>(i_gate_f) * (1.0 - static_cast<double>(i_gate_f));
-            const double daf = df * static_cast<double>(f_gate_f) * (1.0 - static_cast<double>(f_gate_f));
-            const double dag = dg * (1.0 - static_cast<double>(g_gate_f) * static_cast<double>(g_gate_f));
-            const double dao = do_gate * static_cast<double>(o_gate_f) * (1.0 - static_cast<double>(o_gate_f));
-
-            const size_t base = batch_idx * gate_dim;
-            const float dai_f = static_cast<float>(dai);
-            const float daf_f = static_cast<float>(daf);
-            const float dag_f = static_cast<float>(dag);
-            const float dao_f = static_cast<float>(dao);
-            dG_col_step[hidden_idx + base] = dai_f;
-            dG_col_step[hidden_idx + hidden_size + base] = daf_f;
-            dG_col_step[hidden_idx + 2 * hidden_size + base] = dag_f;
-            dG_col_step[hidden_idx + 3 * hidden_size + base] = dao_f;
-            if (dG_half_col_step != nullptr) {
-                dG_half_col_step[hidden_idx + base] = __float2half(dai_f);
-                dG_half_col_step[hidden_idx + hidden_size + base] = __float2half(daf_f);
-                dG_half_col_step[hidden_idx + 2 * hidden_size + base] = __float2half(dag_f);
-                dG_half_col_step[hidden_idx + 3 * hidden_size + base] = __float2half(dao_f);
-            }
-
-            dh_point_prev_col[hidden_idx + batch_idx * hidden_size] = 0.0f; // initialise accumulator
-            dc_prev_row[idx] = static_cast<float>(dc_prev);
-            return;
-        }
-
-        const float denom_o = fabsf(o_gate_f) < kEps ? (o_gate_f >= 0.0f ? kEps : -kEps) : o_gate_f;
-        float tanh_c = y_t_f / denom_o;
-        tanh_c = fmaxf(fminf(tanh_c, 1.0f - kEps), -1.0f + kEps);
-        const float c_t = atanhf(tanh_c);
-
-        const float denom_f = fabsf(f_gate_f) < kEps ? (f_gate_f >= 0.0f ? kEps : -kEps) : f_gate_f;
-        const float c_prev = (c_t - i_gate_f * g_gate_f) / denom_f;
-
-        const float do_gate = dh_total_f * tanh_c;
-        const float one_minus_tanh_sq = 1.0f - tanh_c * tanh_c;
-        const float dc_total = dc_next_f + dh_total_f * o_gate_f * one_minus_tanh_sq;
-
-        const float di = dc_total * g_gate_f;
-        const float df = dc_total * c_prev;
-        const float dg = dc_total * i_gate_f;
-        const float dc_prev = dc_total * f_gate_f;
-
-        const float dai = di * i_gate_f * (1.0f - i_gate_f);
-        const float daf = df * f_gate_f * (1.0f - f_gate_f);
-        const float dag = dg * (1.0f - g_gate_f * g_gate_f);
-        const float dao = do_gate * o_gate_f * (1.0f - o_gate_f);
+        const float dai = static_cast<float>(di * static_cast<CellType>(i_gate * (1.0f - i_gate)));
+        const float daf = static_cast<float>(df * static_cast<CellType>(f_gate * (1.0f - f_gate)));
+        const float dag = static_cast<float>(dg * static_cast<CellType>(1.0f - g_gate * g_gate));
+        const float dao = static_cast<float>(do_gate * static_cast<CellType>(o_gate * (1.0f - o_gate)));
 
         dG_col_step[hidden_idx + batch_idx * gate_dim] = dai;
         dG_col_step[hidden_idx + hidden_size + batch_idx * gate_dim] = daf;
@@ -381,9 +360,9 @@ namespace {
     __global__ void RecomputePointwiseKernel(
         const float *gate_col, // (4H, B) column-major
         const float *bias, // (4H,)
-        const float *c_prev, // (B, H) row-major
+        const CellType *c_prev, // (B, H) row-major
         float *h_next, // (B, H) row-major
-        float *c_next, // (B, H) row-major
+        CellType *c_next, // (B, H) row-major
         float *gate_out, // (B, 4H) row-major or nullptr
         const float *column_scale, // (B,) scaling factors for this step
         const size_t batch_size,
@@ -401,31 +380,32 @@ namespace {
         const size_t row_base = hidden_idx;
 
         const float scale = column_scale[col];
-        const float gi = gate_col[row_base + col * gate_dim] * scale + bias[row_base + 0 * hidden_size];
-        const float gf =
+        const CellType gi =
+            static_cast<CellType>(gate_col[row_base + col * gate_dim] * scale + bias[row_base + 0 * hidden_size]);
+        const CellType gf =
             gate_col[row_base + hidden_size + col * gate_dim] * scale + bias[row_base + 1 * hidden_size];
-        const float gg =
+        const CellType gg =
             gate_col[row_base + 2 * hidden_size + col * gate_dim] * scale + bias[row_base + 2 * hidden_size];
-        const float go =
+        const CellType go =
             gate_col[row_base + 3 * hidden_size + col * gate_dim] * scale + bias[row_base + 3 * hidden_size];
 
-        const float i_gate = 1.0f / (1.0f + expf(-gi));
-        const float f_gate = 1.0f / (1.0f + expf(-gf));
-        const float g_gate = tanhf(gg);
-        const float c_prev_val = c_prev[idx];
-        const float c_val = f_gate * c_prev_val + i_gate * g_gate;
-        const float o_gate = 1.0f / (1.0f + expf(-go));
-        const float h_val = o_gate * tanhf(c_val);
+        const CellType i_gate = 1.0 / (1.0 + exp(-gi));
+        const CellType f_gate = 1.0 / (1.0 + exp(-gf));
+        const CellType g_gate = tanh(gg);
+        const CellType c_prev_val = c_prev[idx];
+        const CellType c_val = f_gate * c_prev_val + i_gate * g_gate;
+        const CellType o_gate = 1.0 / (1.0 + exp(-go));
+        const CellType h_val = o_gate * tanh(c_val);
 
-        h_next[idx] = h_val;
+        h_next[idx] = static_cast<float>(h_val);
         c_next[idx] = c_val;
 
         if (gate_out != nullptr) {
             float *gate_ptr = gate_out + batch_idx * gate_dim;
-            gate_ptr[hidden_idx + 0 * hidden_size] = i_gate;
-            gate_ptr[hidden_idx + 1 * hidden_size] = f_gate;
-            gate_ptr[hidden_idx + 2 * hidden_size] = g_gate;
-            gate_ptr[hidden_idx + 3 * hidden_size] = o_gate;
+            gate_ptr[hidden_idx + 0 * hidden_size] = static_cast<float>(i_gate);
+            gate_ptr[hidden_idx + 1 * hidden_size] = static_cast<float>(f_gate);
+            gate_ptr[hidden_idx + 2 * hidden_size] = static_cast<float>(g_gate);
+            gate_ptr[hidden_idx + 3 * hidden_size] = static_cast<float>(o_gate);
         }
     }
 
@@ -532,11 +512,12 @@ namespace {
         const __half *x_tensor_host;
         const __half *y_tensor_host;
         const __half *dY_tensor_host;
-        DeviceBuffer<float> *checkpoint_half;
+        DeviceBuffer<float> *checkpoint_h;
+        DeviceBuffer<double> *checkpoint_h_double_quantized;
+        DeviceBuffer<CellType> *checkpoint_c;
+        DeviceBuffer<float> *checkpoint_c_float_quantized;
         DeviceBuffer<__half> *checkpoint_h_half_quantized;
         DeviceBuffer<__half> *checkpoint_c_half_quantized;
-        DeviceBuffer<double> *checkpoint_h_double_quantized;
-        DeviceBuffer<double> *checkpoint_c_double_quantized;
         DeviceBuffer<__half> *x_chunk_half;
         DeviceBuffer<__half> *y_chunk_half;
         DeviceBuffer<__half> *dY_chunk_half;
@@ -623,10 +604,10 @@ namespace {
         }
 
         if (params.checkpoint_cache_host.h_ptr != nullptr && params.checkpoint_cache_host.c_ptr != nullptr &&
-            params.checkpoint_half[slot].ptr != nullptr) {
+            params.checkpoint_h[slot].ptr != nullptr && params.checkpoint_c[slot].ptr != nullptr) {
             const size_t checkpoint_offset = checkpoint_index * params.bh_elements;
-            float *checkpoint_dst_h = params.checkpoint_half[slot].ptr;
-            float *checkpoint_dst_c = params.checkpoint_half[slot].ptr + params.bh_elements;
+            float *checkpoint_dst_h = params.checkpoint_h[slot].ptr;
+            CellType *checkpoint_dst_c = params.checkpoint_c[slot].ptr;
 
             if (params.options.h_dtype == flstm::GateCacheDType::kFloat32) {
                 const float *checkpoint_src_h =
@@ -677,15 +658,23 @@ namespace {
             }
 
             if (params.options.c_dtype == flstm::GateCacheDType::kFloat32) {
+                float *float_staging = params.checkpoint_c_float_quantized[slot].ptr;
                 const float *checkpoint_src_c =
                         reinterpret_cast<const float *>(params.checkpoint_cache_host.c_ptr) + checkpoint_offset;
                 CheckCuda(cudaMemcpyAsync(
-                              checkpoint_dst_c,
+                              float_staging,
                               checkpoint_src_c,
                               params.bh_elements * sizeof(float),
                               cudaMemcpyHostToDevice,
                               params.h2d_stream),
                           "copy checkpoint c state");
+                const int convert_blocks = BlocksFor(params.bh_elements, params.threads);
+                FloatToDoubleKernel<<<convert_blocks, params.threads, 0, params.h2d_stream>>>(
+                    float_staging,
+                    checkpoint_dst_c,
+                    params.bh_elements
+                );
+                CheckCuda(cudaGetLastError(), "FloatToDoubleKernel checkpoint c");
             } else if (params.options.c_dtype == flstm::GateCacheDType::kFloat16) {
                 __half *quantized = params.checkpoint_c_half_quantized[slot].ptr;
                 const __half *checkpoint_src_c =
@@ -698,30 +687,22 @@ namespace {
                               params.h2d_stream),
                           "copy checkpoint c state half");
                 const int convert_blocks = BlocksFor(params.bh_elements, params.threads);
-                HalfToFloatKernel<<<convert_blocks, params.threads, 0, params.h2d_stream>>>(
+                HalfToDoubleKernel<<<convert_blocks, params.threads, 0, params.h2d_stream>>>(
                     quantized,
                     checkpoint_dst_c,
                     params.bh_elements
                 );
-                CheckCuda(cudaGetLastError(), "HalfToFloatKernel checkpoint c");
+                CheckCuda(cudaGetLastError(), "HalfToDoubleKernel checkpoint c");
             } else {
-                double *quantized = params.checkpoint_c_double_quantized[slot].ptr;
                 const double *checkpoint_src_c =
                         reinterpret_cast<const double *>(params.checkpoint_cache_host.c_ptr) + checkpoint_offset;
                 CheckCuda(cudaMemcpyAsync(
-                              quantized,
+                              checkpoint_dst_c,
                               checkpoint_src_c,
                               params.bh_elements * sizeof(double),
                               cudaMemcpyHostToDevice,
                               params.h2d_stream),
                           "copy checkpoint c state double");
-                const int convert_blocks = BlocksFor(params.bh_elements, params.threads);
-                DoubleToFloatKernel<<<convert_blocks, params.threads, 0, params.h2d_stream>>>(
-                    quantized,
-                    checkpoint_dst_c,
-                    params.bh_elements
-                );
-                CheckCuda(cudaGetLastError(), "DoubleToFloatKernel checkpoint c");
             }
         }
 
@@ -796,11 +777,12 @@ namespace flstm {
         constexpr size_t kChunkSteps = 32;
 
         DeviceBuffer<float> d_hn_float;
-        DeviceBuffer<float> d_cn_float;
+        DeviceBuffer<CellType> d_cn_float;
         DeviceBuffer<float> dh_cur;
         DeviceBuffer<float> dh_tmp;
-        DeviceBuffer<float> dc_cur;
-        DeviceBuffer<float> dc_tmp;
+        DeviceBuffer<CellType> dc_cur;
+        DeviceBuffer<CellType> dc_tmp;
+        DeviceBuffer<float> dc0_float_tmp;
         DeviceBuffer<__half> weight_cat_col;
         DeviceBuffer<float> db_buffer;
         DeviceBuffer<float> bias_fused;
@@ -818,8 +800,8 @@ namespace flstm {
             ZeroDeviceMemory(d_hn_float.ptr, bh_elements, compute_stream, "memset d_hn");
         }
         if (d_cn_device != nullptr) {
-            HalfToFloatKernel<<<bh_blocks, threads, 0, compute_stream>>>(d_cn_device, d_cn_float.ptr, bh_elements);
-            CheckCuda(cudaGetLastError(), "HalfToFloatKernel d_cn");
+            HalfToDoubleKernel<<<bh_blocks, threads, 0, compute_stream>>>(d_cn_device, d_cn_float.ptr, bh_elements);
+            CheckCuda(cudaGetLastError(), "HalfToDoubleKernel d_cn");
         } else {
             ZeroDeviceMemory(d_cn_float.ptr, bh_elements, compute_stream, "memset d_cn");
         }
@@ -828,6 +810,7 @@ namespace flstm {
         AllocateDeviceBuffer(dh_tmp, bh_elements, "cudaMalloc dh_tmp");
         AllocateDeviceBuffer(dc_cur, bh_elements, "cudaMalloc dc_cur");
         AllocateDeviceBuffer(dc_tmp, bh_elements, "cudaMalloc dc_tmp");
+        AllocateDeviceBuffer(dc0_float_tmp, bh_elements, "cudaMalloc dc0_float_tmp");
         CheckCuda(cudaMemcpyAsync(
                       dh_cur.ptr,
                       d_hn_float.ptr,
@@ -838,7 +821,7 @@ namespace flstm {
         CheckCuda(cudaMemcpyAsync(
                       dc_cur.ptr,
                       d_cn_float.ptr,
-                      bh_elements * sizeof(float),
+                      bh_elements * sizeof(CellType),
                       cudaMemcpyDeviceToDevice,
                       compute_stream),
                   "copy d_cn");
@@ -881,15 +864,16 @@ namespace flstm {
         DeviceBuffer<float> dX_chunk_col[2];
         DeviceBuffer<__half> dx_chunk_half[2];
         DeviceBuffer<__half> y_prev_half[2];
-        DeviceBuffer<float> checkpoint_half[2];
+        DeviceBuffer<float> checkpoint_h[2];
+        DeviceBuffer<double> checkpoint_h_double_quantized[2];
+        DeviceBuffer<CellType> checkpoint_c[2];
+        DeviceBuffer<float> checkpoint_c_float_quantized[2];
         DeviceBuffer<__half> checkpoint_h_half_quantized[2];
         DeviceBuffer<__half> checkpoint_c_half_quantized[2];
-        DeviceBuffer<double> checkpoint_h_double_quantized[2];
-        DeviceBuffer<double> checkpoint_c_double_quantized[2];
         DeviceBuffer<float> recompute_h_prev;
         DeviceBuffer<float> recompute_h_next;
-        DeviceBuffer<float> recompute_c_prev;
-        DeviceBuffer<float> recompute_c_next;
+        DeviceBuffer<CellType> recompute_c_prev;
+        DeviceBuffer<CellType> recompute_c_next;
         DeviceBuffer<float> z_step_float;
         DeviceBuffer<__half> z_step_half;
         DeviceBuffer<float> column_scale_tmp;
@@ -898,7 +882,6 @@ namespace flstm {
         const size_t z_chunk_elements = z_rows * chunk_tb_capacity;
         const size_t dX_chunk_elements = input_size * chunk_tb_capacity;
         const size_t dG_chunk_elements = gate_dim * chunk_tb_capacity;
-        const size_t checkpoint_half_elements = 2 * bh_elements;
         const size_t z_step_elements = z_rows * batch_size;
         const size_t gate_step_elements = gate_dim * batch_size;
 
@@ -912,22 +895,23 @@ namespace flstm {
         AllocateDeviceBufferArray(dG_chunk_col, dG_chunk_elements, "cudaMalloc dG_chunk_col");
         AllocateDeviceBufferArray(dG_chunk_half, dG_chunk_elements, "cudaMalloc dG_chunk_half");
         AllocateDeviceBufferArray(y_prev_half, bh_elements, "cudaMalloc y_prev_half");
-        AllocateDeviceBufferArray(checkpoint_half, checkpoint_half_elements, "cudaMalloc checkpoint_half");
+        AllocateDeviceBufferArray(checkpoint_h, bh_elements, "cudaMalloc checkpoint_h");
+        AllocateDeviceBufferArray(checkpoint_c, bh_elements, "cudaMalloc checkpoint_c");
         const bool checkpoint_h_is_half = (options.h_dtype == flstm::GateCacheDType::kFloat16);
-        const bool checkpoint_c_is_half = (options.c_dtype == flstm::GateCacheDType::kFloat16);
         const bool checkpoint_h_is_double = (options.h_dtype == flstm::GateCacheDType::kFloat64);
-        const bool checkpoint_c_is_double = (options.c_dtype == flstm::GateCacheDType::kFloat64);
+        const bool checkpoint_c_is_half = (options.c_dtype == flstm::GateCacheDType::kFloat16);
+        const bool checkpoint_c_is_float = (options.c_dtype == flstm::GateCacheDType::kFloat32);
         if (checkpoint_h_is_half) {
             AllocateDeviceBufferArray(checkpoint_h_half_quantized, bh_elements, "cudaMalloc checkpoint_h_quantized");
+        }
+        if (checkpoint_h_is_double) {
+            AllocateDeviceBufferArray(checkpoint_h_double_quantized, bh_elements, "cudaMalloc checkpoint_h_double");
         }
         if (checkpoint_c_is_half) {
             AllocateDeviceBufferArray(checkpoint_c_half_quantized, bh_elements, "cudaMalloc checkpoint_c_quantized");
         }
-        if (checkpoint_h_is_double) {
-            AllocateDeviceBufferArray(checkpoint_h_double_quantized, bh_elements, "cudaMalloc checkpoint_h_double_quantized");
-        }
-        if (checkpoint_c_is_double) {
-            AllocateDeviceBufferArray(checkpoint_c_double_quantized, bh_elements, "cudaMalloc checkpoint_c_double_quantized");
+        if (checkpoint_c_is_float) {
+            AllocateDeviceBufferArray(checkpoint_c_float_quantized, bh_elements, "cudaMalloc checkpoint_c_float");
         }
         AllocateDeviceBuffer(bias_fused, gate_dim, "cudaMalloc bias_fused");
         AllocateDeviceBuffer(recompute_h_prev, bh_elements, "cudaMalloc recompute_h_prev");
@@ -955,8 +939,6 @@ namespace flstm {
         const float beta_zero = 0.0f;
         const float beta_one = 1.0f;
         const int point_blocks = BlocksFor(bh_elements, threads);
-        const int use_fp64_state = (options.h_dtype == flstm::GateCacheDType::kFloat64 ||
-                                    options.c_dtype == flstm::GateCacheDType::kFloat64) ? 1 : 0;
 
         CudaEvent h2d_ready[2];
         CudaEvent compute_done[2];
@@ -984,11 +966,12 @@ namespace flstm {
             .x_tensor_host = x_tensor_host,
             .y_tensor_host = y_tensor_host,
             .dY_tensor_host = dY_tensor_host,
-            .checkpoint_half = checkpoint_half,
+            .checkpoint_h = checkpoint_h,
+            .checkpoint_h_double_quantized = checkpoint_h_double_quantized,
+            .checkpoint_c = checkpoint_c,
+            .checkpoint_c_float_quantized = checkpoint_c_float_quantized,
             .checkpoint_h_half_quantized = checkpoint_h_half_quantized,
             .checkpoint_c_half_quantized = checkpoint_c_half_quantized,
-            .checkpoint_h_double_quantized = checkpoint_h_double_quantized,
-            .checkpoint_c_double_quantized = checkpoint_c_double_quantized,
             .x_chunk_half = x_chunk_half,
             .y_chunk_half = y_chunk_half,
             .dY_chunk_half = dY_chunk_half,
@@ -1083,15 +1066,15 @@ namespace flstm {
             if (recompute_steps > 0) {
                 CheckCuda(cudaMemcpyAsync(
                               recompute_h_prev.ptr,
-                              checkpoint_half[slot].ptr,
+                              checkpoint_h[slot].ptr,
                               bh_elements * sizeof(float),
                               cudaMemcpyDeviceToDevice,
                               compute_stream),
                           "copy checkpoint h");
                 CheckCuda(cudaMemcpyAsync(
                               recompute_c_prev.ptr,
-                              checkpoint_half[slot].ptr + bh_elements,
-                              bh_elements * sizeof(float),
+                              checkpoint_c[slot].ptr,
+                              bh_elements * sizeof(CellType),
                               cudaMemcpyDeviceToDevice,
                               compute_stream),
                           "copy checkpoint c");
@@ -1167,7 +1150,7 @@ namespace flstm {
                 float *dG_step = dG_chunk_col[slot].ptr + local_offset * gate_dim;
                 __half *dG_half_step = dG_chunk_half[slot].ptr + local_offset * gate_dim;
                 float *dh_out = dh_tmp.ptr;
-                float *dc_out = dc_tmp.ptr;
+                CellType *dc_out = dc_tmp.ptr;
 
                 const __half *dY_t = dY_chunk_half[slot].ptr + static_cast<size_t>(step) * bh_elements;
                 const float *gate_step = gate_chunk_float[slot].ptr + static_cast<size_t>(step) * batch_size * gate_dim;
@@ -1184,8 +1167,7 @@ namespace flstm {
                     dh_out,
                     dc_out,
                     batch_size,
-                    hidden_size,
-                    use_fp64_state
+                    hidden_size
                 );
                 CheckCuda(cudaGetLastError(), "BackwardPointwiseKernel");
 
@@ -1346,9 +1328,16 @@ namespace flstm {
                       cudaMemcpyDeviceToDevice,
                       compute_stream),
                   "copy dh0");
+        const int dc0_blocks = BlocksFor(bh_elements, threads);
+        DoubleToFloatKernel<<<dc0_blocks, threads, 0, compute_stream>>>(
+            dc_cur.ptr,
+            dc0_float_tmp.ptr,
+            bh_elements
+        );
+        CheckCuda(cudaGetLastError(), "DoubleToFloatKernel dc0");
         CheckCuda(cudaMemcpyAsync(
                       dc0_out,
-                      dc_cur.ptr,
+                      dc0_float_tmp.ptr,
                       bh_elements * sizeof(float),
                       cudaMemcpyDeviceToDevice,
                       compute_stream),

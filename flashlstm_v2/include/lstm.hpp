@@ -9,7 +9,6 @@ namespace flstm {
 enum class GateCacheDType : int {
     kFloat32 = 0,
     kFloat16 = 1,
-    kFloat64 = 2,
 };
 
 struct GateCacheHost {
@@ -135,7 +134,6 @@ extern "C" {
 typedef enum {
     FLSTM_GATE_CACHE_FLOAT32 = 0,
     FLSTM_GATE_CACHE_FLOAT16 = 1,
-    FLSTM_GATE_CACHE_FLOAT64 = 2,
 } flstm_GateCacheDType;
 
 typedef struct {

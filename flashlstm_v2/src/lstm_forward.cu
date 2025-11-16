@@ -13,8 +13,6 @@
 
 namespace {
 
-using CellType = double;
-
 inline void CheckCuda(cudaError_t err, const char *what) {
     if (err != cudaSuccess) {
         throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(err));
@@ -30,7 +28,6 @@ inline const char *GateCacheDTypeName(flstm::GateCacheDType dtype) {
     switch (dtype) {
         case flstm::GateCacheDType::kFloat32: return "float32";
         case flstm::GateCacheDType::kFloat16: return "float16";
-        case flstm::GateCacheDType::kFloat64: return "float64";
     }
     return "unknown";
 }
@@ -39,7 +36,6 @@ inline size_t GateCacheDTypeSize(flstm::GateCacheDType dtype) {
     switch (dtype) {
         case flstm::GateCacheDType::kFloat32: return sizeof(float);
         case flstm::GateCacheDType::kFloat16: return sizeof(__half);
-        case flstm::GateCacheDType::kFloat64: return sizeof(double);
     }
     throw std::runtime_error("Unsupported gate cache dtype");
 }
@@ -49,7 +45,6 @@ inline void ValidateGateCacheOptions(const flstm::StreamingLstmOptions &options)
         switch (dtype) {
             case flstm::GateCacheDType::kFloat32:
             case flstm::GateCacheDType::kFloat16:
-            case flstm::GateCacheDType::kFloat64:
                 return;
             default:
                 throw std::runtime_error(std::string("Unsupported gate cache dtype for ") + label
@@ -174,44 +169,12 @@ __global__ void HalfToFloatKernel(const __half *src, float *dst, size_t count) {
     dst[idx] = __half2float(src[idx]);
 }
 
-__global__ void HalfToDoubleKernel(const __half *src, double *dst, size_t count) {
-    const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= count) {
-        return;
-    }
-    dst[idx] = static_cast<double>(__half2float(src[idx]));
-}
-
 __global__ void FloatToHalfKernel(const float *src, __half *dst, size_t count) {
     const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= count) {
         return;
     }
     dst[idx] = __float2half(src[idx]);
-}
-
-__global__ void DoubleToHalfKernel(const double *src, __half *dst, size_t count) {
-    const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= count) {
-        return;
-    }
-    dst[idx] = __double2half(src[idx]);
-}
-
-__global__ void DoubleToFloatKernel(const double *src, float *dst, size_t count) {
-    const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= count) {
-        return;
-    }
-    dst[idx] = static_cast<float>(src[idx]);
-}
-
-__global__ void FloatToDoubleKernel(const float *src, double *dst, size_t count) {
-    const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= count) {
-        return;
-    }
-    dst[idx] = static_cast<double>(src[idx]);
 }
 
 __global__ void FuseWeightsKernel(
@@ -359,10 +322,10 @@ __global__ void ScaleAndPackColumnsKernel(
 __global__ void ForwardPointwiseKernel(
     const float *gate_col,         // (4H, B) column-major
     const float *bias,             // (4H,)
-    const CellType *c_prev,        // (B, H) row-major
+    const float *c_prev,           // (B, H) row-major
     const float *h_prev,           // (B, H) row-major
     float *h_next,                 // (B, H) row-major
-    CellType *c_next,              // (B, H) row-major
+    float *c_next,                 // (B, H) row-major
     __half *y_half_out,            // (B, H) row-major half or nullptr
     __half *gate_cache_step,       // (B, 4H) row-major
     __half *h_cache,               // (T+1, B, H) row-major
@@ -370,7 +333,7 @@ __global__ void ForwardPointwiseKernel(
     float *z_cache_col,            // (I+H, T*B) column-major float staging
     const float *column_scale,     // (B,) scaling factors for this step
     float *checkpoint_dst_h,       // (B, H) row-major float or nullptr
-    CellType *checkpoint_dst_c,    // (B, H) row-major CellType or nullptr
+    float *checkpoint_dst_c,       // (B, H) row-major float or nullptr
     size_t z_rows,
     size_t input_size,
     int has_next_column,
@@ -392,53 +355,52 @@ __global__ void ForwardPointwiseKernel(
     const size_t state_index = batch_idx * hidden_size + hidden_idx;
 
     const float scale = column_scale[col];
-    const CellType gi = static_cast<CellType>(gate_col[row_base + col * gate_dim] * scale
-                                              + bias[row_base + 0 * hidden_size]);
-    const CellType gf =
+    const float gi = gate_col[row_base + col * gate_dim] * scale + bias[row_base + 0 * hidden_size];
+    const float gf =
         gate_col[row_base + hidden_size + col * gate_dim] * scale + bias[row_base + 1 * hidden_size];
-    const CellType gg =
+    const float gg =
         gate_col[row_base + 2 * hidden_size + col * gate_dim] * scale + bias[row_base + 2 * hidden_size];
-    const CellType go =
+    const float go =
         gate_col[row_base + 3 * hidden_size + col * gate_dim] * scale + bias[row_base + 3 * hidden_size];
 
-    const CellType i_gate = 1.0 / (1.0 + exp(-gi));
-    const CellType f_gate = 1.0 / (1.0 + exp(-gf));
-    const CellType g_gate = tanh(gg);
-    const CellType c_prev_val = c_prev[state_index];
+    const float i_gate = 1.0f / (1.0f + expf(-gi));
+    const float f_gate = 1.0f / (1.0f + expf(-gf));
+    const float g_gate = tanhf(gg);
+    const float c_prev_val = c_prev[state_index];
     if (checkpoint_dst_c != nullptr) {
         checkpoint_dst_c[state_index] = c_prev_val;
     }
     if (checkpoint_dst_h != nullptr && h_prev != nullptr) {
         checkpoint_dst_h[state_index] = h_prev[state_index];
     }
-    const CellType c_val = f_gate * c_prev_val + i_gate * g_gate;
-    const CellType o_gate = 1.0 / (1.0 + exp(-go));
-    const CellType h_val = o_gate * tanh(c_val);
+    const float c_val = f_gate * c_prev_val + i_gate * g_gate;
+    const float o_gate = 1.0f / (1.0f + expf(-go));
+    const float h_val = o_gate * tanhf(c_val);
 
-    h_next[state_index] = static_cast<float>(h_val);
+    h_next[state_index] = h_val;
     c_next[state_index] = c_val;
     if (y_half_out != nullptr) {
-        y_half_out[state_index] = __float2half(static_cast<float>(h_val));
+        y_half_out[state_index] = __float2half(h_val);
     }
 
     if (gate_cache_step != nullptr) {
         __half *gate_ptr = gate_cache_step + batch_idx * gate_dim;
-        gate_ptr[hidden_idx + 0 * hidden_size] = __float2half(static_cast<float>(i_gate));
-        gate_ptr[hidden_idx + 1 * hidden_size] = __float2half(static_cast<float>(f_gate));
-        gate_ptr[hidden_idx + 2 * hidden_size] = __float2half(static_cast<float>(g_gate));
-        gate_ptr[hidden_idx + 3 * hidden_size] = __float2half(static_cast<float>(o_gate));
+        gate_ptr[hidden_idx + 0 * hidden_size] = __float2half(i_gate);
+        gate_ptr[hidden_idx + 1 * hidden_size] = __float2half(f_gate);
+        gate_ptr[hidden_idx + 2 * hidden_size] = __float2half(g_gate);
+        gate_ptr[hidden_idx + 3 * hidden_size] = __float2half(o_gate);
     }
     if (h_cache != nullptr) {
         __half *dst = h_cache + cache_index * (batch_size * hidden_size);
-        dst[batch_idx * hidden_size + hidden_idx] = __float2half(static_cast<float>(h_val));
+        dst[batch_idx * hidden_size + hidden_idx] = __float2half(h_val);
     }
     if (c_cache != nullptr) {
         __half *dst = c_cache + cache_index * (batch_size * hidden_size);
-        dst[batch_idx * hidden_size + hidden_idx] = __double2half(c_val);
+        dst[batch_idx * hidden_size + hidden_idx] = __float2half(c_val);
     }
     if (has_next_column && z_cache_col != nullptr) {
         const size_t column = next_column_offset + batch_idx;
-        z_cache_col[input_size + hidden_idx + column * z_rows] = static_cast<float>(h_val);
+        z_cache_col[input_size + hidden_idx + column * z_rows] = h_val;
     }
 }
 
@@ -600,11 +562,11 @@ void StreamingLstmForward(
     AllocateDeviceBuffer(column_scale_buffer, batch_size, "cudaMalloc column_scale");
 
     DeviceBuffer<float> h0_float;
-    DeviceBuffer<CellType> c0_float;
+    DeviceBuffer<float> c0_float;
     DeviceBuffer<float> h_prev;
-    DeviceBuffer<CellType> c_prev;
+    DeviceBuffer<float> c_prev;
     DeviceBuffer<float> h_next;
-    DeviceBuffer<CellType> c_next;
+    DeviceBuffer<float> c_next;
     DeviceBuffer<float> gate_pre_col;
     DeviceBuffer<__half> weight_cat_half;
     DeviceBuffer<float> bias_fused;
@@ -613,8 +575,8 @@ void StreamingLstmForward(
     AllocateDeviceBuffer(c0_float, bh_elements, "cudaMalloc c0_float");
     HalfToFloatKernel<<<bh_blocks, threads, 0, compute_stream>>>(h_0_device, h0_float.ptr, bh_elements);
     CheckCuda(cudaGetLastError(), "HalfToFloatKernel h0");
-    HalfToDoubleKernel<<<bh_blocks, threads, 0, compute_stream>>>(c_0_device, c0_float.ptr, bh_elements);
-    CheckCuda(cudaGetLastError(), "HalfToDoubleKernel c0");
+    HalfToFloatKernel<<<bh_blocks, threads, 0, compute_stream>>>(c_0_device, c0_float.ptr, bh_elements);
+    CheckCuda(cudaGetLastError(), "HalfToFloatKernel c0");
 
     AllocateDeviceBuffer(h_prev, bh_elements, "cudaMalloc h_prev");
     AllocateDeviceBuffer(c_prev, bh_elements, "cudaMalloc c_prev");
@@ -630,7 +592,7 @@ void StreamingLstmForward(
     CheckCuda(cudaMemcpyAsync(
                   c_prev.ptr,
                   c0_float.ptr,
-                  bh_elements * sizeof(CellType),
+                  bh_elements * sizeof(float),
                   cudaMemcpyDeviceToDevice,
                   compute_stream),
               "copy c0 -> c_prev");
@@ -666,25 +628,14 @@ void StreamingLstmForward(
 
     const size_t max_checkpoints_per_chunk = std::max<size_t>(1, (chunk_capacity + checkpoint_stride - 1) / checkpoint_stride + 1);
     DeviceBuffer<float> checkpoint_chunks_h[2];
-    DeviceBuffer<CellType> checkpoint_chunks_c[2];
-    DeviceBuffer<double> checkpoint_chunks_h_double[2];
-    DeviceBuffer<float> checkpoint_chunks_c_float[2];
+    DeviceBuffer<float> checkpoint_chunks_c[2];
     DeviceBuffer<__half> checkpoint_chunks_h_half[2];
     DeviceBuffer<__half> checkpoint_chunks_c_half[2];
     const bool h_cache_uses_half = (options.h_dtype == GateCacheDType::kFloat16);
-    const bool h_cache_uses_double = (options.h_dtype == GateCacheDType::kFloat64);
     const bool c_cache_uses_half = (options.c_dtype == GateCacheDType::kFloat16);
-    const bool c_cache_uses_double = (options.c_dtype == GateCacheDType::kFloat64);
-    const bool c_cache_uses_float = (options.c_dtype == GateCacheDType::kFloat32);
     if (store_checkpoints) {
         AllocateDeviceBufferArray(checkpoint_chunks_h, max_checkpoints_per_chunk * bh_elements, "cudaMalloc checkpoint_chunk_h");
         AllocateDeviceBufferArray(checkpoint_chunks_c, max_checkpoints_per_chunk * bh_elements, "cudaMalloc checkpoint_chunk_c");
-        if (h_cache_uses_double) {
-            AllocateDeviceBufferArray(checkpoint_chunks_h_double, max_checkpoints_per_chunk * bh_elements, "cudaMalloc checkpoint_chunk_h_double");
-        }
-        if (c_cache_uses_float) {
-            AllocateDeviceBufferArray(checkpoint_chunks_c_float, max_checkpoints_per_chunk * bh_elements, "cudaMalloc checkpoint_chunk_c_float");
-        }
         if (h_cache_uses_half) {
             AllocateDeviceBufferArray(checkpoint_chunks_h_half, max_checkpoints_per_chunk * bh_elements, "cudaMalloc checkpoint_chunk_h_half");
         }
@@ -808,9 +759,9 @@ void StreamingLstmForward(
             if (needs_y_fallback && y_chunk_half[slot].ptr != nullptr) {
                 y_step = y_chunk_half[slot].ptr + step * bh_elements;
             }
-    __half *gate_cache_step = nullptr;
-    float *checkpoint_dst_h = nullptr;
-    CellType *checkpoint_dst_c = nullptr;
+            __half *gate_cache_step = nullptr;
+            float *checkpoint_dst_h = nullptr;
+            float *checkpoint_dst_c = nullptr;
 
             if (store_checkpoints && next_checkpoint_step != static_cast<size_t>(-1) &&
                 global_step == next_checkpoint_step) {
@@ -890,31 +841,15 @@ void StreamingLstmForward(
                         checkpoint_elements_chunk
                     );
                     CheckCuda(cudaGetLastError(), "FloatToHalfKernel checkpoint h");
-                } else if (h_cache_uses_double) {
-                    const int convert_blocks = BlocksFor(checkpoint_elements_chunk, threads);
-                    FloatToDoubleKernel<<<convert_blocks, threads, 0, compute_stream>>>(
-                        checkpoint_chunks_h[slot].ptr,
-                        checkpoint_chunks_h_double[slot].ptr,
-                        checkpoint_elements_chunk
-                    );
-                    CheckCuda(cudaGetLastError(), "FloatToDoubleKernel checkpoint h");
                 }
                 if (c_cache_uses_half) {
                     const int convert_blocks = BlocksFor(checkpoint_elements_chunk, threads);
-                    DoubleToHalfKernel<<<convert_blocks, threads, 0, compute_stream>>>(
+                    FloatToHalfKernel<<<convert_blocks, threads, 0, compute_stream>>>(
                         checkpoint_chunks_c[slot].ptr,
                         checkpoint_chunks_c_half[slot].ptr,
                         checkpoint_elements_chunk
                     );
-                    CheckCuda(cudaGetLastError(), "DoubleToHalfKernel checkpoint c");
-                } else if (c_cache_uses_float) {
-                    const int convert_blocks = BlocksFor(checkpoint_elements_chunk, threads);
-                    DoubleToFloatKernel<<<convert_blocks, threads, 0, compute_stream>>>(
-                        checkpoint_chunks_c[slot].ptr,
-                        checkpoint_chunks_c_float[slot].ptr,
-                        checkpoint_elements_chunk
-                    );
-                    CheckCuda(cudaGetLastError(), "DoubleToFloatKernel checkpoint c");
+                    CheckCuda(cudaGetLastError(), "FloatToHalfKernel checkpoint c");
                 }
             }
         }
@@ -929,17 +864,7 @@ void StreamingLstmForward(
             if (checkpoint_count_chunk > 0) {
                 const size_t dst_offset = checkpoint_host_offsets[slot] * bh_elements;
                 const size_t chunk_elements = checkpoint_count_chunk * bh_elements;
-                if (h_cache_uses_double) {
-                    double *dst = reinterpret_cast<double *>(gate_cache_host.h_ptr) + dst_offset;
-                    const double *src = checkpoint_chunks_h_double[slot].ptr;
-                    CheckCuda(cudaMemcpyAsync(
-                                  dst,
-                                  src,
-                                  chunk_elements * sizeof(double),
-                                  cudaMemcpyDeviceToHost,
-                                  d2h_stream),
-                              "copy checkpoint h chunk double");
-                } else if (!h_cache_uses_half) {
+                if (!h_cache_uses_half) {
                     float *dst = reinterpret_cast<float *>(gate_cache_host.h_ptr) + dst_offset;
                     const float *src = checkpoint_chunks_h[slot].ptr;
                     CheckCuda(cudaMemcpyAsync(
@@ -961,19 +886,9 @@ void StreamingLstmForward(
                               "copy checkpoint h chunk half");
                 }
 
-                if (c_cache_uses_double) {
-                    double *dst = reinterpret_cast<double *>(gate_cache_host.c_ptr) + dst_offset;
-                    const double *src = checkpoint_chunks_c[slot].ptr;
-                    CheckCuda(cudaMemcpyAsync(
-                                  dst,
-                                  src,
-                                  chunk_elements * sizeof(double),
-                                  cudaMemcpyDeviceToHost,
-                                  d2h_stream),
-                              "copy checkpoint c chunk double");
-                } else if (c_cache_uses_float) {
+                if (!c_cache_uses_half) {
                     float *dst = reinterpret_cast<float *>(gate_cache_host.c_ptr) + dst_offset;
-                    const float *src = checkpoint_chunks_c_float[slot].ptr;
+                    const float *src = checkpoint_chunks_c[slot].ptr;
                     CheckCuda(cudaMemcpyAsync(
                                   dst,
                                   src,
@@ -1036,12 +951,12 @@ void StreamingLstmForward(
 
     if (cy_device != nullptr) {
         const int cy_blocks = BlocksFor(bh_elements, threads);
-        DoubleToHalfKernel<<<cy_blocks, threads, 0, compute_stream>>>(
+        FloatToHalfKernel<<<cy_blocks, threads, 0, compute_stream>>>(
             c_prev.ptr,
             cy_device,
             bh_elements
         );
-        CheckCuda(cudaGetLastError(), "DoubleToHalfKernel cy");
+        CheckCuda(cudaGetLastError(), "FloatToHalfKernel cy");
     }
 
     CheckCuda(cudaStreamSynchronize(h2d_stream), "final h2d transfer sync");

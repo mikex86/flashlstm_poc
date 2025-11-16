@@ -640,17 +640,18 @@ namespace {
 } // namespace
 
 namespace flstm {
-    void StreamingLstmBackward(
-        size_t time_steps,
-        size_t batch_size,
-        size_t input_size,
-        size_t hidden_size,
-        size_t recompute_interval,
+void StreamingLstmBackward(
+    size_t time_steps,
+    size_t batch_size,
+    size_t input_size,
+    size_t hidden_size,
+    size_t recompute_interval,
+    size_t weight_set_count,
 
-        const __half *x_tensor_host,
-        const __half *y_tensor_host,
-        GateCacheHost gate_cache_host,
-        StreamingLstmOptions options,
+    const __half *x_tensor_host,
+    const __half *y_tensor_host,
+    GateCacheHost gate_cache_host,
+    StreamingLstmOptions options,
 
         const __half *dY_tensor_host,
         const __half *d_hn_device,
@@ -683,6 +684,9 @@ namespace flstm {
         ValidateGateCacheOptions(options);
         if (recompute_interval == 0) {
             throw std::runtime_error("StreamingLstmBackward requires recompute_interval >= 1");
+        }
+        if (weight_set_count == 0) {
+            throw std::runtime_error("StreamingLstmBackward requires weight_set_count >= 1");
         }
         if (x_tensor_host == nullptr || y_tensor_host == nullptr || gate_cache_host.h_ptr == nullptr ||
             gate_cache_host.c_ptr == nullptr ||
@@ -749,20 +753,28 @@ namespace flstm {
                       compute_stream),
                   "copy d_cn");
 
-        const size_t weight_elems = z_rows * gate_dim;
+        const size_t weight_elems = weight_set_count * z_rows * gate_dim;
         AllocateDeviceBuffer(weight_cat_col, weight_elems, "cudaMalloc weight_cat_col");
-        const int weight_blocks = BlocksFor(weight_elems, threads);
-        FuseWeightsKernel<<<weight_blocks, threads, 0, compute_stream>>>(
-            weights_ih,
-            weights_hh,
-            weight_cat_col.ptr,
-            input_size,
-            hidden_size
-        );
-        CheckCuda(cudaGetLastError(), "FuseWeightsKernel");
+        const size_t weight_ih_stride = gate_dim * input_size;
+        const size_t weight_hh_stride = gate_dim * hidden_size;
+        const size_t bias_elements = weight_set_count * gate_dim;
+        for (size_t set_idx = 0; set_idx < weight_set_count; ++set_idx) {
+            const int weight_blocks = BlocksFor(z_rows * gate_dim, threads);
+            __half *weight_out = weight_cat_col.ptr + set_idx * z_rows * gate_dim;
+            const float *weight_ih_ptr = weights_ih + set_idx * weight_ih_stride;
+            const float *weight_hh_ptr = weights_hh + set_idx * weight_hh_stride;
+            FuseWeightsKernel<<<weight_blocks, threads, 0, compute_stream>>>(
+                weight_ih_ptr,
+                weight_hh_ptr,
+                weight_out,
+                input_size,
+                hidden_size
+            );
+            CheckCuda(cudaGetLastError(), "FuseWeightsKernel");
+        }
 
-        AllocateDeviceBuffer(db_buffer, gate_dim, "cudaMalloc db_buffer");
-        ZeroDeviceMemory(db_buffer.ptr, gate_dim, compute_stream, "memset db buffer");
+        AllocateDeviceBuffer(db_buffer, bias_elements, "cudaMalloc db_buffer");
+        ZeroDeviceMemory(db_buffer.ptr, bias_elements, compute_stream, "memset db buffer");
 
         constexpr size_t chunk_capacity = kChunkSteps;
         const size_t recompute_stride = recompute_interval;
@@ -825,7 +837,7 @@ namespace flstm {
         if (checkpoint_c_is_half) {
             AllocateDeviceBufferArray(checkpoint_c_half_quantized, bh_elements, "cudaMalloc checkpoint_c_quantized");
         }
-        AllocateDeviceBuffer(bias_fused, gate_dim, "cudaMalloc bias_fused");
+        AllocateDeviceBuffer(bias_fused, bias_elements, "cudaMalloc bias_fused");
         AllocateDeviceBuffer(recompute_h_prev, bh_elements, "cudaMalloc recompute_h_prev");
         AllocateDeviceBuffer(recompute_h_next, bh_elements, "cudaMalloc recompute_h_next");
         AllocateDeviceBuffer(recompute_c_prev, bh_elements, "cudaMalloc recompute_c_prev");
@@ -835,17 +847,22 @@ namespace flstm {
         AllocateDeviceBuffer(column_scale_tmp, batch_size, "cudaMalloc column_scale_tmp");
         AllocateDeviceBuffer(gate_pre_col, gate_step_elements, "cudaMalloc gate_pre_col");
 
-        const int bias_blocks = BlocksFor(gate_dim, threads);
-        FuseBiasKernel<<<bias_blocks, threads, 0, compute_stream>>>(
-            bias_ih,
-            bias_hh,
-            bias_fused.ptr,
-            hidden_size
-        );
-        CheckCuda(cudaGetLastError(), "FuseBiasKernel");
+        for (size_t set_idx = 0; set_idx < weight_set_count; ++set_idx) {
+            const int bias_blocks = BlocksFor(gate_dim, threads);
+            float *bias_out = bias_fused.ptr + set_idx * gate_dim;
+            const float *bias_ih_ptr = bias_ih + set_idx * gate_dim;
+            const float *bias_hh_ptr = bias_hh + set_idx * gate_dim;
+            FuseBiasKernel<<<bias_blocks, threads, 0, compute_stream>>>(
+                bias_ih_ptr,
+                bias_hh_ptr,
+                bias_out,
+                hidden_size
+            );
+            CheckCuda(cudaGetLastError(), "FuseBiasKernel");
+        }
 
-        ZeroDeviceMemory(dW_ih, static_cast<size_t>(gate_dim) * input_size, compute_stream, "memset dW_ih");
-        ZeroDeviceMemory(dW_hh, static_cast<size_t>(gate_dim) * hidden_size, compute_stream, "memset dW_hh");
+        ZeroDeviceMemory(dW_ih, static_cast<size_t>(gate_dim) * input_size * weight_set_count, compute_stream, "memset dW_ih");
+        ZeroDeviceMemory(dW_hh, static_cast<size_t>(gate_dim) * hidden_size * weight_set_count, compute_stream, "memset dW_hh");
 
         const float alpha = 1.0f;
         const float beta_zero = 0.0f;
@@ -930,7 +947,6 @@ namespace flstm {
             CheckCuda(cudaStreamWaitEvent(compute_stream, h2d_ready[slot].evt, 0), "wait h2d_ready");
 
             const size_t chunk_start_step = chunk_ids[slot] * chunk_capacity;
-            const size_t chunk_tb = steps_in_chunk * batch_size;
             const size_t prefix_steps = chunk_prefix_steps[slot];
             const size_t recompute_steps = chunk_recompute_steps[slot];
 
@@ -989,6 +1005,8 @@ namespace flstm {
                           "copy checkpoint c");
 
                 for (size_t local_step = 0; local_step < recompute_steps; ++local_step) {
+                    const size_t global_step = chunk_start_step + local_step;
+                    const size_t weight_set = global_step % weight_set_count;
                     const __half *x_step_half =
                             x_chunk_half[slot].ptr + local_step * batch_size * input_size;
                     const int input_blocks = BlocksFor(batch_size * input_size, threads);
@@ -1018,11 +1036,12 @@ namespace flstm {
                         batch_size
                     );
                     CheckCuda(cudaGetLastError(), "ScaleAndPackColumnsKernel recompute");
+                    const __half *weight_cat_step = weight_cat_col.ptr + weight_set * z_rows * gate_dim;
                     flstm::GemmTN(
                         static_cast<int>(gate_dim),
                         static_cast<int>(batch_size),
                         static_cast<int>(z_rows),
-                        weight_cat_col.ptr,
+                        weight_cat_step,
                         static_cast<int>(z_rows),
                         z_step_half.ptr,
                         static_cast<int>(z_rows),
@@ -1037,9 +1056,10 @@ namespace flstm {
                         const size_t chunk_local = local_step - prefix_steps;
                         gate_out_ptr = gate_chunk_float[slot].ptr + chunk_local * batch_size * gate_dim;
                     }
+                    const float *bias_ptr = bias_fused.ptr + weight_set * gate_dim;
                     RecomputePointwiseKernel<<<point_blocks, threads, 0, compute_stream>>>(
                         gate_pre_col.ptr,
-                        bias_fused.ptr,
+                        bias_ptr,
                         recompute_c_prev.ptr,
                         recompute_h_next.ptr,
                         recompute_c_next.ptr,
@@ -1055,6 +1075,8 @@ namespace flstm {
             }
 
             for (int step = static_cast<int>(steps_in_chunk) - 1; step >= 0; --step) {
+                const size_t global_step = chunk_start_step + static_cast<size_t>(step);
+                const size_t weight_set = global_step % weight_set_count;
                 const size_t local_offset = static_cast<size_t>(step) * batch_size;
                 float *dG_step = dG_chunk_col[slot].ptr + local_offset * gate_dim;
                 __half *dG_half_step = dG_chunk_half[slot].ptr + local_offset * gate_dim;
@@ -1080,7 +1102,8 @@ namespace flstm {
                 );
                 CheckCuda(cudaGetLastError(), "BackwardPointwiseKernel");
 
-                const __half *W_hh_block = weight_cat_col.ptr + input_size;
+                const __half *weight_cat_step = weight_cat_col.ptr + weight_set * z_rows * gate_dim;
+                const __half *W_hh_block = weight_cat_step + input_size;
                 flstm::GemmNN(
                     static_cast<int>(hidden_size),
                     static_cast<int>(batch_size),
@@ -1096,94 +1119,92 @@ namespace flstm {
                     compute_stream);
                 profiler.AddUseful(mfu::GemmFlops(hidden_size, batch_size, gate_dim));
 
-                std::swap(dh_cur.ptr, dh_tmp.ptr);
-                std::swap(dc_cur.ptr, dc_tmp.ptr);
-            }
-
-            bool issued_dx_copy = false;
-            size_t dx_chunk_elems = 0;
-            const int zgemm_k = static_cast<int>(chunk_tb);
-            if (zgemm_k > 0) {
-                const __half *z_chunk_base = z_chunk_col[slot].ptr;
+                const __half *z_chunk_base = z_chunk_col[slot].ptr + static_cast<size_t>(step) * batch_size * z_rows;
                 const __half *x_chunk_matrix = z_chunk_base;
                 const __half *h_chunk_matrix = z_chunk_base + input_size;
-                const __half *dG_chunk_half_ptr = dG_chunk_half[slot].ptr;
+                float *dW_ih_set = dW_ih + weight_set * gate_dim * input_size;
+                float *dW_hh_set = dW_hh + weight_set * gate_dim * hidden_size;
+                float *db_set = db_buffer.ptr + weight_set * gate_dim;
 
                 flstm::GemmNT(
                     static_cast<int>(input_size),
                     static_cast<int>(gate_dim),
-                    zgemm_k,
+                    static_cast<int>(batch_size),
                     x_chunk_matrix,
                     static_cast<int>(z_rows),
-                    dG_chunk_half_ptr,
+                    dG_half_step,
                     static_cast<int>(gate_dim),
-                    dW_ih,
+                    dW_ih_set,
                     static_cast<int>(input_size),
                     alpha,
                     beta_one,
                     compute_stream);
-                profiler.AddUseful(mfu::GemmFlops(input_size, gate_dim, static_cast<size_t>(zgemm_k)));
+                profiler.AddUseful(mfu::GemmFlops(input_size, gate_dim, static_cast<size_t>(batch_size)));
 
                 if (hidden_size > 0) {
                     flstm::GemmNT(
                         static_cast<int>(hidden_size),
                         static_cast<int>(gate_dim),
-                        zgemm_k,
+                        static_cast<int>(batch_size),
                         h_chunk_matrix,
                         static_cast<int>(z_rows),
-                        dG_chunk_half_ptr,
+                        dG_half_step,
                         static_cast<int>(gate_dim),
-                        dW_hh,
+                        dW_hh_set,
                         static_cast<int>(hidden_size),
                         alpha,
                         beta_one,
                         compute_stream);
-                    profiler.AddUseful(mfu::GemmFlops(hidden_size, gate_dim, static_cast<size_t>(zgemm_k)));
+                    profiler.AddUseful(mfu::GemmFlops(hidden_size, gate_dim, static_cast<size_t>(batch_size)));
                 }
 
                 flstm::GemmNN(
                     static_cast<int>(gate_dim),
                     1,
-                    zgemm_k,
-                    dG_chunk_half_ptr,
+                    static_cast<int>(batch_size),
+                    dG_half_step,
                     static_cast<int>(gate_dim),
                     ones_vec.ptr,
-                    zgemm_k,
-                    db_buffer.ptr,
+                    static_cast<int>(batch_size),
+                    db_set,
                     static_cast<int>(gate_dim),
                     alpha,
                     beta_one,
                     compute_stream);
-                profiler.AddUseful(mfu::GemvFlops(gate_dim, static_cast<size_t>(zgemm_k)));
+                profiler.AddUseful(mfu::GemvFlops(gate_dim, static_cast<size_t>(batch_size)));
 
                 flstm::GemmNN(
                     static_cast<int>(input_size),
-                    zgemm_k,
+                    static_cast<int>(batch_size),
                     static_cast<int>(gate_dim),
-                    weight_cat_col.ptr,
+                    weight_cat_step,
                     static_cast<int>(z_rows),
-                    dG_chunk_half_ptr,
+                    dG_half_step,
                     static_cast<int>(gate_dim),
-                    dX_chunk_col[slot].ptr,
+                    dX_chunk_col[slot].ptr + static_cast<size_t>(step) * batch_size * input_size,
                     static_cast<int>(input_size),
                     alpha,
                     beta_zero,
                     compute_stream);
-                profiler.AddUseful(mfu::GemmFlops(input_size, static_cast<size_t>(zgemm_k), gate_dim));
+                profiler.AddUseful(mfu::GemmFlops(input_size, static_cast<size_t>(batch_size), gate_dim));
 
-                dx_chunk_elems = steps_in_chunk * batch_size * input_size;
-                if (dx_chunk_elems > 0) {
-                    const int dx_blocks = BlocksFor(dx_chunk_elems, threads);
-                    ConvertDxChunkToHalfKernel<<<dx_blocks, threads, 0, compute_stream>>>(
-                        dX_chunk_col[slot].ptr,
-                        dx_chunk_half[slot].ptr,
-                        steps_in_chunk,
-                        batch_size,
-                        input_size
-                    );
-                    CheckCuda(cudaGetLastError(), "ConvertDxChunkToHalfKernel");
-                    issued_dx_copy = true;
-                }
+                std::swap(dh_cur.ptr, dh_tmp.ptr);
+                std::swap(dc_cur.ptr, dc_tmp.ptr);
+            }
+
+            bool issued_dx_copy = false;
+            const size_t dx_chunk_elems = steps_in_chunk * batch_size * input_size;
+            if (dx_chunk_elems > 0) {
+                const int dx_blocks = BlocksFor(dx_chunk_elems, threads);
+                ConvertDxChunkToHalfKernel<<<dx_blocks, threads, 0, compute_stream>>>(
+                    dX_chunk_col[slot].ptr,
+                    dx_chunk_half[slot].ptr,
+                    steps_in_chunk,
+                    batch_size,
+                    input_size
+                );
+                CheckCuda(cudaGetLastError(), "ConvertDxChunkToHalfKernel");
+                issued_dx_copy = true;
             }
 
             CheckCuda(cudaEventRecord(dx_ready[slot].evt, compute_stream), "record dx_ready");
@@ -1218,14 +1239,14 @@ namespace flstm {
         CheckCuda(cudaMemcpyAsync(
                       db_ih,
                       db_buffer.ptr,
-                      gate_dim * sizeof(float),
+                      bias_elements * sizeof(float),
                       cudaMemcpyDeviceToDevice,
                       compute_stream),
                   "copy db -> db_ih");
         CheckCuda(cudaMemcpyAsync(
                       db_hh,
                       db_buffer.ptr,
-                      gate_dim * sizeof(float),
+                      bias_elements * sizeof(float),
                       cudaMemcpyDeviceToDevice,
                       compute_stream),
                   "copy db -> db_hh");
@@ -1256,6 +1277,7 @@ extern "C" void flstm_StreamingLstmBackward(
     const size_t input_size,
     const size_t hidden_size,
     const size_t recompute_interval,
+    const size_t weight_set_count,
 
     const __half *x_tensor_host,
     const __half *y_tensor_host,
@@ -1301,6 +1323,7 @@ extern "C" void flstm_StreamingLstmBackward(
             input_size,
             hidden_size,
             recompute_interval,
+            weight_set_count,
             x_tensor_host,
             y_tensor_host,
             cache_host,

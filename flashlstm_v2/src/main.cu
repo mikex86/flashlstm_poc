@@ -333,6 +333,7 @@ int main() {
         weight_limit,
         kBaseSeed + 5
     );
+    const size_t weight_set_count = 1;
 
     std::vector h0_host(state_elements, __float2half(0.0f));
     std::vector c0_host(state_elements, __float2half(0.0f));
@@ -384,6 +385,7 @@ int main() {
         input_size,
         hidden_size,
         recompute_interval,
+        weight_set_count,
         x_host,
         h0_device,
         c0_device,
@@ -408,6 +410,7 @@ int main() {
         input_size,
         hidden_size,
         recompute_interval,
+        weight_set_count,
         x_host,
         h0_device,
         c0_device,
@@ -488,6 +491,7 @@ int main() {
         input_size,
         hidden_size,
         recompute_interval,
+        weight_set_count,
         x_host,
         y_host,
         gate_cache_host,
@@ -520,6 +524,7 @@ int main() {
         input_size,
         hidden_size,
         recompute_interval,
+        weight_set_count,
         x_host,
         y_host,
         gate_cache_host,

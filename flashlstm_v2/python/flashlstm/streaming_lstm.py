@@ -58,6 +58,50 @@ def _ensure_half_cuda(
     return tensor
 
 
+def _normalize_weight_sets(
+    weight_ih: torch.Tensor,
+    weight_hh: torch.Tensor,
+    bias_ih: torch.Tensor,
+    bias_hh: torch.Tensor,
+    gate_dim: int,
+    input_size: int,
+    hidden_size: int,
+    requested_sets: Optional[int],
+) -> Tuple[int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    if requested_sets is not None and requested_sets <= 0:
+        raise ValueError(f"weight_set_count must be >= 1, got {requested_sets}")
+    def _validate_and_maybe_expand(param: torch.Tensor, expected_last_shape: Tuple[int, ...], label: str) -> Tuple[int, torch.Tensor]:
+        if param.dim() == 2:
+            set_count = 1
+            if param.shape != expected_last_shape:
+                raise ValueError(f"{label} must have shape {expected_last_shape}, got {tuple(param.shape)}")
+            return set_count, param
+        if param.dim() == 3:
+            if param.shape[1:] != expected_last_shape:
+                raise ValueError(f"{label} must have shape (S, {', '.join(map(str, expected_last_shape))}), got {tuple(param.shape)}")
+            return param.shape[0], param
+        raise ValueError(f"{label} must be 2D or 3D, got rank {param.dim()}")
+
+    set_ih, weight_ih = _validate_and_maybe_expand(weight_ih, (gate_dim, input_size), "weight_ih")
+    set_hh, weight_hh = _validate_and_maybe_expand(weight_hh, (gate_dim, hidden_size), "weight_hh")
+    set_bih, bias_ih = _validate_and_maybe_expand(bias_ih, (gate_dim,), "bias_ih")
+    set_bhh, bias_hh = _validate_and_maybe_expand(bias_hh, (gate_dim,), "bias_hh")
+
+    inferred_sets = set_ih
+    for name, count in (("weight_hh", set_hh), ("bias_ih", set_bih), ("bias_hh", set_bhh)):
+        if count != inferred_sets:
+            raise ValueError(f"{name} must have the same number of weight sets as weight_ih ({inferred_sets}), "
+                             f"got {count}")
+
+    weight_set_count = inferred_sets
+    if requested_sets is not None and requested_sets != weight_set_count:
+        raise ValueError(
+            f"weight_set_count mismatch: expected {requested_sets} sets but tensors provide {weight_set_count}"
+        )
+
+    return weight_set_count, weight_ih.contiguous(), weight_hh.contiguous(), bias_ih.contiguous(), bias_hh.contiguous()
+
+
 class _StreamingLSTMFunction(Function):
     @staticmethod
     def forward(  # type: ignore[override]
@@ -71,6 +115,7 @@ class _StreamingLSTMFunction(Function):
         bias_hh: torch.Tensor,
         recompute_interval: int,
         gate_cache_dtypes: Tuple[torch.dtype, torch.dtype],
+        weight_set_count: Optional[int],
     ):
         _check_pinned_half(x_host, "x_host")
         if not x_host.is_contiguous():
@@ -90,26 +135,23 @@ class _StreamingLSTMFunction(Function):
             if param.dtype != torch.float32:
                 raise ValueError(f"{name} must use dtype torch.float32.")
 
-        h0 = _ensure_half_cuda(h0, (x_host.size(1), weight_hh.size(1)), "h0")
-        c0 = _ensure_half_cuda(c0, (x_host.size(1), weight_hh.size(1)), "c0")
-
         time_steps, batch_size, input_size = x_host.shape
-        hidden_size = weight_hh.size(1)
+        hidden_size = weight_hh.shape[-1]
         gate_dim = 4 * hidden_size
+        weight_set_count, weight_ih, weight_hh, bias_ih, bias_hh = _normalize_weight_sets(
+            weight_ih,
+            weight_hh,
+            bias_ih,
+            bias_hh,
+            gate_dim,
+            input_size,
+            hidden_size,
+            weight_set_count,
+        )
         checkpoint_steps = (time_steps + recompute_interval - 1) // recompute_interval
 
-        if weight_ih.shape != (gate_dim, input_size):
-            raise ValueError(
-                f"weight_ih must have shape {(gate_dim, input_size)}, "
-                f"got {tuple(weight_ih.shape)}"
-            )
-        if weight_hh.shape != (gate_dim, hidden_size):
-            raise ValueError(
-                f"weight_hh must have shape {(gate_dim, hidden_size)}, "
-                f"got {tuple(weight_hh.shape)}"
-            )
-        if bias_ih.numel() != gate_dim or bias_hh.numel() != gate_dim:
-            raise ValueError("Bias tensors must have length 4 * hidden_size.")
+        h0 = _ensure_half_cuda(h0, (x_host.size(1), hidden_size), "h0")
+        c0 = _ensure_half_cuda(c0, (x_host.size(1), hidden_size), "c0")
 
         gate_cache_h_dtype, gate_cache_c_dtype = gate_cache_dtypes
         gate_cache_h_enum = _gate_cache_dtype_enum(gate_cache_h_dtype)
@@ -147,6 +189,7 @@ class _StreamingLSTMFunction(Function):
             input_size,
             hidden_size,
             recompute_interval,
+            weight_set_count,
             x_host.data_ptr(),
             h0.data_ptr(),
             c0.data_ptr(),
@@ -189,6 +232,7 @@ class _StreamingLSTMFunction(Function):
             input_size,
             hidden_size,
             recompute_interval,
+            weight_set_count,
             gate_cache_h_enum,
             gate_cache_c_enum,
         )
@@ -223,6 +267,7 @@ class _StreamingLSTMFunction(Function):
             input_size,
             hidden_size,
             recompute_interval,
+            weight_set_count,
             gate_cache_h_enum,
             gate_cache_c_enum,
         ) = ctx.meta
@@ -296,6 +341,7 @@ class _StreamingLSTMFunction(Function):
             input_size,
             hidden_size,
             recompute_interval,
+            weight_set_count,
             x_host.data_ptr(),
             y_host.data_ptr(),
             gate_cache_h.data_ptr(),
@@ -341,6 +387,7 @@ class _StreamingLSTMFunction(Function):
             db_hh,
             None,
             None,
+            None,
         )
 
 
@@ -355,6 +402,7 @@ def streaming_lstm(
     *,
     recompute_interval: int = 1,
     gate_cache_dtypes: Tuple[torch.dtype, torch.dtype] = (torch.float32, torch.float32),
+    weight_set_count: Optional[int] = None,
 ) -> Tuple[torch.Tensor, GateCache, torch.Tensor, torch.Tensor]:
     """
     Functional wrapper for the streaming LSTM kernels.
@@ -370,6 +418,7 @@ def streaming_lstm(
         bias_hh,
         recompute_interval,
         gate_cache_dtypes,
+        weight_set_count,
     )
     y_host, gate_cache_h, gate_cache_c, hy, cy = outputs
     gate_cache = GateCache(gate_cache_h, gate_cache_c)
@@ -377,23 +426,35 @@ def streaming_lstm(
 
 
 class StreamingLSTM(nn.Module):
-    def __init__(self, input_size: int, hidden_size: int) -> None:
+    def __init__(self, input_size: int, hidden_size: int, weight_set_count: int = 1) -> None:
         super().__init__()
         self.input_size = int(input_size)
         self.hidden_size = int(hidden_size)
+        self.weight_set_count = int(weight_set_count)
 
         gate_dim = 4 * hidden_size
+        weight_ih_shape = (gate_dim, input_size) if self.weight_set_count == 1 else (
+            self.weight_set_count,
+            gate_dim,
+            input_size,
+        )
+        weight_hh_shape = (gate_dim, hidden_size) if self.weight_set_count == 1 else (
+            self.weight_set_count,
+            gate_dim,
+            hidden_size,
+        )
+        bias_shape = (gate_dim,) if self.weight_set_count == 1 else (self.weight_set_count, gate_dim)
         self.weight_ih = nn.Parameter(
-            torch.empty(gate_dim, input_size, device="cuda", dtype=torch.float32)
+            torch.empty(weight_ih_shape, device="cuda", dtype=torch.float32)
         )
         self.weight_hh = nn.Parameter(
-            torch.empty(gate_dim, hidden_size, device="cuda", dtype=torch.float32)
+            torch.empty(weight_hh_shape, device="cuda", dtype=torch.float32)
         )
         self.bias_ih = nn.Parameter(
-            torch.zeros(gate_dim, device="cuda", dtype=torch.float32)
+            torch.zeros(bias_shape, device="cuda", dtype=torch.float32)
         )
         self.bias_hh = nn.Parameter(
-            torch.zeros(gate_dim, device="cuda", dtype=torch.float32)
+            torch.zeros(bias_shape, device="cuda", dtype=torch.float32)
         )
         self.reset_parameters()
 
@@ -426,5 +487,6 @@ class StreamingLSTM(nn.Module):
             self.bias_hh,
             recompute_interval=recompute_interval,
             gate_cache_dtypes=gate_cache_dtypes,
+            weight_set_count=self.weight_set_count,
         )
         return y_host, gate_cache_host, (hy, cy)

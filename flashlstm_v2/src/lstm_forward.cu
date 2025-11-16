@@ -467,6 +467,7 @@ void StreamingLstmForward(
     size_t input_size,
     size_t hidden_size,
     size_t recompute_interval,
+    size_t weight_set_count,
 
     const __half *x_tensor_host,
     const __half *h_0_device,
@@ -496,6 +497,9 @@ void StreamingLstmForward(
     ValidateGateCacheOptions(options);
     if (recompute_interval == 0) {
         throw std::runtime_error("StreamingLstmForward requires recompute_interval >= 1");
+    }
+    if (weight_set_count == 0) {
+        throw std::runtime_error("StreamingLstmForward requires weight_set_count >= 1");
     }
     if (compute_stream == h2d_stream || compute_stream == d2h_stream || h2d_stream == d2h_stream) {
         throw std::runtime_error("StreamingLstmForward requires distinct compute/h2d/d2h streams");
@@ -598,22 +602,40 @@ void StreamingLstmForward(
               "copy c0 -> c_prev");
 
     AllocateDeviceBuffer(gate_pre_col, gate_dim * batch_size, "cudaMalloc gate_pre_col");
-    AllocateDeviceBuffer(weight_cat_half, z_rows * gate_dim, "cudaMalloc weight_cat_half");
-    AllocateDeviceBuffer(bias_fused, gate_dim, "cudaMalloc bias_fused");
+    const size_t weight_cat_elems = weight_set_count * z_rows * gate_dim;
+    const size_t bias_elems = weight_set_count * gate_dim;
+    AllocateDeviceBuffer(weight_cat_half, weight_cat_elems, "cudaMalloc weight_cat_half");
+    AllocateDeviceBuffer(bias_fused, bias_elems, "cudaMalloc bias_fused");
 
-    const int weight_blocks = BlocksFor(z_rows * gate_dim, threads);
-    FuseWeightsKernel<<<weight_blocks, threads, 0, compute_stream>>>(
-        weights_ih,
-        weights_hh,
-        weight_cat_half.ptr,
-        input_size,
-        hidden_size
-    );
-    CheckCuda(cudaGetLastError(), "FuseWeightsKernel");
+    const size_t weight_ih_stride = gate_dim * input_size;
+    const size_t weight_hh_stride = gate_dim * hidden_size;
+    for (size_t set_idx = 0; set_idx < weight_set_count; ++set_idx) {
+        const int weight_blocks = BlocksFor(z_rows * gate_dim, threads);
+        __half *weight_out = weight_cat_half.ptr + set_idx * z_rows * gate_dim;
+        const float *weight_ih_ptr = weights_ih + set_idx * weight_ih_stride;
+        const float *weight_hh_ptr = weights_hh + set_idx * weight_hh_stride;
+        FuseWeightsKernel<<<weight_blocks, threads, 0, compute_stream>>>(
+            weight_ih_ptr,
+            weight_hh_ptr,
+            weight_out,
+            input_size,
+            hidden_size
+        );
+        CheckCuda(cudaGetLastError(), "FuseWeightsKernel");
+    }
 
-    const int bias_blocks = BlocksFor(gate_dim, threads);
-    FuseBiasKernel<<<bias_blocks, threads, 0, compute_stream>>>(bias_ih, bias_hh, bias_fused.ptr, hidden_size);
-    CheckCuda(cudaGetLastError(), "FuseBiasKernel");
+    for (size_t set_idx = 0; set_idx < weight_set_count; ++set_idx) {
+        const int bias_blocks = BlocksFor(gate_dim, threads);
+        float *bias_out = bias_fused.ptr + set_idx * gate_dim;
+        const float *bias_ih_ptr = bias_ih + set_idx * gate_dim;
+        const float *bias_hh_ptr = bias_hh + set_idx * gate_dim;
+        FuseBiasKernel<<<bias_blocks, threads, 0, compute_stream>>>(
+            bias_ih_ptr,
+            bias_hh_ptr,
+            bias_out,
+            hidden_size);
+        CheckCuda(cudaGetLastError(), "FuseBiasKernel");
+    }
 
     const float alpha_f = 1.0f;
     const float beta_zero_f = 0.0f;
@@ -743,6 +765,7 @@ void StreamingLstmForward(
 
         for (size_t step = 0; step < steps_in_chunk; ++step) {
             const size_t global_step = chunk_start_step + step;
+            const size_t weight_set = global_step % weight_set_count;
             const size_t column_offset = step * batch_size;
             float *z_step_float = z_chunk_float + column_offset * z_rows;
             const int scale_blocks = static_cast<int>(batch_size);
@@ -782,11 +805,12 @@ void StreamingLstmForward(
                 }
             }
 
+            const __half *weight_cat_ptr = weight_cat_half.ptr + weight_set * z_rows * gate_dim;
             flstm::GemmTN(
                 static_cast<int>(gate_dim),
                 static_cast<int>(batch_size),
                 static_cast<int>(z_rows),
-                weight_cat_half.ptr,
+                weight_cat_ptr,
                 static_cast<int>(z_rows),
                 z_step_half_buffer.ptr,
                 static_cast<int>(z_rows),
@@ -800,9 +824,10 @@ void StreamingLstmForward(
             const bool has_next_column = (step + 1 < steps_in_chunk);
             const size_t next_column_offset = has_next_column ? ((step + 1) * batch_size) : 0;
 
+            const float *bias_ptr = bias_fused.ptr + weight_set * gate_dim;
             ForwardPointwiseKernel<<<point_blocks, threads, 0, compute_stream>>>(
                 gate_pre_col.ptr,
-                bias_fused.ptr,
+                bias_ptr,
                 c_prev.ptr,
                 h_prev.ptr,
                 h_next.ptr,
@@ -973,6 +998,7 @@ extern "C" void flstm_StreamingLstmForward(
     const size_t input_size,
     const size_t hidden_size,
     const size_t recompute_interval,
+    const size_t weight_set_count,
 
     const __half *x_tensor_host,
     const __half *h0_device,
@@ -1010,6 +1036,7 @@ extern "C" void flstm_StreamingLstmForward(
             input_size,
             hidden_size,
             recompute_interval,
+            weight_set_count,
             x_tensor_host,
             h0_device,
             c0_device,

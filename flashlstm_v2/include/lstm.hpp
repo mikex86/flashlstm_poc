@@ -27,8 +27,9 @@ struct StreamingLstmOptions {
  * Inputs:
  *   - x_tensor_host:     (T, B, I) in pinned host memory (__half)
  *   - h0_device / c0_device: initial states on device (__half, shape B x H)
- *   - weights_ih / weights_hh: FP32 weights on device (4H x I / 4H x H)
- *   - bias_ih / bias_hh: FP32 biases on device (4H)
+ *   - weight_set_count:  number of parameter sets to alternate between
+ *   - weights_ih / weights_hh: FP32 weights on device (S, 4H, I / S, 4H, H)
+ *   - bias_ih / bias_hh: FP32 biases on device (S, 4H)
  *
  * Outputs:
  *   - y_tensor_host:     (T, B, H) in pinned host memory (__half)
@@ -46,6 +47,7 @@ void StreamingLstmForward(
     size_t input_size,
     size_t hidden_size,
     size_t recompute_interval,
+    size_t weight_set_count,
 
     const __half *x_tensor_host,
     const __half *h0_device,
@@ -79,8 +81,9 @@ void StreamingLstmForward(
  *   - dY_tensor_host:   upstream grads w.r.t outputs in host half precision
  *   - d_hn_device / d_cn_device: grads for final states (nullable)
  *   - c0_device:        initial cell state provided in half precision (B, H)
- *   - weights_ih / weights_hh: forward weights (FP32) reused for GEMMs
- *   - bias_ih / bias_hh: fused bias terms reused during recomputation
+ *   - weight_set_count:  number of parameter sets to alternate between
+ *   - weights_ih / weights_hh: forward weights (FP32) reused for GEMMs (S, 4H, I/H)
+ *   - bias_ih / bias_hh: fused bias terms reused during recomputation (S, 4H)
  *
  * Outputs:
  *   - dx_tensor_host:   gradients w.r.t. inputs written in host half precision
@@ -97,6 +100,7 @@ void StreamingLstmBackward(
     size_t input_size,
     size_t hidden_size,
     size_t recompute_interval,
+    size_t weight_set_count,
 
     const __half *x_tensor_host,
     const __half *y_tensor_host,
@@ -152,6 +156,7 @@ void flstm_StreamingLstmForward(
     size_t input_size,
     size_t hidden_size,
     size_t recompute_interval,
+    size_t weight_set_count,
 
     const __half *x_tensor_host,
     const __half *h0_device,
@@ -180,6 +185,7 @@ void flstm_StreamingLstmBackward(
     size_t input_size,
     size_t hidden_size,
     size_t recompute_interval,
+    size_t weight_set_count,
 
     const __half *x_tensor_host,
     const __half *y_tensor_host,

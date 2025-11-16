@@ -6,8 +6,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Tuple
 
+import math
 import torch
-import torch.nn.functional as F
 
 RECOMPUTE = 4
 
@@ -60,11 +60,12 @@ class LstmConfig:
     batch_size: int
     input_size: int
     hidden_size: int
+    weight_sets: int = 1
 
     def describe(self) -> str:
         return (
             f"T={self.time_steps}, B={self.batch_size}, "
-            f"I={self.input_size}, H={self.hidden_size}"
+            f"I={self.input_size}, H={self.hidden_size}, S={self.weight_sets}"
         )
 
 
@@ -76,6 +77,7 @@ def _prepare_function(lib: ctypes.CDLL) -> None:
         ctypes.c_size_t,  # input
         ctypes.c_size_t,  # hidden
         ctypes.c_size_t,  # recompute_interval
+        ctypes.c_size_t,  # weight_set_count
         ctypes.c_void_p,  # x host
         ctypes.c_void_p,  # h0 device
         ctypes.c_void_p,  # c0 device
@@ -98,8 +100,7 @@ def _run_case(lib: ctypes.CDLL, cfg: LstmConfig):
     torch.manual_seed(0)
     device = torch.device("cuda")
 
-    lstm = torch.nn.LSTM(cfg.input_size, cfg.hidden_size, batch_first=False).to(device)
-    lstm.eval()
+    weight_set_count = cfg.weight_sets
 
     x_fp32 = torch.randn(cfg.time_steps, cfg.batch_size, cfg.input_size, dtype=torch.float32).contiguous()
     x_host = x_fp32.to(dtype=torch.float16).contiguous().pin_memory()
@@ -114,45 +115,38 @@ def _run_case(lib: ctypes.CDLL, cfg: LstmConfig):
     h0_device = h0_init.squeeze(0).to(device=device, dtype=torch.float16).contiguous()
     c0_device = c0_init.squeeze(0).to(device=device, dtype=torch.float16).contiguous()
 
-    with torch.no_grad():
-        y_ref, (h_n_ref, c_n_ref) = lstm(x_torch, (h0_torch, c0_torch))
+    gate_dim = 4 * cfg.hidden_size
+    std = 1.0 / math.sqrt(cfg.hidden_size)
+    weight_ih = torch.empty(
+        weight_set_count, gate_dim, cfg.input_size, device=device, dtype=torch.float32
+    ).uniform_(-std, std)
+    weight_hh = torch.empty(
+        weight_set_count, gate_dim, cfg.hidden_size, device=device, dtype=torch.float32
+    ).uniform_(-std, std)
+    bias_ih = torch.zeros(weight_set_count, gate_dim, device=device, dtype=torch.float32)
+    bias_hh = torch.zeros_like(bias_ih)
 
-    lstm_cell = torch.nn.LSTMCell(cfg.input_size, cfg.hidden_size).to(device)
-    lstm_cell.eval()
+    lstm_cells = [torch.nn.LSTMCell(cfg.input_size, cfg.hidden_size).to(device) for _ in range(weight_set_count)]
     with torch.no_grad():
-        lstm_cell.weight_ih.copy_(lstm.weight_ih_l0)
-        lstm_cell.weight_hh.copy_(lstm.weight_hh_l0)
-        lstm_cell.bias_ih.copy_(lstm.bias_ih_l0)
-        lstm_cell.bias_hh.copy_(lstm.bias_hh_l0)
+        for idx, cell in enumerate(lstm_cells):
+            cell.eval()
+            cell.weight_ih.copy_(weight_ih[idx])
+            cell.weight_hh.copy_(weight_hh[idx])
+            cell.bias_ih.copy_(bias_ih[idx])
+            cell.bias_hh.copy_(bias_hh[idx])
 
     with torch.no_grad():
         h_cell = h0_torch.squeeze(0).clone()
         c_cell = c0_torch.squeeze(0).clone()
         h_states_ref = []
-        c_states_ref = []
-        gate_states_ref = []
         for t in range(cfg.time_steps):
-            x_step = x_torch[t]
-            linear_input = F.linear(x_step, lstm.weight_ih_l0)
-            linear_hidden = F.linear(h_cell, lstm.weight_hh_l0)
-            gates_linear = linear_input + linear_hidden + lstm.bias_ih_l0 + lstm.bias_hh_l0
-            gi, gf, gg, go = gates_linear.chunk(4, dim=1)
-            i_act = torch.sigmoid(gi)
-            f_act = torch.sigmoid(gf)
-            g_act = torch.tanh(gg)
-            o_act = torch.sigmoid(go)
-            gate_states_ref.append(torch.cat((i_act, f_act, g_act, o_act), dim=1).unsqueeze(0))
-            h_cell, c_cell = lstm_cell(x_step, (h_cell, c_cell))
+            set_idx = t % weight_set_count
+            h_cell, c_cell = lstm_cells[set_idx](x_torch[t], (h_cell, c_cell))
             h_states_ref.append(h_cell.unsqueeze(0))
-            c_states_ref.append(c_cell.unsqueeze(0))
         h_states_ref = torch.cat(h_states_ref, dim=0)
-        c_states_ref = torch.cat(c_states_ref, dim=0)
-        gate_states_ref = torch.cat(gate_states_ref, dim=0)
-
-    weight_ih = lstm.weight_ih_l0.detach().clone().contiguous().to(device)
-    weight_hh = lstm.weight_hh_l0.detach().clone().contiguous().to(device)
-    bias_ih = lstm.bias_ih_l0.detach().clone().contiguous().to(device)
-    bias_hh = lstm.bias_hh_l0.detach().clone().contiguous().to(device)
+        y_ref = h_states_ref
+        h_n_ref = h_cell.unsqueeze(0)
+        c_n_ref = c_cell.unsqueeze(0)
 
     y_host = torch.empty(cfg.time_steps, cfg.batch_size, cfg.hidden_size, dtype=torch.float16).contiguous().pin_memory()
 
@@ -197,6 +191,7 @@ def _run_case(lib: ctypes.CDLL, cfg: LstmConfig):
         ctypes.c_size_t(cfg.input_size),
         ctypes.c_size_t(cfg.hidden_size),
         ctypes.c_size_t(RECOMPUTE),
+        ctypes.c_size_t(weight_set_count),
         _as_void_p(x_host),
         _as_void_p(h0_device),
         _as_void_p(c0_device),
@@ -242,7 +237,7 @@ def _run_case(lib: ctypes.CDLL, cfg: LstmConfig):
 
 def _gather_cases() -> Iterable[LstmConfig]:
     return (
-        LstmConfig(4, 2, 3, 5),
+        LstmConfig(4, 2, 3, 5, 3),
         LstmConfig(16, 8, 64, 32),
         LstmConfig(32, 4, 128, 16),
         LstmConfig(64, 32, 256, 256),

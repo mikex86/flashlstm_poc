@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Tuple
 
+import math
 import torch
 import torch.nn.functional as F
 
@@ -60,11 +61,12 @@ class LstmConfig:
     batch_size: int
     input_size: int
     hidden_size: int
+    weight_sets: int = 1
 
     def describe(self) -> str:
         return (
             f"T={self.time_steps}, B={self.batch_size}, "
-            f"I={self.input_size}, H={self.hidden_size}"
+            f"I={self.input_size}, H={self.hidden_size}, S={self.weight_sets}"
         )
 
 
@@ -77,6 +79,7 @@ def _prepare_functions(lib: ctypes.CDLL) -> None:
         ctypes.c_size_t,  # input
         ctypes.c_size_t,  # hidden
         ctypes.c_size_t,  # recompute_interval
+        ctypes.c_size_t,  # weight_set_count
         ctypes.c_void_p,  # x host
         ctypes.c_void_p,  # h0 device
         ctypes.c_void_p,  # c0 device
@@ -102,6 +105,7 @@ def _prepare_functions(lib: ctypes.CDLL) -> None:
         ctypes.c_size_t,  # input
         ctypes.c_size_t,  # hidden
         ctypes.c_size_t,  # recompute_interval
+        ctypes.c_size_t,  # weight_set_count
 
         ctypes.c_void_p,  # x host
         ctypes.c_void_p,  # y host
@@ -137,8 +141,7 @@ def _run_case_forward_only(lib: ctypes.CDLL, cfg: LstmConfig):
     torch.manual_seed(0)
     device = torch.device("cuda")
 
-    lstm = torch.nn.LSTM(cfg.input_size, cfg.hidden_size, batch_first=False).to(device)
-    lstm.eval()
+    weight_set_count = cfg.weight_sets
 
     x_fp32 = torch.randn(cfg.time_steps, cfg.batch_size, cfg.input_size, dtype=torch.float32).contiguous()
     x_host = x_fp32.to(dtype=torch.float16).contiguous().pin_memory()
@@ -153,46 +156,38 @@ def _run_case_forward_only(lib: ctypes.CDLL, cfg: LstmConfig):
     h0_device = h0_init.squeeze(0).to(device=device, dtype=torch.float16).contiguous()
     c0_device = c0_init.squeeze(0).to(device=device, dtype=torch.float16).contiguous()
 
-    with torch.no_grad():
-        y_ref, (h_n_ref, c_n_ref) = lstm(x_torch, (h0_torch, c0_torch))
+    gate_dim = 4 * cfg.hidden_size
+    std = 1.0 / math.sqrt(cfg.hidden_size)
+    weight_ih = torch.empty(
+        weight_set_count, gate_dim, cfg.input_size, device=device, dtype=torch.float32
+    ).uniform_(-std, std)
+    weight_hh = torch.empty(
+        weight_set_count, gate_dim, cfg.hidden_size, device=device, dtype=torch.float32
+    ).uniform_(-std, std)
+    bias_ih = torch.zeros(weight_set_count, gate_dim, device=device, dtype=torch.float32)
+    bias_hh = torch.zeros_like(bias_ih)
 
-    # For gate_refs and per-step states (forward correctness)
-    lstm_cell = torch.nn.LSTMCell(cfg.input_size, cfg.hidden_size).to(device)
-    lstm_cell.eval()
+    lstm_cells = [torch.nn.LSTMCell(cfg.input_size, cfg.hidden_size).to(device) for _ in range(weight_set_count)]
     with torch.no_grad():
-        lstm_cell.weight_ih.copy_(lstm.weight_ih_l0)
-        lstm_cell.weight_hh.copy_(lstm.weight_hh_l0)
-        lstm_cell.bias_ih.copy_(lstm.bias_ih_l0)
-        lstm_cell.bias_hh.copy_(lstm.bias_hh_l0)
+        for idx, cell in enumerate(lstm_cells):
+            cell.eval()
+            cell.weight_ih.copy_(weight_ih[idx])
+            cell.weight_hh.copy_(weight_hh[idx])
+            cell.bias_ih.copy_(bias_ih[idx])
+            cell.bias_hh.copy_(bias_hh[idx])
 
     with torch.no_grad():
         h_cell = h0_torch.squeeze(0).clone()
         c_cell = c0_torch.squeeze(0).clone()
         h_states_ref = []
-        c_states_ref = []
-        gate_states_ref = []
         for t in range(cfg.time_steps):
-            x_step = x_torch[t]
-            linear_input = F.linear(x_step, lstm.weight_ih_l0)
-            linear_hidden = F.linear(h_cell, lstm.weight_hh_l0)
-            gates_linear = linear_input + linear_hidden + lstm.bias_ih_l0 + lstm.bias_hh_l0
-            gi, gf, gg, go = gates_linear.chunk(4, dim=1)
-            i_act = torch.sigmoid(gi)
-            f_act = torch.sigmoid(gf)
-            g_act = torch.tanh(gg)
-            o_act = torch.sigmoid(go)
-            gate_states_ref.append(torch.cat((i_act, f_act, g_act, o_act), dim=1).unsqueeze(0))
-            h_cell, c_cell = lstm_cell(x_step, (h_cell, c_cell))
+            set_idx = t % weight_set_count
+            h_cell, c_cell = lstm_cells[set_idx](x_torch[t], (h_cell, c_cell))
             h_states_ref.append(h_cell.unsqueeze(0))
-            c_states_ref.append(c_cell.unsqueeze(0))
         h_states_ref = torch.cat(h_states_ref, dim=0)
-        c_states_ref = torch.cat(c_states_ref, dim=0)
-        gate_states_ref = torch.cat(gate_states_ref, dim=0)
-
-    weight_ih = lstm.weight_ih_l0.detach().clone().contiguous().to(device)
-    weight_hh = lstm.weight_hh_l0.detach().clone().contiguous().to(device)
-    bias_ih = lstm.bias_ih_l0.detach().clone().contiguous().to(device)
-    bias_hh = lstm.bias_hh_l0.detach().clone().contiguous().to(device)
+        y_ref = h_states_ref
+        h_n_ref = h_cell.unsqueeze(0)
+        c_n_ref = c_cell.unsqueeze(0)
 
     y_host = torch.empty(cfg.time_steps, cfg.batch_size, cfg.hidden_size, dtype=torch.float16).contiguous().pin_memory()
     checkpoint_steps = (cfg.time_steps + RECOMPUTE - 1) // RECOMPUTE
@@ -233,6 +228,7 @@ def _run_case_forward_only(lib: ctypes.CDLL, cfg: LstmConfig):
         ctypes.c_size_t(cfg.input_size),
         ctypes.c_size_t(cfg.hidden_size),
         ctypes.c_size_t(RECOMPUTE),
+        ctypes.c_size_t(weight_set_count),
         _as_void_p(x_host),
         _as_void_p(h0_device),
         _as_void_p(c0_device),
@@ -289,6 +285,7 @@ def _run_case_backward(lib: ctypes.CDLL, cfg: LstmConfig):
      gate_cache_c) = _run_case_forward_only(lib, cfg)
 
     device = torch.device("cuda")
+    weight_set_count = cfg.weight_sets
 
     # === Upstream grads (host half for dY; device half for dHN/dCN) ===
     torch.manual_seed(42)
@@ -303,12 +300,14 @@ def _run_case_backward(lib: ctypes.CDLL, cfg: LstmConfig):
     # === Outputs to be written by our custom backward ===
     dx_host = torch.empty(cfg.time_steps, cfg.batch_size, cfg.input_size,
                           dtype=torch.float16).contiguous().pin_memory()
-    dW_ih_dev = torch.zeros(4 * cfg.hidden_size, cfg.input_size,
-                            device=device, dtype=torch.float32)
-    dW_hh_dev = torch.zeros(4 * cfg.hidden_size, cfg.hidden_size,
-                            device=device, dtype=torch.float32)
-    db_ih_dev = torch.zeros(4 * cfg.hidden_size, device=device, dtype=torch.float32)
-    db_hh_dev = torch.zeros(4 * cfg.hidden_size, device=device, dtype=torch.float32)
+    dW_ih_dev = torch.zeros(
+        weight_set_count, 4 * cfg.hidden_size, cfg.input_size, device=device, dtype=torch.float32
+    )
+    dW_hh_dev = torch.zeros(
+        weight_set_count, 4 * cfg.hidden_size, cfg.hidden_size, device=device, dtype=torch.float32
+    )
+    db_ih_dev = torch.zeros(weight_set_count, 4 * cfg.hidden_size, device=device, dtype=torch.float32)
+    db_hh_dev = torch.zeros_like(db_ih_dev)
     dh0_dev   = torch.zeros(cfg.batch_size, cfg.hidden_size, device=device, dtype=torch.float32)
     dc0_dev   = torch.zeros(cfg.batch_size, cfg.hidden_size, device=device, dtype=torch.float32)
 
@@ -336,6 +335,7 @@ def _run_case_backward(lib: ctypes.CDLL, cfg: LstmConfig):
         ctypes.c_size_t(cfg.input_size),
         ctypes.c_size_t(cfg.hidden_size),
         ctypes.c_size_t(RECOMPUTE),
+        ctypes.c_size_t(weight_set_count),
 
         _as_void_p(x_host),
         _as_void_p(y_host),
@@ -363,26 +363,43 @@ def _run_case_backward(lib: ctypes.CDLL, cfg: LstmConfig):
     )
     torch.cuda.synchronize()
 
-    # === PyTorch reference grads (run in FP16 to match forward/back activations) ===
-    lstm_ref = torch.nn.LSTM(cfg.input_size, cfg.hidden_size, batch_first=False).to(device).half()
-    with torch.no_grad():
-        lstm_ref.weight_ih_l0.copy_(weight_ih.half())
-        lstm_ref.weight_hh_l0.copy_(weight_hh.half())
-        lstm_ref.bias_ih_l0.copy_(bias_ih.half())
-        lstm_ref.bias_hh_l0.copy_(bias_hh.half())
+    # === PyTorch reference grads (run in FP16 to match forward/back activations) with alternating weights ===
+    weight_ih_ref = weight_ih.half().detach().clone().requires_grad_(True)
+    weight_hh_ref = weight_hh.half().detach().clone().requires_grad_(True)
+    bias_ih_ref = bias_ih.half().detach().clone().requires_grad_(True)
+    bias_hh_ref = bias_hh.half().detach().clone().requires_grad_(True)
 
-    x_th  = x_host.to(device, non_blocking=True)  # FP16
+    x_th = x_host.to(device, non_blocking=True)  # FP16
     x_th.requires_grad_(True)
     h0_th = h0_device.view(1, cfg.batch_size, cfg.hidden_size).half()
     c0_th = c0_device.view(1, cfg.batch_size, cfg.hidden_size).half()
     h0_th.requires_grad_(True)
     c0_th.requires_grad_(True)
 
-    dY_th  = dY_host.to(device, non_blocking=True)     # FP16
-    dHN_th = dHN_dev                                   # FP16 (B,H)
-    dCN_th = dCN_dev                                   # FP16 (B,H)
+    dY_th = dY_host.to(device, non_blocking=True)     # FP16
+    dHN_th = dHN_dev                                  # FP16 (B,H)
+    dCN_th = dCN_dev                                  # FP16 (B,H)
 
-    y_th, (hn_th, cn_th) = lstm_ref(x_th, (h0_th, c0_th))
+    h_state = h0_th.squeeze(0)
+    c_state = c0_th.squeeze(0)
+    outputs = []
+    for t in range(cfg.time_steps):
+        set_idx = t % weight_set_count
+        gates_linear = F.linear(x_th[t], weight_ih_ref[set_idx]) \
+            + F.linear(h_state, weight_hh_ref[set_idx]) \
+            + bias_ih_ref[set_idx] + bias_hh_ref[set_idx]
+        gi, gf, gg, go = gates_linear.chunk(4, dim=1)
+        i_act = torch.sigmoid(gi)
+        f_act = torch.sigmoid(gf)
+        g_act = torch.tanh(gg)
+        o_act = torch.sigmoid(go)
+        c_state = f_act * c_state + i_act * g_act
+        h_state = o_act * torch.tanh(c_state)
+        outputs.append(h_state.unsqueeze(0))
+    y_th = torch.cat(outputs, dim=0)
+    hn_th = h_state.unsqueeze(0)
+    cn_th = c_state.unsqueeze(0)
+
     # VJP-style scalar loss to inject exact upstream grads
     loss = (y_th * dY_th).sum()
     loss = loss + (hn_th.squeeze(0) * dHN_th).sum()
@@ -390,13 +407,13 @@ def _run_case_backward(lib: ctypes.CDLL, cfg: LstmConfig):
     loss.backward()
 
     # Collect torch grads (cast to FP32 for stable comparison)
-    dx_ref    = x_th.grad.detach().to(dtype=torch.float32).cpu()
-    dh0_ref   = h0_th.grad.detach().to(dtype=torch.float32).squeeze(0).cpu()
-    dc0_ref   = c0_th.grad.detach().to(dtype=torch.float32).squeeze(0).cpu()
-    dW_ih_ref = lstm_ref.weight_ih_l0.grad.detach().to(dtype=torch.float32).cpu()
-    dW_hh_ref = lstm_ref.weight_hh_l0.grad.detach().to(dtype=torch.float32).cpu()
-    db_ih_ref = lstm_ref.bias_ih_l0.grad.detach().to(dtype=torch.float32).cpu()
-    db_hh_ref = lstm_ref.bias_hh_l0.grad.detach().to(dtype=torch.float32).cpu()
+    dx_ref = x_th.grad.detach().to(dtype=torch.float32).cpu()
+    dh0_ref = h0_th.grad.detach().to(dtype=torch.float32).squeeze(0).cpu()
+    dc0_ref = c0_th.grad.detach().to(dtype=torch.float32).squeeze(0).cpu()
+    dW_ih_ref = weight_ih_ref.grad.detach().to(dtype=torch.float32).cpu()
+    dW_hh_ref = weight_hh_ref.grad.detach().to(dtype=torch.float32).cpu()
+    db_ih_ref = bias_ih_ref.grad.detach().to(dtype=torch.float32).cpu()
+    db_hh_ref = bias_hh_ref.grad.detach().to(dtype=torch.float32).cpu()
 
     # Bring custom grads to CPU FP32
     dx_custom  = dx_host.to(dtype=torch.float32)
@@ -435,7 +452,7 @@ def _run_case_backward(lib: ctypes.CDLL, cfg: LstmConfig):
 def _gather_cases() -> Iterable[LstmConfig]:
     # You can add the huge case back after kernel is stable.
     return (
-        LstmConfig(4, 2, 3, 5),
+        LstmConfig(4, 2, 3, 5, 3),
         LstmConfig(16, 8, 64, 32),
         LstmConfig(32, 4, 128, 16),
         LstmConfig(64, 32, 256, 256),

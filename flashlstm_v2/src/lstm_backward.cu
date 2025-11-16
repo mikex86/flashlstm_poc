@@ -2,7 +2,6 @@
 #include "gputx.h"
 #include "lstm.hpp"
 #include "mfu_profiler.hpp"
-#include "numeric_utils.cuh"
 
 #include <algorithm>
 #include <cmath>
@@ -139,8 +138,7 @@ namespace {
             const size_t h_row = row - input_size;
             value = weight_hh[col * hidden_size + h_row];
         }
-        const float clamped = flstm::numeric::ClampToHalfRange(value);
-        weight_cat[row + col * rows] = __float2half(clamped);
+        weight_cat[row + col * rows] = __float2half(value);
     }
 
     __global__ void FuseBiasKernel(
@@ -205,18 +203,16 @@ namespace {
 
         if (dG_half_col_step != nullptr) {
             const size_t base = batch_idx * gate_dim;
-            const float dai_safe = flstm::numeric::ClampToHalfRange(dai);
-            const float daf_safe = flstm::numeric::ClampToHalfRange(daf);
-            const float dag_safe = flstm::numeric::ClampToHalfRange(dag);
-            const float dao_safe = flstm::numeric::ClampToHalfRange(dao);
-            dG_half_col_step[hidden_idx + base] = __float2half(dai_safe);
-            dG_half_col_step[hidden_idx + hidden_size + base] = __float2half(daf_safe);
-            dG_half_col_step[hidden_idx + 2 * hidden_size + base] = __float2half(dag_safe);
-            dG_half_col_step[hidden_idx + 3 * hidden_size + base] = __float2half(dao_safe);
+            dG_half_col_step[hidden_idx + base] = __float2half(dai);
+            dG_half_col_step[hidden_idx + hidden_size + base] = __float2half(daf);
+            dG_half_col_step[hidden_idx + 2 * hidden_size + base] = __float2half(dag);
+            dG_half_col_step[hidden_idx + 3 * hidden_size + base] = __float2half(dao);
         }
 
         dc_prev_row[idx] = dc_prev;
     }
+
+    constexpr float kFp16SafeMax = 60000.0f;
 
     __global__ void ScaleAndPackColumnsKernel(
         const float *z_cols_float, // (I+H, B) column-major float
@@ -235,7 +231,7 @@ namespace {
 
         float local_max = 0.0f;
         for (size_t row = threadIdx.x; row < z_rows; row += blockDim.x) {
-            const float value = flstm::numeric::FiniteOrZero(src[row]);
+            const float value = src[row];
             local_max = fmaxf(local_max, fabsf(value));
         }
         shared[threadIdx.x] = local_max;
@@ -251,24 +247,25 @@ namespace {
         float inv_scale = 1.0f;
         if (threadIdx.x == 0) {
             const float max_abs = shared[0];
-            float column_scale_value = 1.0f;
-            if (max_abs > 0.0f && isfinite(max_abs)) {
-                float scale = max_abs / flstm::numeric::kFp16SafeMax;
-                if (!(scale > 0.0f) || !isfinite(scale)) {
+            float scale = 1.0f;
+            if (max_abs > 0.0f) {
+                scale = max_abs / kFp16SafeMax;
+                if (!(scale > 0.0f)) {
                     scale = 1.0f;
                 }
                 inv_scale = 1.0f / scale;
-                column_scale_value = scale;
+            } else {
+                inv_scale = 1.0f;
             }
-            column_scale[batch_idx] = column_scale_value;
+            column_scale[batch_idx] = 1.0f / inv_scale;
             shared[0] = inv_scale;
         }
         __syncthreads();
         inv_scale = shared[0];
 
         for (size_t row = threadIdx.x; row < z_rows; row += blockDim.x) {
-            const float value = flstm::numeric::FiniteOrZero(src[row]);
-            const float scaled = flstm::numeric::ClampToHalfRange(value * inv_scale);
+            float scaled = src[row] * inv_scale;
+            scaled = fminf(fmaxf(scaled, -kFp16SafeMax), kFp16SafeMax);
             dst[row] = __float2half(scaled);
         }
     }
@@ -297,10 +294,7 @@ namespace {
         const size_t col = batch_idx;
         const size_t row_base = hidden_idx;
 
-        float scale = flstm::numeric::FiniteOrDefault(column_scale[col], 1.0f);
-        if (scale == 0.0f) {
-            scale = 1.0f;
-        }
+        const float scale = column_scale[col];
         const float gi = gate_col[row_base + col * gate_dim] * scale + bias[row_base + 0 * hidden_size];
         const float gf =
             gate_col[row_base + hidden_size + col * gate_dim] * scale + bias[row_base + 1 * hidden_size];
@@ -309,12 +303,12 @@ namespace {
         const float go =
             gate_col[row_base + 3 * hidden_size + col * gate_dim] * scale + bias[row_base + 3 * hidden_size];
 
-        const float i_gate = flstm::numeric::StableSigmoid(gi);
-        const float f_gate = flstm::numeric::StableSigmoid(gf);
+        const float i_gate = 1.0f / (1.0f + expf(-gi));
+        const float f_gate = 1.0f / (1.0f + expf(-gf));
         const float g_gate = tanhf(gg);
         const float c_prev_val = c_prev[idx];
         const float c_val = f_gate * c_prev_val + i_gate * g_gate;
-        const float o_gate = flstm::numeric::StableSigmoid(go);
+        const float o_gate = 1.0f / (1.0f + expf(-go));
         const float h_val = o_gate * tanhf(c_val);
 
         h_next[idx] = h_val;
@@ -355,7 +349,7 @@ namespace {
 
         const size_t column = step_idx * batch_size + batch_idx;
         const float value = dx_col[input_idx + column * input_size];
-        dx_half[idx] = __float2half(flstm::numeric::ClampToHalfRange(value));
+        dx_half[idx] = __float2half(value);
     }
 
     __global__ void BuildZChunkKernel(

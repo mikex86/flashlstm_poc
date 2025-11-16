@@ -21,7 +21,9 @@ def _gate_cache_dtype_enum(dtype: torch.dtype) -> int:
         return 0
     if dtype == torch.float16:
         return 1
-    raise ValueError(f"gate cache dtype must be float16 or float32, got {dtype}")
+    if dtype == torch.float64:
+        return 2
+    raise ValueError(f"gate cache dtype must be float16, float32, or float64, got {dtype}")
 
 
 def _check_pinned_half(tensor: torch.Tensor, name: str) -> None:
@@ -38,6 +40,15 @@ def _check_pinned_float(tensor: torch.Tensor, name: str) -> None:
         raise ValueError(f"{name} must reside on the CPU (pinned host memory).")
     if tensor.dtype != torch.float32:
         raise ValueError(f"{name} must use dtype torch.float32, got {tensor.dtype}.")
+    if not tensor.is_pinned():
+        raise ValueError(f"{name} must be allocated in pinned memory (tensor.pin_memory()).")
+
+
+def _check_pinned_double(tensor: torch.Tensor, name: str) -> None:
+    if tensor.device.type != "cpu":
+        raise ValueError(f"{name} must reside on the CPU (pinned host memory).")
+    if tensor.dtype != torch.float64:
+        raise ValueError(f"{name} must use dtype torch.float64, got {tensor.dtype}.")
     if not tensor.is_pinned():
         raise ValueError(f"{name} must be allocated in pinned memory (tensor.pin_memory()).")
 
@@ -230,12 +241,16 @@ class _StreamingLSTMFunction(Function):
             _check_pinned_float(gate_cache_h, "gate_cache_h")
         elif gate_cache_h.dtype == torch.float16:
             _check_pinned_half(gate_cache_h, "gate_cache_h")
+        elif gate_cache_h.dtype == torch.float64:
+            _check_pinned_double(gate_cache_h, "gate_cache_h")
         else:
             raise ValueError(f"Unsupported dtype for gate_cache_h: {gate_cache_h.dtype}")
         if gate_cache_c.dtype == torch.float32:
             _check_pinned_float(gate_cache_c, "gate_cache_c")
         elif gate_cache_c.dtype == torch.float16:
             _check_pinned_half(gate_cache_c, "gate_cache_c")
+        elif gate_cache_c.dtype == torch.float64:
+            _check_pinned_double(gate_cache_c, "gate_cache_c")
         else:
             raise ValueError(f"Unsupported dtype for gate_cache_c: {gate_cache_c.dtype}")
 

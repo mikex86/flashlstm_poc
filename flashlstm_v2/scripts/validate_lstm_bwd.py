@@ -51,6 +51,8 @@ def _gate_dtype_enum(dtype: torch.dtype) -> int:
         return 0
     if dtype == torch.float16:
         return 1
+    if dtype == torch.float64:
+        return 2
     raise ValueError(f"Unsupported gate cache dtype: {dtype}")
 
 

@@ -27,6 +27,7 @@ namespace {
         switch (dtype) {
             case flstm::GateCacheDType::kFloat32: return "float32";
             case flstm::GateCacheDType::kFloat16: return "float16";
+            case flstm::GateCacheDType::kFloat64: return "float64";
         }
         return "unknown";
     }
@@ -36,6 +37,7 @@ namespace {
             switch (dtype) {
                 case flstm::GateCacheDType::kFloat32:
                 case flstm::GateCacheDType::kFloat16:
+                case flstm::GateCacheDType::kFloat64:
                     return;
                 default:
                     throw std::runtime_error(std::string("Unsupported gate cache dtype for ") + label
@@ -116,6 +118,14 @@ namespace {
         dst[idx] = __half2float(src[idx]);
     }
 
+    __global__ void DoubleToFloatKernel(const double *src, float *dst, const size_t count) {
+        const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+        if (idx >= count) {
+            return;
+        }
+        dst[idx] = static_cast<float>(src[idx]);
+    }
+
     __global__ void FuseWeightsKernel(
         const float *weight_ih, // (4H, I) row-major
         const float *weight_hh, // (4H, H) row-major
@@ -166,7 +176,8 @@ namespace {
         float *dh_point_prev_col, // (H, B) column-major
         float *dc_prev_row, // (B, H) row-major
         const size_t batch_size,
-        const size_t hidden_size
+        const size_t hidden_size,
+        const int use_fp64_state
     ) {
         const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
         const size_t total = batch_size * hidden_size;
@@ -177,38 +188,83 @@ namespace {
         const size_t hidden_idx = idx % hidden_size;
         const size_t gate_dim = 4 * hidden_size;
 
-        const float dh_total = __half2float(dY_row[idx]) + dh_next_row[idx];
-        const float dc_next = dc_next_row[idx];
+        const float dh_total_f = __half2float(dY_row[idx]) + dh_next_row[idx];
+        const float dc_next_f = dc_next_row[idx];
 
-        const float i_gate = gate_cache_row[batch_idx * gate_dim + hidden_idx + 0 * hidden_size];
-        const float f_gate = gate_cache_row[batch_idx * gate_dim + hidden_idx + 1 * hidden_size];
-        const float g_gate = gate_cache_row[batch_idx * gate_dim + hidden_idx + 2 * hidden_size];
-        const float o_gate = gate_cache_row[batch_idx * gate_dim + hidden_idx + 3 * hidden_size];
+        const float i_gate_f = gate_cache_row[batch_idx * gate_dim + hidden_idx + 0 * hidden_size];
+        const float f_gate_f = gate_cache_row[batch_idx * gate_dim + hidden_idx + 1 * hidden_size];
+        const float g_gate_f = gate_cache_row[batch_idx * gate_dim + hidden_idx + 2 * hidden_size];
+        const float o_gate_f = gate_cache_row[batch_idx * gate_dim + hidden_idx + 3 * hidden_size];
 
-        const float y_t = __half2float(y_row[idx]);
+        const float y_t_f = __half2float(y_row[idx]);
         constexpr float kEps = 1e-6f;
 
-        const float denom_o = fabsf(o_gate) < kEps ? (o_gate >= 0.0f ? kEps : -kEps) : o_gate;
-        float tanh_c = y_t / denom_o;
+        if (use_fp64_state) {
+            const double denom_o = fabs(o_gate_f) < kEps ? (o_gate_f >= 0.0f ? kEps : -kEps) : o_gate_f;
+            double tanh_c = static_cast<double>(y_t_f) / denom_o;
+            tanh_c = fmax(fmin(tanh_c, 1.0 - static_cast<double>(kEps)), -1.0 + static_cast<double>(kEps));
+            const double c_t = atanh(tanh_c);
+
+            const double denom_f = fabs(f_gate_f) < kEps ? (f_gate_f >= 0.0f ? kEps : -kEps) : f_gate_f;
+            const double c_prev = (c_t - static_cast<double>(i_gate_f) * static_cast<double>(g_gate_f)) / denom_f;
+
+            const double do_gate = static_cast<double>(dh_total_f) * tanh_c;
+            const double one_minus_tanh_sq = 1.0 - tanh_c * tanh_c;
+            const double dc_total = static_cast<double>(dc_next_f) + static_cast<double>(dh_total_f) *
+                    static_cast<double>(o_gate_f) * one_minus_tanh_sq;
+
+            const double di = dc_total * static_cast<double>(g_gate_f);
+            const double df = dc_total * c_prev;
+            const double dg = dc_total * static_cast<double>(i_gate_f);
+            const double dc_prev = dc_total * static_cast<double>(f_gate_f);
+
+            const double dai = di * static_cast<double>(i_gate_f) * (1.0 - static_cast<double>(i_gate_f));
+            const double daf = df * static_cast<double>(f_gate_f) * (1.0 - static_cast<double>(f_gate_f));
+            const double dag = dg * (1.0 - static_cast<double>(g_gate_f) * static_cast<double>(g_gate_f));
+            const double dao = do_gate * static_cast<double>(o_gate_f) * (1.0 - static_cast<double>(o_gate_f));
+
+            const size_t base = batch_idx * gate_dim;
+            const float dai_f = static_cast<float>(dai);
+            const float daf_f = static_cast<float>(daf);
+            const float dag_f = static_cast<float>(dag);
+            const float dao_f = static_cast<float>(dao);
+            dG_col_step[hidden_idx + base] = dai_f;
+            dG_col_step[hidden_idx + hidden_size + base] = daf_f;
+            dG_col_step[hidden_idx + 2 * hidden_size + base] = dag_f;
+            dG_col_step[hidden_idx + 3 * hidden_size + base] = dao_f;
+            if (dG_half_col_step != nullptr) {
+                dG_half_col_step[hidden_idx + base] = __float2half(dai_f);
+                dG_half_col_step[hidden_idx + hidden_size + base] = __float2half(daf_f);
+                dG_half_col_step[hidden_idx + 2 * hidden_size + base] = __float2half(dag_f);
+                dG_half_col_step[hidden_idx + 3 * hidden_size + base] = __float2half(dao_f);
+            }
+
+            dh_point_prev_col[hidden_idx + batch_idx * hidden_size] = 0.0f; // initialise accumulator
+            dc_prev_row[idx] = static_cast<float>(dc_prev);
+            return;
+        }
+
+        const float denom_o = fabsf(o_gate_f) < kEps ? (o_gate_f >= 0.0f ? kEps : -kEps) : o_gate_f;
+        float tanh_c = y_t_f / denom_o;
         tanh_c = fmaxf(fminf(tanh_c, 1.0f - kEps), -1.0f + kEps);
         const float c_t = atanhf(tanh_c);
 
-        const float denom_f = fabsf(f_gate) < kEps ? (f_gate >= 0.0f ? kEps : -kEps) : f_gate;
-        const float c_prev = (c_t - i_gate * g_gate) / denom_f;
+        const float denom_f = fabsf(f_gate_f) < kEps ? (f_gate_f >= 0.0f ? kEps : -kEps) : f_gate_f;
+        const float c_prev = (c_t - i_gate_f * g_gate_f) / denom_f;
 
-        const float do_gate = dh_total * tanh_c;
+        const float do_gate = dh_total_f * tanh_c;
         const float one_minus_tanh_sq = 1.0f - tanh_c * tanh_c;
-        const float dc_total = dc_next + dh_total * o_gate * one_minus_tanh_sq;
+        const float dc_total = dc_next_f + dh_total_f * o_gate_f * one_minus_tanh_sq;
 
-        const float di = dc_total * g_gate;
+        const float di = dc_total * g_gate_f;
         const float df = dc_total * c_prev;
-        const float dg = dc_total * i_gate;
-        const float dc_prev = dc_total * f_gate;
+        const float dg = dc_total * i_gate_f;
+        const float dc_prev = dc_total * f_gate_f;
 
-        const float dai = di * i_gate * (1.0f - i_gate);
-        const float daf = df * f_gate * (1.0f - f_gate);
-        const float dag = dg * (1.0f - g_gate * g_gate);
-        const float dao = do_gate * o_gate * (1.0f - o_gate);
+        const float dai = di * i_gate_f * (1.0f - i_gate_f);
+        const float daf = df * f_gate_f * (1.0f - f_gate_f);
+        const float dag = dg * (1.0f - g_gate_f * g_gate_f);
+        const float dao = do_gate * o_gate_f * (1.0f - o_gate_f);
 
         dG_col_step[hidden_idx + batch_idx * gate_dim] = dai;
         dG_col_step[hidden_idx + hidden_size + batch_idx * gate_dim] = daf;
@@ -479,6 +535,8 @@ namespace {
         DeviceBuffer<float> *checkpoint_half;
         DeviceBuffer<__half> *checkpoint_h_half_quantized;
         DeviceBuffer<__half> *checkpoint_c_half_quantized;
+        DeviceBuffer<double> *checkpoint_h_double_quantized;
+        DeviceBuffer<double> *checkpoint_c_double_quantized;
         DeviceBuffer<__half> *x_chunk_half;
         DeviceBuffer<__half> *y_chunk_half;
         DeviceBuffer<__half> *dY_chunk_half;
@@ -580,7 +638,7 @@ namespace {
                               cudaMemcpyHostToDevice,
                               params.h2d_stream),
                           "copy checkpoint h state");
-            } else {
+            } else if (params.options.h_dtype == flstm::GateCacheDType::kFloat16) {
                 __half *quantized = params.checkpoint_h_half_quantized[slot].ptr;
                 const __half *checkpoint_src_h =
                         reinterpret_cast<const __half *>(params.checkpoint_cache_host.h_ptr) + checkpoint_offset;
@@ -598,6 +656,24 @@ namespace {
                     params.bh_elements
                 );
                 CheckCuda(cudaGetLastError(), "HalfToFloatKernel checkpoint h");
+            } else {
+                double *quantized = params.checkpoint_h_double_quantized[slot].ptr;
+                const double *checkpoint_src_h =
+                        reinterpret_cast<const double *>(params.checkpoint_cache_host.h_ptr) + checkpoint_offset;
+                CheckCuda(cudaMemcpyAsync(
+                              quantized,
+                              checkpoint_src_h,
+                              params.bh_elements * sizeof(double),
+                              cudaMemcpyHostToDevice,
+                              params.h2d_stream),
+                          "copy checkpoint h state double");
+                const int convert_blocks = BlocksFor(params.bh_elements, params.threads);
+                DoubleToFloatKernel<<<convert_blocks, params.threads, 0, params.h2d_stream>>>(
+                    quantized,
+                    checkpoint_dst_h,
+                    params.bh_elements
+                );
+                CheckCuda(cudaGetLastError(), "DoubleToFloatKernel checkpoint h");
             }
 
             if (params.options.c_dtype == flstm::GateCacheDType::kFloat32) {
@@ -610,7 +686,7 @@ namespace {
                               cudaMemcpyHostToDevice,
                               params.h2d_stream),
                           "copy checkpoint c state");
-            } else {
+            } else if (params.options.c_dtype == flstm::GateCacheDType::kFloat16) {
                 __half *quantized = params.checkpoint_c_half_quantized[slot].ptr;
                 const __half *checkpoint_src_c =
                         reinterpret_cast<const __half *>(params.checkpoint_cache_host.c_ptr) + checkpoint_offset;
@@ -628,6 +704,24 @@ namespace {
                     params.bh_elements
                 );
                 CheckCuda(cudaGetLastError(), "HalfToFloatKernel checkpoint c");
+            } else {
+                double *quantized = params.checkpoint_c_double_quantized[slot].ptr;
+                const double *checkpoint_src_c =
+                        reinterpret_cast<const double *>(params.checkpoint_cache_host.c_ptr) + checkpoint_offset;
+                CheckCuda(cudaMemcpyAsync(
+                              quantized,
+                              checkpoint_src_c,
+                              params.bh_elements * sizeof(double),
+                              cudaMemcpyHostToDevice,
+                              params.h2d_stream),
+                          "copy checkpoint c state double");
+                const int convert_blocks = BlocksFor(params.bh_elements, params.threads);
+                DoubleToFloatKernel<<<convert_blocks, params.threads, 0, params.h2d_stream>>>(
+                    quantized,
+                    checkpoint_dst_c,
+                    params.bh_elements
+                );
+                CheckCuda(cudaGetLastError(), "DoubleToFloatKernel checkpoint c");
             }
         }
 
@@ -790,6 +884,8 @@ namespace flstm {
         DeviceBuffer<float> checkpoint_half[2];
         DeviceBuffer<__half> checkpoint_h_half_quantized[2];
         DeviceBuffer<__half> checkpoint_c_half_quantized[2];
+        DeviceBuffer<double> checkpoint_h_double_quantized[2];
+        DeviceBuffer<double> checkpoint_c_double_quantized[2];
         DeviceBuffer<float> recompute_h_prev;
         DeviceBuffer<float> recompute_h_next;
         DeviceBuffer<float> recompute_c_prev;
@@ -819,11 +915,19 @@ namespace flstm {
         AllocateDeviceBufferArray(checkpoint_half, checkpoint_half_elements, "cudaMalloc checkpoint_half");
         const bool checkpoint_h_is_half = (options.h_dtype == flstm::GateCacheDType::kFloat16);
         const bool checkpoint_c_is_half = (options.c_dtype == flstm::GateCacheDType::kFloat16);
+        const bool checkpoint_h_is_double = (options.h_dtype == flstm::GateCacheDType::kFloat64);
+        const bool checkpoint_c_is_double = (options.c_dtype == flstm::GateCacheDType::kFloat64);
         if (checkpoint_h_is_half) {
             AllocateDeviceBufferArray(checkpoint_h_half_quantized, bh_elements, "cudaMalloc checkpoint_h_quantized");
         }
         if (checkpoint_c_is_half) {
             AllocateDeviceBufferArray(checkpoint_c_half_quantized, bh_elements, "cudaMalloc checkpoint_c_quantized");
+        }
+        if (checkpoint_h_is_double) {
+            AllocateDeviceBufferArray(checkpoint_h_double_quantized, bh_elements, "cudaMalloc checkpoint_h_double_quantized");
+        }
+        if (checkpoint_c_is_double) {
+            AllocateDeviceBufferArray(checkpoint_c_double_quantized, bh_elements, "cudaMalloc checkpoint_c_double_quantized");
         }
         AllocateDeviceBuffer(bias_fused, gate_dim, "cudaMalloc bias_fused");
         AllocateDeviceBuffer(recompute_h_prev, bh_elements, "cudaMalloc recompute_h_prev");
@@ -851,6 +955,8 @@ namespace flstm {
         const float beta_zero = 0.0f;
         const float beta_one = 1.0f;
         const int point_blocks = BlocksFor(bh_elements, threads);
+        const int use_fp64_state = (options.h_dtype == flstm::GateCacheDType::kFloat64 ||
+                                    options.c_dtype == flstm::GateCacheDType::kFloat64) ? 1 : 0;
 
         CudaEvent h2d_ready[2];
         CudaEvent compute_done[2];
@@ -881,6 +987,8 @@ namespace flstm {
             .checkpoint_half = checkpoint_half,
             .checkpoint_h_half_quantized = checkpoint_h_half_quantized,
             .checkpoint_c_half_quantized = checkpoint_c_half_quantized,
+            .checkpoint_h_double_quantized = checkpoint_h_double_quantized,
+            .checkpoint_c_double_quantized = checkpoint_c_double_quantized,
             .x_chunk_half = x_chunk_half,
             .y_chunk_half = y_chunk_half,
             .dY_chunk_half = dY_chunk_half,
@@ -1076,7 +1184,8 @@ namespace flstm {
                     dh_out,
                     dc_out,
                     batch_size,
-                    hidden_size
+                    hidden_size,
+                    use_fp64_state
                 );
                 CheckCuda(cudaGetLastError(), "BackwardPointwiseKernel");
 

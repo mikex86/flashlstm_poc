@@ -77,6 +77,11 @@ def _normalize_weight_sets(
         allow_rank1: bool = False,
     ) -> Tuple[int, torch.Tensor]:
         if param.dim() == 2:
+            # Bias tensors may come as (S, 4H) when allow_rank1 is True.
+            if allow_rank1 and param.shape[1:] == expected_last_shape:
+                if param.shape[0] <= 0:
+                    raise ValueError(f"{label} must have at least one weight set, got shape {tuple(param.shape)}")
+                return param.shape[0], param
             set_count = 1
             if param.shape != expected_last_shape:
                 raise ValueError(f"{label} must have shape {expected_last_shape}, got {tuple(param.shape)}")

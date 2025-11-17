@@ -62,12 +62,11 @@ class LstmConfig:
     input_size: int
     hidden_size: int
     weight_sets: int = 1
-    time_oversample: bool = False
 
     def describe(self) -> str:
         return (
             f"T={self.time_steps}, B={self.batch_size}, "
-            f"I={self.input_size}, H={self.hidden_size}, S={self.weight_sets}, O={int(self.time_oversample)}"
+            f"I={self.input_size}, H={self.hidden_size}, S={self.weight_sets}"
         )
 
 
@@ -81,7 +80,6 @@ def _prepare_functions(lib: ctypes.CDLL) -> None:
         ctypes.c_size_t,  # hidden
         ctypes.c_size_t,  # recompute_interval
         ctypes.c_size_t,  # weight_set_count
-        ctypes.c_bool,    # time_oversample
         ctypes.c_void_p,  # x host
         ctypes.c_void_p,  # h0 device
         ctypes.c_void_p,  # c0 device
@@ -108,7 +106,6 @@ def _prepare_functions(lib: ctypes.CDLL) -> None:
         ctypes.c_size_t,  # hidden
         ctypes.c_size_t,  # recompute_interval
         ctypes.c_size_t,  # weight_set_count
-        ctypes.c_bool,    # time_oversample
 
         ctypes.c_void_p,  # x host
         ctypes.c_void_p,  # y host
@@ -145,15 +142,10 @@ def _run_case_forward_only(lib: ctypes.CDLL, cfg: LstmConfig):
     device = torch.device("cuda")
 
     weight_set_count = cfg.weight_sets
-    oversample_factor = weight_set_count if (cfg.time_oversample and weight_set_count > 1) else 1
-    effective_time_steps = cfg.time_steps * oversample_factor
 
     x_fp32 = torch.randn(cfg.time_steps, cfg.batch_size, cfg.input_size, dtype=torch.float32).contiguous()
-    x_host_logical = x_fp32.to(dtype=torch.float16).contiguous().pin_memory()
+    x_host = x_fp32.to(dtype=torch.float16).contiguous().pin_memory()
     x_torch = x_fp32.to(device)
-    x_host = x_host_logical
-    if oversample_factor > 1:
-        x_host = x_host_logical.repeat_interleave(oversample_factor, dim=0).contiguous()
 
     h0_init = torch.randn(1, cfg.batch_size, cfg.hidden_size, dtype=torch.float32)
     c0_init = torch.randn(1, cfg.batch_size, cfg.hidden_size, dtype=torch.float32)
@@ -189,17 +181,16 @@ def _run_case_forward_only(lib: ctypes.CDLL, cfg: LstmConfig):
         c_cell = c0_torch.squeeze(0).clone()
         h_states_ref = []
         for t in range(cfg.time_steps):
-            for set_idx in range(weight_set_count if cfg.time_oversample else 1):
-                effective_idx = set_idx if cfg.time_oversample else (t % weight_set_count)
-                h_cell, c_cell = lstm_cells[effective_idx](x_torch[t], (h_cell, c_cell))
+            set_idx = t % weight_set_count
+            h_cell, c_cell = lstm_cells[set_idx](x_torch[t], (h_cell, c_cell))
             h_states_ref.append(h_cell.unsqueeze(0))
         h_states_ref = torch.cat(h_states_ref, dim=0)
         y_ref = h_states_ref
         h_n_ref = h_cell.unsqueeze(0)
         c_n_ref = c_cell.unsqueeze(0)
 
-    y_host = torch.empty(effective_time_steps, cfg.batch_size, cfg.hidden_size, dtype=torch.float16).contiguous().pin_memory()
-    checkpoint_steps = (effective_time_steps + RECOMPUTE - 1) // RECOMPUTE
+    y_host = torch.empty(cfg.time_steps, cfg.batch_size, cfg.hidden_size, dtype=torch.float16).contiguous().pin_memory()
+    checkpoint_steps = (cfg.time_steps + RECOMPUTE - 1) // RECOMPUTE
     gate_cache_h = torch.empty(
         checkpoint_steps,
         cfg.batch_size,
@@ -232,13 +223,12 @@ def _run_case_forward_only(lib: ctypes.CDLL, cfg: LstmConfig):
         raise RuntimeError("Streaming LSTM forward requires three distinct CUDA streams")
 
     lib.flstm_StreamingLstmForward(
-        ctypes.c_size_t(effective_time_steps),
+        ctypes.c_size_t(cfg.time_steps),
         ctypes.c_size_t(cfg.batch_size),
         ctypes.c_size_t(cfg.input_size),
         ctypes.c_size_t(cfg.hidden_size),
         ctypes.c_size_t(RECOMPUTE),
         ctypes.c_size_t(weight_set_count),
-        ctypes.c_bool(False),
         _as_void_p(x_host),
         _as_void_p(h0_device),
         _as_void_p(c0_device),
@@ -259,10 +249,7 @@ def _run_case_forward_only(lib: ctypes.CDLL, cfg: LstmConfig):
 
     # Forward validations
     y_ref_cpu = y_ref.cpu()
-    y_custom_eff = y_host
-    if oversample_factor > 1:
-        y_custom_eff = y_custom_eff.view(cfg.time_steps, oversample_factor, cfg.batch_size, cfg.hidden_size)[:, -1, ...].contiguous()
-    y_custom = y_custom_eff.to(dtype=torch.float32)
+    y_custom = y_host.to(dtype=torch.float32)
     h_states_custom = y_custom
     h_states_ref_cpu = h_states_ref.cpu()
     h_custom = hy_device.to(dtype=torch.float32).cpu()
@@ -299,27 +286,19 @@ def _run_case_backward(lib: ctypes.CDLL, cfg: LstmConfig):
 
     device = torch.device("cuda")
     weight_set_count = cfg.weight_sets
-    oversample_factor = weight_set_count if (cfg.time_oversample and weight_set_count > 1) else 1
-    effective_time_steps = cfg.time_steps * oversample_factor
 
     # === Upstream grads (host half for dY; device half for dHN/dCN) ===
     torch.manual_seed(42)
-    dY_fp32  = torch.randn(cfg.time_steps, cfg.batch_size, cfg.hidden_size, dtype=torch.float32)
+    dY_fp32  = torch.randn_like(y_host.to(dtype=torch.float32))
     dHN_fp32 = torch.randn(cfg.batch_size, cfg.hidden_size, dtype=torch.float32)
     dCN_fp32 = torch.randn(cfg.batch_size, cfg.hidden_size, dtype=torch.float32)
 
-    dY_host_eff = dY_fp32.to(dtype=torch.float16).contiguous().pin_memory()
-    if oversample_factor > 1:
-        dY_host_expanded = torch.zeros_like(y_host)
-        dY_host_expanded.view(cfg.time_steps, oversample_factor, cfg.batch_size, cfg.hidden_size)[:, -1, ...] = dY_host_eff
-        dY_host = dY_host_expanded
-    else:
-        dY_host = dY_host_eff
+    dY_host = dY_fp32.to(dtype=torch.float16).contiguous().pin_memory()
     dHN_dev = dHN_fp32.to(device=device, dtype=torch.float16).contiguous()
     dCN_dev = dCN_fp32.to(device=device, dtype=torch.float16).contiguous()
 
     # === Outputs to be written by our custom backward ===
-    dx_host = torch.empty(effective_time_steps, cfg.batch_size, cfg.input_size,
+    dx_host = torch.empty(cfg.time_steps, cfg.batch_size, cfg.input_size,
                           dtype=torch.float16).contiguous().pin_memory()
     dW_ih_dev = torch.zeros(
         weight_set_count, 4 * cfg.hidden_size, cfg.input_size, device=device, dtype=torch.float32
@@ -351,13 +330,12 @@ def _run_case_backward(lib: ctypes.CDLL, cfg: LstmConfig):
     )
 
     lib.flstm_StreamingLstmBackward(
-        ctypes.c_size_t(effective_time_steps),
+        ctypes.c_size_t(cfg.time_steps),
         ctypes.c_size_t(cfg.batch_size),
         ctypes.c_size_t(cfg.input_size),
         ctypes.c_size_t(cfg.hidden_size),
         ctypes.c_size_t(RECOMPUTE),
         ctypes.c_size_t(weight_set_count),
-        ctypes.c_bool(False),
 
         _as_void_p(x_host),
         _as_void_p(y_host),
@@ -405,7 +383,7 @@ def _run_case_backward(lib: ctypes.CDLL, cfg: LstmConfig):
     h_state = h0_th.squeeze(0)
     c_state = c0_th.squeeze(0)
     outputs = []
-    for t in range(effective_time_steps):
+    for t in range(cfg.time_steps):
         set_idx = t % weight_set_count
         gates_linear = F.linear(x_th[t], weight_ih_ref[set_idx]) \
             + F.linear(h_state, weight_hh_ref[set_idx]) \
@@ -429,11 +407,7 @@ def _run_case_backward(lib: ctypes.CDLL, cfg: LstmConfig):
     loss.backward()
 
     # Collect torch grads (cast to FP32 for stable comparison)
-    dx_ref_eff = x_th.grad.detach().to(dtype=torch.float32).cpu()
-    if oversample_factor > 1:
-        dx_ref = dx_ref_eff.view(cfg.time_steps, oversample_factor, cfg.batch_size, cfg.input_size).sum(dim=1)
-    else:
-        dx_ref = dx_ref_eff
+    dx_ref = x_th.grad.detach().to(dtype=torch.float32).cpu()
     dh0_ref = h0_th.grad.detach().to(dtype=torch.float32).squeeze(0).cpu()
     dc0_ref = c0_th.grad.detach().to(dtype=torch.float32).squeeze(0).cpu()
     dW_ih_ref = weight_ih_ref.grad.detach().to(dtype=torch.float32).cpu()
@@ -442,10 +416,7 @@ def _run_case_backward(lib: ctypes.CDLL, cfg: LstmConfig):
     db_hh_ref = bias_hh_ref.grad.detach().to(dtype=torch.float32).cpu()
 
     # Bring custom grads to CPU FP32
-    if oversample_factor > 1:
-        dx_custom = dx_host.view(cfg.time_steps, oversample_factor, cfg.batch_size, cfg.input_size).sum(dim=1).to(dtype=torch.float32)
-    else:
-        dx_custom  = dx_host.to(dtype=torch.float32)
+    dx_custom  = dx_host.to(dtype=torch.float32)
     dh0_custom = dh0_dev.to(dtype=torch.float32).cpu()
     dc0_custom = dc0_dev.to(dtype=torch.float32).cpu()
     dW_ih_custom = dW_ih_dev.to(dtype=torch.float32).cpu()
@@ -481,7 +452,7 @@ def _run_case_backward(lib: ctypes.CDLL, cfg: LstmConfig):
 def _gather_cases() -> Iterable[LstmConfig]:
     # You can add the huge case back after kernel is stable.
     return (
-        LstmConfig(4, 2, 3, 5, 3, True),
+        LstmConfig(4, 2, 3, 5, 3),
         LstmConfig(16, 8, 64, 32),
         LstmConfig(32, 4, 128, 16),
         LstmConfig(64, 32, 256, 256),

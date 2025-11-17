@@ -48,7 +48,6 @@ void StreamingLstmForward(
     size_t hidden_size,
     size_t recompute_interval,
     size_t weight_set_count,
-    bool time_oversample,
 
     const __half *x_tensor_host,
     const __half *h0_device,
@@ -102,7 +101,6 @@ void StreamingLstmBackward(
     size_t hidden_size,
     size_t recompute_interval,
     size_t weight_set_count,
-    bool time_oversample,
 
     const __half *x_tensor_host,
     const __half *y_tensor_host,
@@ -159,7 +157,6 @@ void flstm_StreamingLstmForward(
     size_t hidden_size,
     size_t recompute_interval,
     size_t weight_set_count,
-    bool time_oversample,
 
     const __half *x_tensor_host,
     const __half *h0_device,
@@ -189,7 +186,6 @@ void flstm_StreamingLstmBackward(
     size_t hidden_size,
     size_t recompute_interval,
     size_t weight_set_count,
-    bool time_oversample,
 
     const __half *x_tensor_host,
     const __half *y_tensor_host,

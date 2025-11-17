@@ -130,7 +130,6 @@ class _StreamingLSTMFunction(Function):
         recompute_interval: int,
         gate_cache_dtypes: Tuple[torch.dtype, torch.dtype],
         weight_set_count: Optional[int],
-        time_oversample: bool,
     ):
         _check_pinned_half(x_host, "x_host")
         if not x_host.is_contiguous():
@@ -163,9 +162,7 @@ class _StreamingLSTMFunction(Function):
             hidden_size,
             weight_set_count,
         )
-        oversample_factor = weight_set_count if (time_oversample and weight_set_count > 1) else 1
-        effective_time_steps = time_steps * oversample_factor
-        checkpoint_steps = (effective_time_steps + recompute_interval - 1) // recompute_interval
+        checkpoint_steps = (time_steps + recompute_interval - 1) // recompute_interval
 
         h0 = _ensure_half_cuda(h0, (x_host.size(1), hidden_size), "h0")
         c0 = _ensure_half_cuda(c0, (x_host.size(1), hidden_size), "c0")
@@ -174,8 +171,8 @@ class _StreamingLSTMFunction(Function):
         gate_cache_h_enum = _gate_cache_dtype_enum(gate_cache_h_dtype)
         gate_cache_c_enum = _gate_cache_dtype_enum(gate_cache_c_dtype)
 
-        y_host_kernel = torch.empty(
-            (effective_time_steps, batch_size, hidden_size),
+        y_host = torch.empty(
+            (time_steps, batch_size, hidden_size),
             dtype=torch.float16,
             pin_memory=True,
         )
@@ -200,26 +197,21 @@ class _StreamingLSTMFunction(Function):
         h2d_stream = torch.cuda.Stream()
         d2h_stream = torch.cuda.Stream()
 
-        effective_x_host = x_host
-        if oversample_factor > 1:
-            effective_x_host = x_host.repeat_interleave(oversample_factor, dim=0).contiguous().pin_memory()
-
         _streaming_lstm_forward(
-            effective_time_steps,
+            time_steps,
             batch_size,
             input_size,
             hidden_size,
             recompute_interval,
             weight_set_count,
-            False,  # Python handles oversampling
-            effective_x_host.data_ptr(),
+            x_host.data_ptr(),
             h0.data_ptr(),
             c0.data_ptr(),
             weight_ih.data_ptr(),
             weight_hh.data_ptr(),
             bias_ih.data_ptr(),
             bias_hh.data_ptr(),
-            y_host_kernel.data_ptr(),
+            y_host.data_ptr(),
             gate_cache_h.data_ptr(),
             gate_cache_c.data_ptr(),
             gate_cache_h_enum,
@@ -236,11 +228,6 @@ class _StreamingLSTMFunction(Function):
         d2h_stream.synchronize()
         torch.cuda.current_stream().wait_stream(compute_stream)
 
-        if oversample_factor > 1:
-            y_host = y_host_kernel.view(time_steps, oversample_factor, batch_size, hidden_size)[:, -1, ...].contiguous()
-        else:
-            y_host = y_host_kernel
-
         ctx.save_for_backward(
             x_host,
             h0,
@@ -249,7 +236,7 @@ class _StreamingLSTMFunction(Function):
             weight_hh,
             bias_ih,
             bias_hh,
-            y_host_kernel,
+            y_host,
             gate_cache_h,
             gate_cache_c,
         )
@@ -259,11 +246,9 @@ class _StreamingLSTMFunction(Function):
             input_size,
             hidden_size,
             recompute_interval,
+            weight_set_count,
             gate_cache_h_enum,
             gate_cache_c_enum,
-            oversample_factor,
-            weight_set_count,
-            time_oversample,
         )
         ctx.mark_non_differentiable(gate_cache_h, gate_cache_c)
 
@@ -296,11 +281,9 @@ class _StreamingLSTMFunction(Function):
             input_size,
             hidden_size,
             recompute_interval,
+            weight_set_count,
             gate_cache_h_enum,
             gate_cache_c_enum,
-            oversample_factor,
-            weight_set_count,
-            _time_oversample,
         ) = ctx.meta
         if gate_cache_h.dtype == torch.float32:
             _check_pinned_float(gate_cache_h, "gate_cache_h")
@@ -354,12 +337,7 @@ class _StreamingLSTMFunction(Function):
             grad_cy_half = grad_cy
             grad_cy_ptr = grad_cy_half.data_ptr()
 
-        effective_time_steps = time_steps * oversample_factor
-        dx_host_kernel = torch.empty(
-            (effective_time_steps, batch_size, input_size),
-            dtype=torch.float16,
-            pin_memory=True,
-        )
+        dx_host = torch.empty_like(x_host)
         dW_ih = torch.zeros_like(weight_ih)
         dW_hh = torch.zeros_like(weight_hh)
         db_ih = torch.zeros_like(bias_ih)
@@ -371,29 +349,20 @@ class _StreamingLSTMFunction(Function):
         h2d_stream = torch.cuda.Stream()
         d2h_stream = torch.cuda.Stream()
 
-        effective_x_host = x_host
-        if oversample_factor > 1:
-            effective_x_host = x_host.repeat_interleave(oversample_factor, dim=0).contiguous().pin_memory()
-        effective_grad_y_host = grad_y_host
-        if oversample_factor > 1:
-            effective_grad_y_host = torch.zeros_like(dx_host_kernel)
-            effective_grad_y_host.view(time_steps, oversample_factor, batch_size, hidden_size)[:, -1, ...] = grad_y_host
-
         _streaming_lstm_backward(
-            effective_time_steps,
+            time_steps,
             batch_size,
             input_size,
             hidden_size,
             recompute_interval,
             weight_set_count,
-            False,  # Python handles oversampling
-            effective_x_host.data_ptr(),
+            x_host.data_ptr(),
             y_host.data_ptr(),
             gate_cache_h.data_ptr(),
             gate_cache_c.data_ptr(),
             gate_cache_h_enum,
             gate_cache_c_enum,
-            effective_grad_y_host.data_ptr(),
+            grad_y_host.data_ptr(),
             grad_hy_ptr,
             grad_cy_ptr,
             h0.data_ptr(),
@@ -402,7 +371,7 @@ class _StreamingLSTMFunction(Function):
             weight_hh.data_ptr(),
             bias_ih.data_ptr(),
             bias_hh.data_ptr(),
-            dx_host_kernel.data_ptr(),
+            dx_host.data_ptr(),
             dW_ih.data_ptr(),
             dW_hh.data_ptr(),
             db_ih.data_ptr(),
@@ -422,11 +391,6 @@ class _StreamingLSTMFunction(Function):
         grad_h0 = dh0_float.to(dtype=h0.dtype)
         grad_c0 = dc0_float.to(dtype=c0.dtype)
 
-        if oversample_factor > 1:
-            dx_host = dx_host_kernel.view(time_steps, oversample_factor, batch_size, input_size).sum(dim=1).contiguous()
-        else:
-            dx_host = dx_host_kernel
-
         return (
             dx_host,
             grad_h0,
@@ -435,7 +399,6 @@ class _StreamingLSTMFunction(Function):
             dW_hh,
             db_ih,
             db_hh,
-            None,
             None,
             None,
             None,
@@ -454,7 +417,6 @@ def streaming_lstm(
     recompute_interval: int = 1,
     gate_cache_dtypes: Tuple[torch.dtype, torch.dtype] = (torch.float32, torch.float32),
     weight_set_count: Optional[int] = None,
-    time_oversample: bool = False,
 ) -> Tuple[torch.Tensor, GateCache, torch.Tensor, torch.Tensor]:
     """
     Functional wrapper for the streaming LSTM kernels.
@@ -471,7 +433,6 @@ def streaming_lstm(
         recompute_interval,
         gate_cache_dtypes,
         weight_set_count,
-        time_oversample,
     )
     y_host, gate_cache_h, gate_cache_c, hy, cy = outputs
     gate_cache = GateCache(gate_cache_h, gate_cache_c)
@@ -524,7 +485,6 @@ class StreamingLSTM(nn.Module):
         *,
         recompute_interval: int = 1,
         gate_cache_dtypes: Tuple[torch.dtype, torch.dtype] = (torch.float32, torch.float32),
-        time_oversample: bool = False,
     ) -> Tuple[torch.Tensor, GateCache, Tuple[torch.Tensor, torch.Tensor]]:
         _check_pinned_half(x_host, "x_host")
         batch_size = x_host.size(1)
@@ -542,6 +502,5 @@ class StreamingLSTM(nn.Module):
             recompute_interval=recompute_interval,
             gate_cache_dtypes=gate_cache_dtypes,
             weight_set_count=self.weight_set_count,
-            time_oversample=time_oversample,
         )
         return y_host, gate_cache_host, (hy, cy)

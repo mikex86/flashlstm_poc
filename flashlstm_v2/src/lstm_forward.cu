@@ -409,8 +409,6 @@ __global__ void ForwardPointwiseKernel(
 struct ForwardChunkCopyParams {
     size_t total_chunks;
     size_t time_steps;
-    size_t logical_time_steps;
-    size_t oversample_factor;
     size_t chunk_capacity;
     size_t batch_size;
     size_t input_size;
@@ -444,22 +442,18 @@ static size_t IssueChunkCopy(size_t chunk_index, int slot, const ForwardChunkCop
     if (steps == 0) {
         return 0;
     }
-    const size_t bytes_per_step = params.batch_size * params.input_size * sizeof(__half);
-    for (size_t local = 0; local < steps; ++local) {
-        const size_t global_step = chunk_start + local;
-        const size_t src_step = global_step / params.oversample_factor;
-        const size_t src_offset = src_step * params.batch_size * params.input_size;
-        const size_t dst_offset = local * params.batch_size * params.input_size;
-        const __half *src = params.x_tensor_host + src_offset;
-        __half *dst = params.x_chunk_buffers[slot].ptr + dst_offset;
-        CheckCuda(cudaMemcpyAsync(
-                      dst,
-                      src,
-                      bytes_per_step,
-                      cudaMemcpyHostToDevice,
-                      params.h2d_stream),
-                  "async copy x chunk oversample");
+    const size_t bytes = steps * params.batch_size * params.input_size * sizeof(__half);
+    if (bytes == 0) {
+        return 0;
     }
+    const __half *src = params.x_tensor_host + chunk_start * params.batch_size * params.input_size;
+    CheckCuda(cudaMemcpyAsync(
+                  params.x_chunk_buffers[slot].ptr,
+                  src,
+                  bytes,
+                  cudaMemcpyHostToDevice,
+                  params.h2d_stream),
+              "async copy x chunk");
     CheckCuda(cudaEventRecord(params.x_ready[slot].evt, params.h2d_stream), "record x_ready");
     return steps;
 }
@@ -475,7 +469,6 @@ void StreamingLstmForward(
     size_t hidden_size,
     size_t recompute_interval,
     size_t weight_set_count,
-    bool time_oversample,
 
     const __half *x_tensor_host,
     const __half *h_0_device,
@@ -509,8 +502,6 @@ void StreamingLstmForward(
     if (weight_set_count == 0) {
         throw std::runtime_error("StreamingLstmForward requires weight_set_count >= 1");
     }
-    const size_t oversample_factor = (time_oversample && weight_set_count > 1) ? weight_set_count : 1;
-    const size_t effective_time_steps = time_steps * oversample_factor;
     if (compute_stream == h2d_stream || compute_stream == d2h_stream || h2d_stream == d2h_stream) {
         throw std::runtime_error("StreamingLstmForward requires distinct compute/h2d/d2h streams");
     }
@@ -519,7 +510,7 @@ void StreamingLstmForward(
     const size_t z_rows = input_size + hidden_size;
     const size_t bh_elements = batch_size * hidden_size;
     const size_t checkpoint_stride = recompute_interval;
-    const size_t checkpoint_count = (effective_time_steps + checkpoint_stride - 1) / checkpoint_stride;
+    const size_t checkpoint_count = (time_steps + checkpoint_stride - 1) / checkpoint_stride;
     const size_t checkpoint_h_elements = checkpoint_count * bh_elements;
     const size_t checkpoint_c_elements = checkpoint_count * bh_elements;
     const size_t checkpoint_h_bytes = checkpoint_h_elements * GateCacheDTypeSize(options.h_dtype);
@@ -549,7 +540,7 @@ void StreamingLstmForward(
     if (y_tensor_host != nullptr) {
         y_host_registration.reset(
             y_tensor_host,
-            effective_time_steps * y_step_bytes,
+            time_steps * y_step_bytes,
             "cudaHostRegister y_tensor_host"
         );
     }
@@ -686,14 +677,12 @@ void StreamingLstmForward(
     bool y_copy_inflight[2] = {false, false};
     size_t chunk_steps[2] = {0, 0};
 
-    const size_t total_chunks = (effective_time_steps + chunk_capacity - 1) / chunk_capacity;
+    const size_t total_chunks = (time_steps + chunk_capacity - 1) / chunk_capacity;
 
     // Shared metadata for the double-buffered input copy helper.
     ForwardChunkCopyParams chunk_params{};
     chunk_params.total_chunks = total_chunks;
-    chunk_params.time_steps = effective_time_steps;
-    chunk_params.logical_time_steps = time_steps;
-    chunk_params.oversample_factor = oversample_factor;
+    chunk_params.time_steps = time_steps;
     chunk_params.chunk_capacity = chunk_capacity;
     chunk_params.batch_size = batch_size;
     chunk_params.input_size = input_size;
@@ -776,8 +765,8 @@ void StreamingLstmForward(
         }
 
         for (size_t step = 0; step < steps_in_chunk; ++step) {
-        const size_t global_step = chunk_start_step + step;
-        const size_t weight_set = global_step % weight_set_count;
+            const size_t global_step = chunk_start_step + step;
+            const size_t weight_set = global_step % weight_set_count;
             const size_t column_offset = step * batch_size;
             float *z_step_float = z_chunk_float + column_offset * z_rows;
             const int scale_blocks = static_cast<int>(batch_size);
@@ -1011,7 +1000,6 @@ extern "C" void flstm_StreamingLstmForward(
     const size_t hidden_size,
     const size_t recompute_interval,
     const size_t weight_set_count,
-    const bool time_oversample,
 
     const __half *x_tensor_host,
     const __half *h0_device,
@@ -1050,7 +1038,6 @@ extern "C" void flstm_StreamingLstmForward(
             hidden_size,
             recompute_interval,
             weight_set_count,
-            time_oversample,
             x_tensor_host,
             h0_device,
             c0_device,

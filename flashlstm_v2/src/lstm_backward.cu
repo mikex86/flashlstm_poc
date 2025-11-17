@@ -329,6 +329,7 @@ namespace {
         float *h_next, // (B, H) row-major
         float *c_next, // (B, H) row-major
         float *gate_out, // (B, 4H) row-major or nullptr
+        __half *y_out, // (B, H) row-major or nullptr
         const float *column_scale, // (B,) scaling factors for this step
         const size_t batch_size,
         const size_t hidden_size
@@ -370,6 +371,9 @@ namespace {
             gate_ptr[hidden_idx + 1 * hidden_size] = f_gate;
             gate_ptr[hidden_idx + 2 * hidden_size] = g_gate;
             gate_ptr[hidden_idx + 3 * hidden_size] = o_gate;
+        }
+        if (y_out != nullptr) {
+            y_out[batch_idx * hidden_size + hidden_idx] = __float2half(h_val);
         }
     }
 
@@ -688,6 +692,8 @@ void StreamingLstmBackward(
         if (weight_set_count == 0) {
             throw std::runtime_error("StreamingLstmBackward requires weight_set_count >= 1");
         }
+        const bool time_oversample = options.time_oversample && weight_set_count > 1;
+        const size_t step_multiplier = time_oversample ? weight_set_count : 1;
         if (x_tensor_host == nullptr || y_tensor_host == nullptr || gate_cache_host.h_ptr == nullptr ||
             gate_cache_host.c_ptr == nullptr ||
             dY_tensor_host == nullptr || h0_device == nullptr || c0_device == nullptr) {
@@ -779,10 +785,12 @@ void StreamingLstmBackward(
         constexpr size_t chunk_capacity = kChunkSteps;
         const size_t recompute_stride = recompute_interval;
         const size_t max_chunk_window = chunk_capacity + recompute_stride - 1;
-        const size_t chunk_gate_capacity = chunk_capacity * batch_size * gate_dim;
+        const size_t chunk_substeps = chunk_capacity * step_multiplier;
+        const size_t chunk_gate_capacity = chunk_substeps * batch_size * gate_dim;
         const size_t chunk_input_capacity = max_chunk_window * batch_size * input_size;
-        const size_t chunk_hidden_capacity = chunk_capacity * batch_size * hidden_size;
+        const size_t chunk_hidden_capacity = chunk_substeps * batch_size * hidden_size;
         const size_t chunk_tb_capacity = chunk_capacity * batch_size;
+        const size_t chunk_tb_substep_capacity = chunk_substeps * batch_size;
 
         AllocateDeviceBuffer(ones_vec, chunk_tb_capacity, "cudaMalloc ones_vec");
         const int ones_blocks = BlocksFor(chunk_tb_capacity, threads);
@@ -792,6 +800,7 @@ void StreamingLstmBackward(
         DeviceBuffer<__half> x_chunk_half[2];
         DeviceBuffer<__half> y_chunk_half[2];
         DeviceBuffer<__half> dY_chunk_half[2];
+        DeviceBuffer<__half> zero_dY;
         DeviceBuffer<float> gate_chunk_float[2];
         DeviceBuffer<__half> z_chunk_col[2];
         DeviceBuffer<float> dG_chunk_col[2];
@@ -813,7 +822,7 @@ void StreamingLstmBackward(
 
         const size_t z_chunk_elements = z_rows * chunk_tb_capacity;
         const size_t dX_chunk_elements = input_size * chunk_tb_capacity;
-        const size_t dG_chunk_elements = gate_dim * chunk_tb_capacity;
+        const size_t dG_chunk_elements = gate_dim * chunk_tb_substep_capacity;
         const size_t checkpoint_half_elements = 2 * bh_elements;
         const size_t z_step_elements = z_rows * batch_size;
         const size_t gate_step_elements = gate_dim * batch_size;
@@ -825,6 +834,8 @@ void StreamingLstmBackward(
         AllocateDeviceBufferArray(dx_chunk_half, chunk_input_capacity, "cudaMalloc dx_chunk_half");
         AllocateDeviceBufferArray(y_chunk_half, chunk_hidden_capacity, "cudaMalloc y_chunk_half");
         AllocateDeviceBufferArray(dY_chunk_half, chunk_hidden_capacity, "cudaMalloc dY_chunk_half");
+        AllocateDeviceBuffer(zero_dY, bh_elements, "cudaMalloc zero_dY");
+        ZeroDeviceMemory(zero_dY.ptr, bh_elements, compute_stream, "memset zero_dY");
         AllocateDeviceBufferArray(dG_chunk_col, dG_chunk_elements, "cudaMalloc dG_chunk_col");
         AllocateDeviceBufferArray(dG_chunk_half, dG_chunk_elements, "cudaMalloc dG_chunk_half");
         AllocateDeviceBufferArray(y_prev_half, bh_elements, "cudaMalloc y_prev_half");
@@ -1006,7 +1017,6 @@ void StreamingLstmBackward(
 
                 for (size_t local_step = 0; local_step < recompute_steps; ++local_step) {
                     const size_t global_step = chunk_start_step + local_step;
-                    const size_t weight_set = global_step % weight_set_count;
                     const __half *x_step_half =
                             x_chunk_half[slot].ptr + local_step * batch_size * input_size;
                     const int input_blocks = BlocksFor(batch_size * input_size, threads);
@@ -1018,74 +1028,90 @@ void StreamingLstmBackward(
                         hidden_size
                     );
                     CheckCuda(cudaGetLastError(), "PackInputStepKernel");
-                    PackHiddenStateKernel<<<point_blocks, threads, 0, compute_stream>>>(
-                        recompute_h_prev.ptr,
-                        z_step_float.ptr,
-                        batch_size,
-                        input_size,
-                        hidden_size
-                    );
-                    CheckCuda(cudaGetLastError(), "PackHiddenStateKernel");
-                    const int scale_blocks = static_cast<int>(batch_size);
-                    const size_t shared_bytes = threads * sizeof(float);
-                    ScaleAndPackColumnsKernel<<<scale_blocks, threads, shared_bytes, compute_stream>>>(
-                        z_step_float.ptr,
-                        z_step_half.ptr,
-                        column_scale_tmp.ptr,
-                        z_rows,
-                        batch_size
-                    );
-                    CheckCuda(cudaGetLastError(), "ScaleAndPackColumnsKernel recompute");
-                    const __half *weight_cat_step = weight_cat_col.ptr + weight_set * z_rows * gate_dim;
-                    flstm::GemmTN(
-                        static_cast<int>(gate_dim),
-                        static_cast<int>(batch_size),
-                        static_cast<int>(z_rows),
-                        weight_cat_step,
-                        static_cast<int>(z_rows),
-                        z_step_half.ptr,
-                        static_cast<int>(z_rows),
-                        gate_pre_col.ptr,
-                        static_cast<int>(gate_dim),
-                        alpha,
-                        beta_zero,
-                        compute_stream);
-                    profiler.AddTotal(mfu::GemmFlops(gate_dim, batch_size, z_rows));
-                    float *gate_out_ptr = nullptr;
-                    if (local_step >= prefix_steps) {
-                        const size_t chunk_local = local_step - prefix_steps;
-                        gate_out_ptr = gate_chunk_float[slot].ptr + chunk_local * batch_size * gate_dim;
+
+                    for (size_t repeat_idx = 0; repeat_idx < step_multiplier; ++repeat_idx) {
+                        const size_t weight_set = time_oversample ? repeat_idx : (global_step % weight_set_count);
+                        PackHiddenStateKernel<<<point_blocks, threads, 0, compute_stream>>>(
+                            recompute_h_prev.ptr,
+                            z_step_float.ptr,
+                            batch_size,
+                            input_size,
+                            hidden_size
+                        );
+                        CheckCuda(cudaGetLastError(), "PackHiddenStateKernel");
+                        const int scale_blocks = static_cast<int>(batch_size);
+                        const size_t shared_bytes = threads * sizeof(float);
+                        ScaleAndPackColumnsKernel<<<scale_blocks, threads, shared_bytes, compute_stream>>>(
+                            z_step_float.ptr,
+                            z_step_half.ptr,
+                            column_scale_tmp.ptr,
+                            z_rows,
+                            batch_size
+                        );
+                        CheckCuda(cudaGetLastError(), "ScaleAndPackColumnsKernel recompute");
+                        const __half *weight_cat_step = weight_cat_col.ptr + weight_set * z_rows * gate_dim;
+                        flstm::GemmTN(
+                            static_cast<int>(gate_dim),
+                            static_cast<int>(batch_size),
+                            static_cast<int>(z_rows),
+                            weight_cat_step,
+                            static_cast<int>(z_rows),
+                            z_step_half.ptr,
+                            static_cast<int>(z_rows),
+                            gate_pre_col.ptr,
+                            static_cast<int>(gate_dim),
+                            alpha,
+                            beta_zero,
+                            compute_stream);
+                        profiler.AddTotal(mfu::GemmFlops(gate_dim, batch_size, z_rows));
+                        float *gate_out_ptr = nullptr;
+                        __half *y_out_ptr = nullptr;
+                        if (local_step >= prefix_steps) {
+                            const size_t chunk_local =
+                                    (local_step - prefix_steps) * step_multiplier + repeat_idx;
+                            gate_out_ptr = gate_chunk_float[slot].ptr + chunk_local * batch_size * gate_dim;
+                            y_out_ptr = y_chunk_half[slot].ptr + chunk_local * bh_elements;
+                        }
+                        const float *bias_ptr = bias_fused.ptr + weight_set * gate_dim;
+                        RecomputePointwiseKernel<<<point_blocks, threads, 0, compute_stream>>>(
+                            gate_pre_col.ptr,
+                            bias_ptr,
+                            recompute_c_prev.ptr,
+                            recompute_h_next.ptr,
+                            recompute_c_next.ptr,
+                            gate_out_ptr,
+                            y_out_ptr,
+                            column_scale_tmp.ptr,
+                            batch_size,
+                            hidden_size
+                        );
+                        CheckCuda(cudaGetLastError(), "RecomputePointwiseKernel");
+                        std::swap(recompute_h_prev.ptr, recompute_h_next.ptr);
+                        std::swap(recompute_c_prev.ptr, recompute_c_next.ptr);
                     }
-                    const float *bias_ptr = bias_fused.ptr + weight_set * gate_dim;
-                    RecomputePointwiseKernel<<<point_blocks, threads, 0, compute_stream>>>(
-                        gate_pre_col.ptr,
-                        bias_ptr,
-                        recompute_c_prev.ptr,
-                        recompute_h_next.ptr,
-                        recompute_c_next.ptr,
-                        gate_out_ptr,
-                        column_scale_tmp.ptr,
-                        batch_size,
-                        hidden_size
-                    );
-                    CheckCuda(cudaGetLastError(), "RecomputePointwiseKernel");
-                    std::swap(recompute_h_prev.ptr, recompute_h_next.ptr);
-                    std::swap(recompute_c_prev.ptr, recompute_c_next.ptr);
                 }
             }
 
-            for (int step = static_cast<int>(steps_in_chunk) - 1; step >= 0; --step) {
-                const size_t global_step = chunk_start_step + static_cast<size_t>(step);
-                const size_t weight_set = global_step % weight_set_count;
-                const size_t local_offset = static_cast<size_t>(step) * batch_size;
+            const size_t total_substeps = steps_in_chunk * step_multiplier;
+            for (ssize_t substep = static_cast<ssize_t>(total_substeps) - 1; substep >= 0; --substep) {
+                const size_t logical_step = static_cast<size_t>(substep) / step_multiplier;
+                const size_t repeat_idx = static_cast<size_t>(substep) % step_multiplier;
+                const size_t global_step = chunk_start_step + logical_step;
+                const size_t weight_set =
+                        time_oversample ? repeat_idx : (global_step % weight_set_count);
+                const size_t local_offset = static_cast<size_t>(substep) * batch_size;
                 float *dG_step = dG_chunk_col[slot].ptr + local_offset * gate_dim;
                 __half *dG_half_step = dG_chunk_half[slot].ptr + local_offset * gate_dim;
                 float *dh_out = dh_tmp.ptr;
                 float *dc_out = dc_tmp.ptr;
 
-                const __half *dY_t = dY_chunk_half[slot].ptr + static_cast<size_t>(step) * bh_elements;
-                const float *gate_step = gate_chunk_float[slot].ptr + static_cast<size_t>(step) * batch_size * gate_dim;
-                const __half *y_step = y_chunk_half[slot].ptr + static_cast<size_t>(step) * bh_elements;
+                const bool has_explicit_grad = (!time_oversample) || (repeat_idx + 1 == step_multiplier);
+                const __half *dY_t = has_explicit_grad
+                        ? dY_chunk_half[slot].ptr + logical_step * bh_elements
+                        : zero_dY.ptr;
+                const float *gate_step =
+                        gate_chunk_float[slot].ptr + static_cast<size_t>(substep) * batch_size * gate_dim;
+                const __half *y_step = y_chunk_half[slot].ptr + static_cast<size_t>(substep) * bh_elements;
 
                 BackwardPointwiseKernel<<<point_blocks, threads, 0, compute_stream>>>(
                     dY_t,
@@ -1119,7 +1145,7 @@ void StreamingLstmBackward(
                     compute_stream);
                 profiler.AddUseful(mfu::GemmFlops(hidden_size, batch_size, gate_dim));
 
-                const __half *z_chunk_base = z_chunk_col[slot].ptr + static_cast<size_t>(step) * batch_size * z_rows;
+                const __half *z_chunk_base = z_chunk_col[slot].ptr + logical_step * batch_size * z_rows;
                 const __half *x_chunk_matrix = z_chunk_base;
                 const __half *h_chunk_matrix = z_chunk_base + input_size;
                 float *dW_ih_set = dW_ih + weight_set * gate_dim * input_size;
@@ -1181,10 +1207,10 @@ void StreamingLstmBackward(
                     static_cast<int>(z_rows),
                     dG_half_step,
                     static_cast<int>(gate_dim),
-                    dX_chunk_col[slot].ptr + static_cast<size_t>(step) * batch_size * input_size,
+                    dX_chunk_col[slot].ptr + logical_step * batch_size * input_size,
                     static_cast<int>(input_size),
                     alpha,
-                    beta_zero,
+                    has_explicit_grad ? beta_zero : beta_one,
                     compute_stream);
                 profiler.AddUseful(mfu::GemmFlops(input_size, static_cast<size_t>(batch_size), gate_dim));
 
@@ -1316,6 +1342,7 @@ extern "C" void flstm_StreamingLstmBackward(
         if (options != nullptr) {
             opts.h_dtype = static_cast<flstm::GateCacheDType>(options->h_dtype);
             opts.c_dtype = static_cast<flstm::GateCacheDType>(options->c_dtype);
+            opts.time_oversample = (options->time_oversample != 0);
         }
         flstm::StreamingLstmBackward(
             time_steps,

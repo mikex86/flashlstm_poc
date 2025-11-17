@@ -33,6 +33,7 @@ PyObject *StreamingLstmForward(PyObject *, PyObject *args) {
     unsigned long long gate_cache_c_host{};
     unsigned long long gate_cache_h_dtype{};
     unsigned long long gate_cache_c_dtype{};
+    unsigned long long time_oversample{};
     unsigned long long hy_device{};
     unsigned long long cy_device{};
     unsigned long long compute_stream{};
@@ -41,7 +42,7 @@ PyObject *StreamingLstmForward(PyObject *, PyObject *args) {
 
     if (!PyArg_ParseTuple(
             args,
-            "KKKKKKKKKKKKKKKKKKKKKKK",
+            "KKKKKKKKKKKKKKKKKKKKKKKK",
             &time_steps,
             &batch_size,
             &input_size,
@@ -60,6 +61,7 @@ PyObject *StreamingLstmForward(PyObject *, PyObject *args) {
             &gate_cache_c_host,
             &gate_cache_h_dtype,
             &gate_cache_c_dtype,
+            &time_oversample,
             &hy_device,
             &cy_device,
             &compute_stream,
@@ -75,6 +77,7 @@ PyObject *StreamingLstmForward(PyObject *, PyObject *args) {
     flstm_StreamingLstmOptions options{};
     options.h_dtype = static_cast<flstm_GateCacheDType>(gate_cache_h_dtype);
     options.c_dtype = static_cast<flstm_GateCacheDType>(gate_cache_c_dtype);
+    options.time_oversample = static_cast<int>(time_oversample);
 
     Py_BEGIN_ALLOW_THREADS
     flstm_StreamingLstmForward(
@@ -118,6 +121,7 @@ PyObject *StreamingLstmBackward(PyObject *, PyObject *args) {
     unsigned long long gate_cache_c_host{};
     unsigned long long gate_cache_h_dtype{};
     unsigned long long gate_cache_c_dtype{};
+    unsigned long long time_oversample{};
     unsigned long long dY_tensor_host{};
     unsigned long long d_hn_device{};
     unsigned long long d_cn_device{};
@@ -140,7 +144,7 @@ PyObject *StreamingLstmBackward(PyObject *, PyObject *args) {
 
     if (!PyArg_ParseTuple(
             args,
-            "KKKKKKKKKKKKKKKKKKKKKKKKKKKKKKK",
+            "KKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKK",
             &time_steps,
             &batch_size,
             &input_size,
@@ -153,6 +157,7 @@ PyObject *StreamingLstmBackward(PyObject *, PyObject *args) {
             &gate_cache_c_host,
             &gate_cache_h_dtype,
             &gate_cache_c_dtype,
+            &time_oversample,
             &dY_tensor_host,
             &d_hn_device,
             &d_cn_device,
@@ -182,6 +187,7 @@ PyObject *StreamingLstmBackward(PyObject *, PyObject *args) {
     flstm_StreamingLstmOptions options{};
     options.h_dtype = static_cast<flstm_GateCacheDType>(gate_cache_h_dtype);
     options.c_dtype = static_cast<flstm_GateCacheDType>(gate_cache_c_dtype);
+    options.time_oversample = static_cast<int>(time_oversample);
 
     Py_BEGIN_ALLOW_THREADS
     flstm_StreamingLstmBackward(

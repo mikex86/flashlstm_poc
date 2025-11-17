@@ -19,6 +19,7 @@ struct GateCacheHost {
 struct StreamingLstmOptions {
     GateCacheDType h_dtype = GateCacheDType::kFloat32;
     GateCacheDType c_dtype = GateCacheDType::kFloat32;
+    bool time_oversample = false;
 };
 
 /**
@@ -148,6 +149,7 @@ typedef struct {
 typedef struct {
     flstm_GateCacheDType h_dtype;
     flstm_GateCacheDType c_dtype;
+    int time_oversample;
 } flstm_StreamingLstmOptions;
 
 void flstm_StreamingLstmForward(

@@ -43,6 +43,7 @@ class StreamingLstmOptions(ctypes.Structure):
     _fields_ = [
         ("h_dtype", ctypes.c_int),
         ("c_dtype", ctypes.c_int),
+        ("time_oversample", ctypes.c_int),
     ]
 
 
@@ -61,11 +62,13 @@ class LstmConfig:
     input_size: int
     hidden_size: int
     weight_sets: int = 1
+    time_oversample: bool = False
 
     def describe(self) -> str:
         return (
             f"T={self.time_steps}, B={self.batch_size}, "
-            f"I={self.input_size}, H={self.hidden_size}, S={self.weight_sets}"
+            f"I={self.input_size}, H={self.hidden_size}, S={self.weight_sets}, "
+            f"oversample={self.time_oversample}"
         )
 
 
@@ -101,6 +104,7 @@ def _run_case(lib: ctypes.CDLL, cfg: LstmConfig):
     device = torch.device("cuda")
 
     weight_set_count = cfg.weight_sets
+    time_oversample = cfg.time_oversample and weight_set_count > 1
 
     x_fp32 = torch.randn(cfg.time_steps, cfg.batch_size, cfg.input_size, dtype=torch.float32).contiguous()
     x_host = x_fp32.to(dtype=torch.float16).contiguous().pin_memory()
@@ -140,9 +144,14 @@ def _run_case(lib: ctypes.CDLL, cfg: LstmConfig):
         c_cell = c0_torch.squeeze(0).clone()
         h_states_ref = []
         for t in range(cfg.time_steps):
-            set_idx = t % weight_set_count
-            h_cell, c_cell = lstm_cells[set_idx](x_torch[t], (h_cell, c_cell))
-            h_states_ref.append(h_cell.unsqueeze(0))
+            if time_oversample and weight_set_count > 1:
+                for set_idx in range(weight_set_count):
+                    h_cell, c_cell = lstm_cells[set_idx](x_torch[t], (h_cell, c_cell))
+                h_states_ref.append(h_cell.unsqueeze(0))
+            else:
+                set_idx = t % weight_set_count
+                h_cell, c_cell = lstm_cells[set_idx](x_torch[t], (h_cell, c_cell))
+                h_states_ref.append(h_cell.unsqueeze(0))
         h_states_ref = torch.cat(h_states_ref, dim=0)
         y_ref = h_states_ref
         h_n_ref = h_cell.unsqueeze(0)
@@ -167,6 +176,7 @@ def _run_case(lib: ctypes.CDLL, cfg: LstmConfig):
     gate_cache_options = StreamingLstmOptions(
         _gate_dtype_enum(gate_cache_h.dtype),
         _gate_dtype_enum(gate_cache_c.dtype),
+        int(time_oversample),
     )
 
     hy_device = torch.empty(cfg.batch_size, cfg.hidden_size, dtype=torch.float16, device=device).contiguous()
@@ -238,6 +248,7 @@ def _run_case(lib: ctypes.CDLL, cfg: LstmConfig):
 def _gather_cases() -> Iterable[LstmConfig]:
     return (
         LstmConfig(4, 2, 3, 5, 3),
+        LstmConfig(4, 2, 3, 5, 3, time_oversample=True),
         LstmConfig(16, 8, 64, 32),
         LstmConfig(32, 4, 128, 16),
         LstmConfig(64, 32, 256, 256),

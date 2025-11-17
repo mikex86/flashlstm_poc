@@ -502,6 +502,8 @@ void StreamingLstmForward(
     if (weight_set_count == 0) {
         throw std::runtime_error("StreamingLstmForward requires weight_set_count >= 1");
     }
+    const bool time_oversample = options.time_oversample && weight_set_count > 1;
+    const size_t weight_repeats = time_oversample ? weight_set_count : 1;
     if (compute_stream == h2d_stream || compute_stream == d2h_stream || h2d_stream == d2h_stream) {
         throw std::runtime_error("StreamingLstmForward requires distinct compute/h2d/d2h streams");
     }
@@ -766,23 +768,11 @@ void StreamingLstmForward(
 
         for (size_t step = 0; step < steps_in_chunk; ++step) {
             const size_t global_step = chunk_start_step + step;
-            const size_t weight_set = global_step % weight_set_count;
             const size_t column_offset = step * batch_size;
             float *z_step_float = z_chunk_float + column_offset * z_rows;
             const int scale_blocks = static_cast<int>(batch_size);
             const size_t shared_bytes = threads * sizeof(float);
-            ScaleAndPackColumnsKernel<<<scale_blocks, threads, shared_bytes, compute_stream>>>(
-                z_step_float,
-                z_step_half_buffer.ptr,
-                column_scale_buffer.ptr,
-                z_rows,
-                batch_size
-            );
-            CheckCuda(cudaGetLastError(), "ScaleAndPackColumnsKernel");
-            __half *y_step = nullptr;
-            if (needs_y_fallback && y_chunk_half[slot].ptr != nullptr) {
-                y_step = y_chunk_half[slot].ptr + step * bh_elements;
-            }
+
             __half *gate_cache_step = nullptr;
             float *checkpoint_dst_h = nullptr;
             float *checkpoint_dst_c = nullptr;
@@ -806,53 +796,84 @@ void StreamingLstmForward(
                 }
             }
 
-            const __half *weight_cat_ptr = weight_cat_half.ptr + weight_set * z_rows * gate_dim;
-            flstm::GemmTN(
-                static_cast<int>(gate_dim),
-                static_cast<int>(batch_size),
-                static_cast<int>(z_rows),
-                weight_cat_ptr,
-                static_cast<int>(z_rows),
-                z_step_half_buffer.ptr,
-                static_cast<int>(z_rows),
-                gate_pre_col.ptr,
-                static_cast<int>(gate_dim),
-                alpha_f,
-                beta_zero_f,
-                compute_stream);
-            profiler.AddUseful(mfu::GemmFlops(gate_dim, batch_size, z_rows));
+            for (size_t repeat_idx = 0; repeat_idx < weight_repeats; ++repeat_idx) {
+                const size_t weight_set = time_oversample ? repeat_idx : (global_step % weight_set_count);
+                const bool is_final_repeat = (repeat_idx + 1 == weight_repeats);
 
-            const bool has_next_column = (step + 1 < steps_in_chunk);
-            const size_t next_column_offset = has_next_column ? ((step + 1) * batch_size) : 0;
+                if (time_oversample) {
+                    SeedHiddenColumnKernel<<<seed_blocks, threads, 0, compute_stream>>>(
+                        h_prev.ptr,
+                        z_step_float,
+                        batch_size,
+                        input_size,
+                        hidden_size
+                    );
+                    CheckCuda(cudaGetLastError(), "SeedHiddenColumnKernel repeat");
+                }
 
-            const float *bias_ptr = bias_fused.ptr + weight_set * gate_dim;
-            ForwardPointwiseKernel<<<point_blocks, threads, 0, compute_stream>>>(
-                gate_pre_col.ptr,
-                bias_ptr,
-                c_prev.ptr,
-                h_prev.ptr,
-                h_next.ptr,
-                c_next.ptr,
-                y_step,
-                gate_cache_step,
-                nullptr,
-                nullptr,
-                z_chunk_float,
-                column_scale_buffer.ptr,
-                checkpoint_dst_h,
-                checkpoint_dst_c,
-                z_rows,
-                input_size,
-                has_next_column ? 1 : 0,
-                next_column_offset,
-                step + 1,
-                batch_size,
-                hidden_size
-            );
-            CheckCuda(cudaGetLastError(), "ForwardPointwiseKernel");
+                ScaleAndPackColumnsKernel<<<scale_blocks, threads, shared_bytes, compute_stream>>>(
+                    z_step_float,
+                    z_step_half_buffer.ptr,
+                    column_scale_buffer.ptr,
+                    z_rows,
+                    batch_size
+                );
+                CheckCuda(cudaGetLastError(), "ScaleAndPackColumnsKernel");
+                __half *y_step = nullptr;
+                if (is_final_repeat && needs_y_fallback && y_chunk_half[slot].ptr != nullptr) {
+                    y_step = y_chunk_half[slot].ptr + step * bh_elements;
+                }
+                float *checkpoint_dst_h_rep = (repeat_idx == 0) ? checkpoint_dst_h : nullptr;
+                float *checkpoint_dst_c_rep = (repeat_idx == 0) ? checkpoint_dst_c : nullptr;
 
-            std::swap(h_prev.ptr, h_next.ptr);
-            std::swap(c_prev.ptr, c_next.ptr);
+                const __half *weight_cat_ptr = weight_cat_half.ptr + weight_set * z_rows * gate_dim;
+                flstm::GemmTN(
+                    static_cast<int>(gate_dim),
+                    static_cast<int>(batch_size),
+                    static_cast<int>(z_rows),
+                    weight_cat_ptr,
+                    static_cast<int>(z_rows),
+                    z_step_half_buffer.ptr,
+                    static_cast<int>(z_rows),
+                    gate_pre_col.ptr,
+                    static_cast<int>(gate_dim),
+                    alpha_f,
+                    beta_zero_f,
+                    compute_stream);
+                profiler.AddUseful(mfu::GemmFlops(gate_dim, batch_size, z_rows));
+
+                const bool has_next_column = (is_final_repeat && (step + 1 < steps_in_chunk));
+                const size_t next_column_offset = has_next_column ? ((step + 1) * batch_size) : 0;
+
+                const float *bias_ptr = bias_fused.ptr + weight_set * gate_dim;
+                ForwardPointwiseKernel<<<point_blocks, threads, 0, compute_stream>>>(
+                    gate_pre_col.ptr,
+                    bias_ptr,
+                    c_prev.ptr,
+                    h_prev.ptr,
+                    h_next.ptr,
+                    c_next.ptr,
+                    y_step,
+                    gate_cache_step,
+                    nullptr,
+                    nullptr,
+                    z_chunk_float,
+                    column_scale_buffer.ptr,
+                    checkpoint_dst_h_rep,
+                    checkpoint_dst_c_rep,
+                    z_rows,
+                    input_size,
+                    has_next_column ? 1 : 0,
+                    next_column_offset,
+                    step + 1,
+                    batch_size,
+                    hidden_size
+                );
+                CheckCuda(cudaGetLastError(), "ForwardPointwiseKernel");
+
+                std::swap(h_prev.ptr, h_next.ptr);
+                std::swap(c_prev.ptr, c_next.ptr);
+            }
         }
 
         if (store_checkpoints) {
@@ -1030,6 +1051,7 @@ extern "C" void flstm_StreamingLstmForward(
         if (options != nullptr) {
             opts.h_dtype = static_cast<flstm::GateCacheDType>(options->h_dtype);
             opts.c_dtype = static_cast<flstm::GateCacheDType>(options->c_dtype);
+            opts.time_oversample = (options->time_oversample != 0);
         }
         flstm::StreamingLstmForward(
             time_steps,

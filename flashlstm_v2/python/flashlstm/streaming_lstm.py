@@ -70,12 +70,21 @@ def _normalize_weight_sets(
 ) -> Tuple[int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     if requested_sets is not None and requested_sets <= 0:
         raise ValueError(f"weight_set_count must be >= 1, got {requested_sets}")
-    def _validate_and_maybe_expand(param: torch.Tensor, expected_last_shape: Tuple[int, ...], label: str) -> Tuple[int, torch.Tensor]:
+    def _validate_and_maybe_expand(
+        param: torch.Tensor,
+        expected_last_shape: Tuple[int, ...],
+        label: str,
+        allow_rank1: bool = False,
+    ) -> Tuple[int, torch.Tensor]:
         if param.dim() == 2:
             set_count = 1
             if param.shape != expected_last_shape:
                 raise ValueError(f"{label} must have shape {expected_last_shape}, got {tuple(param.shape)}")
             return set_count, param
+        if allow_rank1 and param.dim() == 1:
+            if param.numel() != expected_last_shape[0]:
+                raise ValueError(f"{label} must have length {expected_last_shape[0]}, got {param.numel()}")
+            return 1, param
         if param.dim() == 3:
             if param.shape[1:] != expected_last_shape:
                 raise ValueError(f"{label} must have shape (S, {', '.join(map(str, expected_last_shape))}), got {tuple(param.shape)}")
@@ -84,8 +93,8 @@ def _normalize_weight_sets(
 
     set_ih, weight_ih = _validate_and_maybe_expand(weight_ih, (gate_dim, input_size), "weight_ih")
     set_hh, weight_hh = _validate_and_maybe_expand(weight_hh, (gate_dim, hidden_size), "weight_hh")
-    set_bih, bias_ih = _validate_and_maybe_expand(bias_ih, (gate_dim,), "bias_ih")
-    set_bhh, bias_hh = _validate_and_maybe_expand(bias_hh, (gate_dim,), "bias_hh")
+    set_bih, bias_ih = _validate_and_maybe_expand(bias_ih, (gate_dim,), "bias_ih", allow_rank1=True)
+    set_bhh, bias_hh = _validate_and_maybe_expand(bias_hh, (gate_dim,), "bias_hh", allow_rank1=True)
 
     inferred_sets = set_ih
     for name, count in (("weight_hh", set_hh), ("bias_ih", set_bih), ("bias_hh", set_bhh)):

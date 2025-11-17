@@ -144,16 +144,17 @@ struct CudaEvent {
 
 struct HostRegistration {
     const void *ptr{nullptr};
-    void reset(const void *p, size_t bytes, const char *what) {
+
+    void reset(const void *p, const size_t bytes, const char *what) {
         if (ptr != nullptr) {
             cudaHostUnregister(const_cast<void *>(ptr));
             ptr = nullptr;
         }
-        const bool registered = RegisterHostMemoryOrThrow(p, bytes, what);
-        if (registered) {
+        if (RegisterHostMemoryOrThrow(p, bytes, what)) {
             ptr = p;
         }
     }
+
     ~HostRegistration() {
         if (ptr != nullptr) {
             cudaHostUnregister(const_cast<void *>(ptr));
@@ -161,7 +162,7 @@ struct HostRegistration {
     }
 };
 
-__global__ void HalfToFloatKernel(const __half *src, float *dst, size_t count) {
+__global__ void HalfToFloatKernel(const __half *src, float *dst, const size_t count) {
     const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= count) {
         return;
@@ -169,7 +170,7 @@ __global__ void HalfToFloatKernel(const __half *src, float *dst, size_t count) {
     dst[idx] = __half2float(src[idx]);
 }
 
-__global__ void FloatToHalfKernel(const float *src, __half *dst, size_t count) {
+__global__ void FloatToHalfKernel(const float *src, __half *dst, const size_t count) {
     const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= count) {
         return;

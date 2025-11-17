@@ -61,11 +61,12 @@ class LstmConfig:
     input_size: int
     hidden_size: int
     weight_sets: int = 1
+    time_oversample: bool = False
 
     def describe(self) -> str:
         return (
             f"T={self.time_steps}, B={self.batch_size}, "
-            f"I={self.input_size}, H={self.hidden_size}, S={self.weight_sets}"
+            f"I={self.input_size}, H={self.hidden_size}, S={self.weight_sets}, O={int(self.time_oversample)}"
         )
 
 
@@ -78,6 +79,7 @@ def _prepare_function(lib: ctypes.CDLL) -> None:
         ctypes.c_size_t,  # hidden
         ctypes.c_size_t,  # recompute_interval
         ctypes.c_size_t,  # weight_set_count
+        ctypes.c_bool,    # time_oversample
         ctypes.c_void_p,  # x host
         ctypes.c_void_p,  # h0 device
         ctypes.c_void_p,  # c0 device
@@ -101,10 +103,15 @@ def _run_case(lib: ctypes.CDLL, cfg: LstmConfig):
     device = torch.device("cuda")
 
     weight_set_count = cfg.weight_sets
+    oversample_factor = weight_set_count if (cfg.time_oversample and weight_set_count > 1) else 1
+    effective_time_steps = cfg.time_steps * oversample_factor
 
     x_fp32 = torch.randn(cfg.time_steps, cfg.batch_size, cfg.input_size, dtype=torch.float32).contiguous()
-    x_host = x_fp32.to(dtype=torch.float16).contiguous().pin_memory()
+    x_host_logical = x_fp32.to(dtype=torch.float16).contiguous().pin_memory()
     x_torch = x_fp32.to(device)
+    x_host = x_host_logical
+    if oversample_factor > 1:
+        x_host = x_host_logical.repeat_interleave(oversample_factor, dim=0).contiguous()
 
     h0_init = torch.randn(1, cfg.batch_size, cfg.hidden_size, dtype=torch.float32)
     c0_init = torch.randn(1, cfg.batch_size, cfg.hidden_size, dtype=torch.float32)
@@ -140,17 +147,18 @@ def _run_case(lib: ctypes.CDLL, cfg: LstmConfig):
         c_cell = c0_torch.squeeze(0).clone()
         h_states_ref = []
         for t in range(cfg.time_steps):
-            set_idx = t % weight_set_count
-            h_cell, c_cell = lstm_cells[set_idx](x_torch[t], (h_cell, c_cell))
+            for set_idx in range(weight_set_count if cfg.time_oversample else 1):
+                effective_idx = set_idx if cfg.time_oversample else (t % weight_set_count)
+                h_cell, c_cell = lstm_cells[effective_idx](x_torch[t], (h_cell, c_cell))
             h_states_ref.append(h_cell.unsqueeze(0))
         h_states_ref = torch.cat(h_states_ref, dim=0)
         y_ref = h_states_ref
         h_n_ref = h_cell.unsqueeze(0)
         c_n_ref = c_cell.unsqueeze(0)
 
-    y_host = torch.empty(cfg.time_steps, cfg.batch_size, cfg.hidden_size, dtype=torch.float16).contiguous().pin_memory()
+    y_host = torch.empty(effective_time_steps, cfg.batch_size, cfg.hidden_size, dtype=torch.float16).contiguous().pin_memory()
 
-    checkpoint_steps = (cfg.time_steps + RECOMPUTE - 1) // RECOMPUTE
+    checkpoint_steps = (effective_time_steps + RECOMPUTE - 1) // RECOMPUTE
     gate_cache_h = torch.empty(
         checkpoint_steps,
         cfg.batch_size,
@@ -186,12 +194,13 @@ def _run_case(lib: ctypes.CDLL, cfg: LstmConfig):
         raise RuntimeError("Streaming LSTM forward requires three distinct CUDA streams")
 
     lib.flstm_StreamingLstmForward(
-        ctypes.c_size_t(cfg.time_steps),
+        ctypes.c_size_t(effective_time_steps),
         ctypes.c_size_t(cfg.batch_size),
         ctypes.c_size_t(cfg.input_size),
         ctypes.c_size_t(cfg.hidden_size),
         ctypes.c_size_t(RECOMPUTE),
         ctypes.c_size_t(weight_set_count),
+        ctypes.c_bool(False),  # oversample handled in test harness
         _as_void_p(x_host),
         _as_void_p(h0_device),
         _as_void_p(c0_device),
@@ -212,7 +221,10 @@ def _run_case(lib: ctypes.CDLL, cfg: LstmConfig):
     torch.cuda.synchronize()
 
     y_ref_cpu = y_ref.cpu()
-    y_custom = y_host.to(dtype=torch.float32)
+    y_custom_eff = y_host
+    if oversample_factor > 1:
+        y_custom_eff = y_custom_eff.view(cfg.time_steps, oversample_factor, cfg.batch_size, cfg.hidden_size)[:, -1, ...].contiguous()
+    y_custom = y_custom_eff.to(dtype=torch.float32)
     h_states_custom = y_custom
     h_states_ref_cpu = h_states_ref.cpu()
     h_custom = hy_device.to(dtype=torch.float32).cpu()
@@ -237,7 +249,7 @@ def _run_case(lib: ctypes.CDLL, cfg: LstmConfig):
 
 def _gather_cases() -> Iterable[LstmConfig]:
     return (
-        LstmConfig(4, 2, 3, 5, 3),
+        LstmConfig(4, 2, 3, 5, 3, True),
         LstmConfig(16, 8, 64, 32),
         LstmConfig(32, 4, 128, 16),
         LstmConfig(64, 32, 256, 256),

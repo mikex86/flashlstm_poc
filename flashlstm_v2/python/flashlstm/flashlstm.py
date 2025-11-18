@@ -298,7 +298,7 @@ def flashlstm(
     gate_cache_dtypes: Tuple[torch.dtype, torch.dtype] = (torch.float32, torch.float32),
     weight_set_count: Optional[int] = None,
     time_oversample: bool = False,
-    ) -> Tuple[torch.Tensor, GateCache, torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, GateCache, torch.Tensor, torch.Tensor]:
     y, gate_cache_h, gate_cache_c, hy, cy = _LstmFunction.apply(
         x,
         h0,
@@ -369,7 +369,8 @@ class FlashLstm(nn.Module):
         recompute_interval: int = 1,
         gate_cache_dtypes: Tuple[torch.dtype, torch.dtype] = (torch.float32, torch.float32),
         time_oversample: Optional[bool] = None,
-    ) -> Tuple[torch.Tensor, GateCache, Tuple[torch.Tensor, torch.Tensor]]:
+        return_gate_cache: bool = False,
+    ) -> Tuple[torch.Tensor, GateCache, Tuple[torch.Tensor, torch.Tensor]] | Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         if x.device.type != "cuda":
             raise ValueError("FlashLstm expects CUDA inputs.")
         if x.dtype != torch.float16:
@@ -394,4 +395,6 @@ class FlashLstm(nn.Module):
             weight_set_count=self.weight_set_count,
             time_oversample=use_time_oversample,
         )
-        return y_device, gate_cache, (hy, cy)
+        if return_gate_cache:
+            return y_device, gate_cache, (hy, cy)
+        return y_device, (hy, cy)

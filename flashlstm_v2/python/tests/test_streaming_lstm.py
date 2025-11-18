@@ -268,7 +268,7 @@ def test_flashlstm_matches_streaming():
     y_host, _, (hy_stream, cy_stream) = streaming(x_host, h0, c0)
     y_stream = y_host.to(device="cuda", dtype=torch.float16)
 
-    y_flash, _, (hy_flash, cy_flash) = flash(x_device, h0, c0)
+    y_flash, _, (hy_flash, cy_flash) = flash(x_device, h0, c0, return_gate_cache=True)
 
     torch.testing.assert_close(y_flash.float(), y_stream.float(), rtol=1e-3, atol=2e-3)
     torch.testing.assert_close(hy_flash.float(), hy_stream.float(), rtol=1e-3, atol=2e-3)
@@ -307,7 +307,7 @@ def test_flashlstm_matches_torch_lstm():
     flash.zero_grad(set_to_none=True)
     reference.zero_grad(set_to_none=True)
 
-    y_flash, _, (hy_flash, cy_flash) = flash(x, h0, c0)
+    y_flash, _, (hy_flash, cy_flash) = flash(x, h0, c0, return_gate_cache=True)
     y_ref, (hy_ref, cy_ref) = reference(x.to(dtype=torch.float32), (h0_ref, c0_ref))
     hy_ref = hy_ref.squeeze(0)
     cy_ref = cy_ref.squeeze(0)

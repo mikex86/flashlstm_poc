@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.18)
 
-set(CMAKE_CUDA_ARCHITECTURES 89)
+set(CMAKE_CUDA_ARCHITECTURES 89;90a)
 project(flashlstm LANGUAGES CUDA CXX)
 
 find_library(NVTX_LIBRARY NAMES nvToolsExt64_1 nvToolsExt)
@@ -18,8 +18,6 @@ target_include_directories(flashlstm PUBLIC include)
 set_target_properties(flashlstm PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(flashlstm PUBLIC cudnn cublas nvidia::cutlass::cutlass ${NVTX_LIBRARY})
 target_compile_options(flashlstm PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
-list(GET CMAKE_CUDA_ARCHITECTURES 0 FLASHLSTM_FIRST_ARCH)
-target_compile_definitions(flashlstm PRIVATE FLASHLSTM_CUDA_ARCH=${FLASHLSTM_FIRST_ARCH})
 set_target_properties(flashlstm PROPERTIES BUILD_RPATH "$ORIGIN" INSTALL_RPATH "$ORIGIN")
 
 add_executable(test_flashlstm src/main.cu src/cudnn_reference.cpp)

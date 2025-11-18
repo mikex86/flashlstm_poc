@@ -7,6 +7,7 @@
 #include <cutlass/layout/matrix.h>
 #include <cutlass/numeric_types.h>
 #include <cublas_v2.h>
+#include <cuda_runtime.h>
 
 #include <cstdlib>
 #include <cstdio>
@@ -22,27 +23,6 @@ using ColumnMajor = cutlass::layout::ColumnMajor;
 using RowMajor = cutlass::layout::RowMajor;
 using EpilogueOp = cutlass::epilogue::thread::LinearCombination<float, 1, float, float>;
 
-#if defined(FLASHLSTM_CUDA_ARCH) && FLASHLSTM_CUDA_ARCH >= 90
-using DefaultArch = cutlass::arch::Sm90;
-#elif defined(FLASHLSTM_CUDA_ARCH) && FLASHLSTM_CUDA_ARCH >= 89
-using DefaultArch = cutlass::arch::Sm89;
-#else
-using DefaultArch = cutlass::arch::Sm80;
-#endif
-
-template <typename LayoutA, typename LayoutB, typename OpClass>
-using GemmKernel = cutlass::gemm::device::Gemm<
-    CutlassHalf,
-    LayoutA,
-    CutlassHalf,
-    LayoutB,
-    float,
-    ColumnMajor,
-    float,
-    OpClass,
-    DefaultArch
->;
-
 template <
     typename LayoutA,
     typename LayoutB,
@@ -50,6 +30,7 @@ template <
     typename WarpShape,
     typename InstructionShape,
     int Stages,
+    typename ArchTag,
     int AlignmentA = 8,
     int AlignmentB = 8>
 using TensorOpGemm = cutlass::gemm::device::Gemm<
@@ -61,7 +42,7 @@ using TensorOpGemm = cutlass::gemm::device::Gemm<
     ColumnMajor,
     float,
     cutlass::arch::OpClassTensorOp,
-    DefaultArch,
+    ArchTag,
     ThreadblockShape,
     WarpShape,
     InstructionShape,
@@ -73,7 +54,7 @@ using TensorOpGemm = cutlass::gemm::device::Gemm<
     false,
     cutlass::arch::OpMultiplyAdd>;
 
-template <typename LayoutA, typename LayoutB>
+template <typename LayoutA, typename LayoutB, typename ArchTag>
 using SimtGemm = cutlass::gemm::device::Gemm<
     CutlassHalf,
     LayoutA,
@@ -83,7 +64,7 @@ using SimtGemm = cutlass::gemm::device::Gemm<
     ColumnMajor,
     float,
     cutlass::arch::OpClassSimt,
-    DefaultArch,
+    ArchTag,
     cutlass::gemm::GemmShape<64, 64, 8>,
     cutlass::gemm::GemmShape<32, 32, 8>,
     cutlass::gemm::GemmShape<1, 1, 1>,
@@ -172,6 +153,101 @@ inline bool UseCublasGemm() {
     static const bool use = (std::getenv("FLASHLSTM_USE_CUBLAS_GEMM") != nullptr);
     return use;
 }
+
+enum class RuntimeArch {
+    kSm90,
+    kSm89,
+    kFallback
+};
+
+inline RuntimeArch GetRuntimeArch() {
+    static RuntimeArch arch = [] {
+        int device = 0;
+        cudaError_t err = cudaGetDevice(&device);
+        if (err != cudaSuccess) {
+            cudaGetLastError();
+            return RuntimeArch::kFallback;
+        }
+        cudaDeviceProp prop{};
+        err = cudaGetDeviceProperties(&prop, device);
+        if (err != cudaSuccess) {
+            cudaGetLastError();
+            return RuntimeArch::kFallback;
+        }
+        int sm = prop.major * 10 + prop.minor;
+        if (sm >= 90) {
+            return RuntimeArch::kSm90;
+        }
+        if (sm >= 89) {
+            return RuntimeArch::kSm89;
+        }
+        return RuntimeArch::kFallback;
+    }();
+    return arch;
+}
+
+template <typename ArchTag>
+struct GemmTNTypes {
+    using Primary = TensorOpGemm<
+        RowMajor,
+        ColumnMajor,
+        cutlass::gemm::GemmShape<128, 64, 64>,
+        cutlass::gemm::GemmShape<64, 32, 64>,
+        cutlass::gemm::GemmShape<16, 8, 16>,
+        3,
+        ArchTag>;
+    using Secondary = TensorOpGemm<
+        RowMajor,
+        ColumnMajor,
+        cutlass::gemm::GemmShape<64, 64, 64>,
+        cutlass::gemm::GemmShape<32, 32, 64>,
+        cutlass::gemm::GemmShape<16, 8, 16>,
+        2,
+        ArchTag>;
+    using Simt = SimtGemm<RowMajor, ColumnMajor, ArchTag>;
+};
+
+template <typename ArchTag>
+struct GemmNNTypes {
+    using Primary = TensorOpGemm<
+        ColumnMajor,
+        ColumnMajor,
+        cutlass::gemm::GemmShape<128, 128, 64>,
+        cutlass::gemm::GemmShape<64, 64, 64>,
+        cutlass::gemm::GemmShape<16, 8, 16>,
+        4,
+        ArchTag>;
+    using Secondary = TensorOpGemm<
+        ColumnMajor,
+        ColumnMajor,
+        cutlass::gemm::GemmShape<64, 128, 32>,
+        cutlass::gemm::GemmShape<32, 64, 32>,
+        cutlass::gemm::GemmShape<16, 8, 16>,
+        3,
+        ArchTag>;
+    using Simt = SimtGemm<ColumnMajor, ColumnMajor, ArchTag>;
+};
+
+template <typename ArchTag>
+struct GemmNTTypes {
+    using Primary = TensorOpGemm<
+        ColumnMajor,
+        RowMajor,
+        cutlass::gemm::GemmShape<128, 128, 32>,
+        cutlass::gemm::GemmShape<64, 64, 32>,
+        cutlass::gemm::GemmShape<16, 8, 16>,
+        3,
+        ArchTag>;
+    using Secondary = TensorOpGemm<
+        ColumnMajor,
+        RowMajor,
+        cutlass::gemm::GemmShape<64, 128, 32>,
+        cutlass::gemm::GemmShape<32, 64, 32>,
+        cutlass::gemm::GemmShape<16, 8, 16>,
+        2,
+        ArchTag>;
+    using Simt = SimtGemm<ColumnMajor, RowMajor, ArchTag>;
+};
 
 template <
     typename PrimaryTensor,
@@ -291,41 +367,35 @@ void GemmTN(
             "cublasGemmEx GemmTN");
         return;
     }
-    using Primary = TensorOpGemm<
-        RowMajor,
-        ColumnMajor,
-        cutlass::gemm::GemmShape<128, 64, 64>,
-        cutlass::gemm::GemmShape<64, 32, 64>,
-        cutlass::gemm::GemmShape<16, 8, 16>,
-        3>;
-    using Secondary = TensorOpGemm<
-        RowMajor,
-        ColumnMajor,
-        cutlass::gemm::GemmShape<64, 64, 64>,
-        cutlass::gemm::GemmShape<32, 32, 64>,
-        cutlass::gemm::GemmShape<16, 8, 16>,
-        2>;
-    using Simt = SimtGemm<RowMajor, ColumnMajor>;
-    static GemmContext<Primary> primary_ctx;
-    static GemmContext<Secondary> secondary_ctx;
-    static GemmContext<Simt> simt_ctx;
-    RunGemmWithFallback(
-        primary_ctx,
-        secondary_ctx,
-        simt_ctx,
-        m,
-        n,
-        k,
-        A,
-        lda,
-        B,
-        ldb,
-        C,
-        ldc,
-        alpha,
-        beta,
-        stream,
-        "cutlass GemmTN");
+    auto dispatch = [&]([[maybe_unused]] auto arch_tag_constant) {
+        using ArchTag = std::decay_t<decltype(arch_tag_constant)>;
+        using Types = GemmTNTypes<ArchTag>;
+        static GemmContext<typename Types::Primary> primary_ctx;
+        static GemmContext<typename Types::Secondary> secondary_ctx;
+        static GemmContext<typename Types::Simt> simt_ctx;
+        RunGemmWithFallback(
+            primary_ctx,
+            secondary_ctx,
+            simt_ctx,
+            m,
+            n,
+            k,
+            A,
+            lda,
+            B,
+            ldb,
+            C,
+            ldc,
+            alpha,
+            beta,
+            stream,
+            "cutlass GemmTN");
+    };
+    switch (GetRuntimeArch()) {
+        case RuntimeArch::kSm90: dispatch(cutlass::arch::Sm90{}); break;
+        case RuntimeArch::kSm89: dispatch(cutlass::arch::Sm89{}); break;
+        default: dispatch(cutlass::arch::Sm80{}); break;
+    }
 }
 
 void GemmNN(
@@ -369,41 +439,35 @@ void GemmNN(
             "cublasGemmEx GemmNN");
         return;
     }
-    using Primary = TensorOpGemm<
-        ColumnMajor,
-        ColumnMajor,
-        cutlass::gemm::GemmShape<128, 128, 64>,
-        cutlass::gemm::GemmShape<64, 64, 64>,
-        cutlass::gemm::GemmShape<16, 8, 16>,
-        4>;
-    using Secondary = TensorOpGemm<
-        ColumnMajor,
-        ColumnMajor,
-        cutlass::gemm::GemmShape<64, 128, 32>,
-        cutlass::gemm::GemmShape<32, 64, 32>,
-        cutlass::gemm::GemmShape<16, 8, 16>,
-        3>;
-    using Simt = SimtGemm<ColumnMajor, ColumnMajor>;
-    static GemmContext<Primary> primary_ctx;
-    static GemmContext<Secondary> secondary_ctx;
-    static GemmContext<Simt> simt_ctx;
-    RunGemmWithFallback(
-        primary_ctx,
-        secondary_ctx,
-        simt_ctx,
-        m,
-        n,
-        k,
-        A,
-        lda,
-        B,
-        ldb,
-        C,
-        ldc,
-        alpha,
-        beta,
-        stream,
-        "cutlass GemmNN");
+    auto dispatch = [&]([[maybe_unused]] auto arch_tag_constant) {
+        using ArchTag = std::decay_t<decltype(arch_tag_constant)>;
+        using Types = GemmNNTypes<ArchTag>;
+        static GemmContext<typename Types::Primary> primary_ctx;
+        static GemmContext<typename Types::Secondary> secondary_ctx;
+        static GemmContext<typename Types::Simt> simt_ctx;
+        RunGemmWithFallback(
+            primary_ctx,
+            secondary_ctx,
+            simt_ctx,
+            m,
+            n,
+            k,
+            A,
+            lda,
+            B,
+            ldb,
+            C,
+            ldc,
+            alpha,
+            beta,
+            stream,
+            "cutlass GemmNN");
+    };
+    switch (GetRuntimeArch()) {
+        case RuntimeArch::kSm90: dispatch(cutlass::arch::Sm90{}); break;
+        case RuntimeArch::kSm89: dispatch(cutlass::arch::Sm89{}); break;
+        default: dispatch(cutlass::arch::Sm80{}); break;
+    }
 }
 
 void GemmNT(
@@ -447,41 +511,35 @@ void GemmNT(
             "cublasGemmEx GemmNT");
         return;
     }
-    using Primary = TensorOpGemm<
-        ColumnMajor,
-        RowMajor,
-        cutlass::gemm::GemmShape<128, 128, 32>,
-        cutlass::gemm::GemmShape<64, 64, 32>,
-        cutlass::gemm::GemmShape<16, 8, 16>,
-        3>;
-    using Secondary = TensorOpGemm<
-        ColumnMajor,
-        RowMajor,
-        cutlass::gemm::GemmShape<64, 128, 32>,
-        cutlass::gemm::GemmShape<32, 64, 32>,
-        cutlass::gemm::GemmShape<16, 8, 16>,
-        2>;
-    using Simt = SimtGemm<ColumnMajor, RowMajor>;
-    static GemmContext<Primary> primary_ctx;
-    static GemmContext<Secondary> secondary_ctx;
-    static GemmContext<Simt> simt_ctx;
-    RunGemmWithFallback(
-        primary_ctx,
-        secondary_ctx,
-        simt_ctx,
-        m,
-        n,
-        k,
-        A,
-        lda,
-        B,
-        ldb,
-        C,
-        ldc,
-        alpha,
-        beta,
-        stream,
-        "cutlass GemmNT");
+    auto dispatch = [&]([[maybe_unused]] auto arch_tag_constant) {
+        using ArchTag = std::decay_t<decltype(arch_tag_constant)>;
+        using Types = GemmNTTypes<ArchTag>;
+        static GemmContext<typename Types::Primary> primary_ctx;
+        static GemmContext<typename Types::Secondary> secondary_ctx;
+        static GemmContext<typename Types::Simt> simt_ctx;
+        RunGemmWithFallback(
+            primary_ctx,
+            secondary_ctx,
+            simt_ctx,
+            m,
+            n,
+            k,
+            A,
+            lda,
+            B,
+            ldb,
+            C,
+            ldc,
+            alpha,
+            beta,
+            stream,
+            "cutlass GemmNT");
+    };
+    switch (GetRuntimeArch()) {
+        case RuntimeArch::kSm90: dispatch(cutlass::arch::Sm90{}); break;
+        case RuntimeArch::kSm89: dispatch(cutlass::arch::Sm89{}); break;
+        default: dispatch(cutlass::arch::Sm80{}); break;
+    }
 }
 
 } // namespace flstm

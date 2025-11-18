@@ -46,6 +46,32 @@ namespace {
         validate(options.c_dtype, "c");
     }
 
+    inline size_t GateCacheDTypeSize(flstm::GateCacheDType dtype) {
+        switch (dtype) {
+            case flstm::GateCacheDType::kFloat32: return sizeof(float);
+            case flstm::GateCacheDType::kFloat16: return sizeof(__half);
+        }
+        throw std::runtime_error("Unsupported gate cache dtype");
+    }
+
+    struct PinnedBuffer {
+        void *ptr{nullptr};
+        PinnedBuffer() = default;
+        explicit PinnedBuffer(size_t bytes) {
+            if (bytes > 0) {
+                CheckCuda(cudaMallocHost(&ptr, bytes), "cudaMallocHost");
+            }
+        }
+        PinnedBuffer(const PinnedBuffer &) = delete;
+        PinnedBuffer &operator=(const PinnedBuffer &) = delete;
+        ~PinnedBuffer() {
+            if (ptr != nullptr) {
+                cudaFreeHost(ptr);
+                ptr = nullptr;
+            }
+        }
+    };
+
     template<typename T>
     struct DeviceBuffer {
         T *ptr{nullptr};
@@ -1295,6 +1321,160 @@ void StreamingLstmBackward(
         CheckCuda(cudaStreamSynchronize(compute_stream), "final backward sync");
         profiler.Finish();
     }
+
+void LstmBackward(
+    const size_t time_steps,
+    const size_t batch_size,
+    const size_t input_size,
+    const size_t hidden_size,
+    const size_t recompute_interval,
+    const size_t weight_set_count,
+
+    const __half *x_tensor_device,
+    const __half *y_tensor_device,
+    GateCacheHost gate_cache_device,
+
+    const __half *dY_tensor_device,
+    const __half *d_hn_device,
+    const __half *d_cn_device,
+    const __half *h0_device,
+    const __half *c0_device,
+
+    const float *weights_ih,
+    const float *weights_hh,
+    const float *bias_ih,
+    const float *bias_hh,
+
+    __half *dx_tensor_device,
+    float *dW_ih,
+    float *dW_hh,
+    float *db_ih,
+    float *db_hh,
+    float *dh0_out,
+    float *dc0_out,
+
+    cudaStream_t compute_stream,
+    cudaStream_t h2d_stream,
+    cudaStream_t d2h_stream,
+    StreamingLstmOptions options
+) {
+    GPUTX_RANGE("LstmBackward");
+    if (time_steps == 0 || batch_size == 0 || input_size == 0 || hidden_size == 0) {
+        return;
+    }
+    ValidateGateCacheOptions(options);
+
+    const size_t x_elements = time_steps * batch_size * input_size;
+    const size_t y_elements = time_steps * batch_size * hidden_size;
+    const size_t bh_elements = batch_size * hidden_size;
+    const size_t checkpoint_stride = recompute_interval;
+    const size_t checkpoint_count = (time_steps + checkpoint_stride - 1) / checkpoint_stride;
+    const size_t checkpoint_elements = checkpoint_count * bh_elements;
+    const size_t checkpoint_h_bytes = checkpoint_elements * GateCacheDTypeSize(options.h_dtype);
+    const size_t checkpoint_c_bytes = checkpoint_elements * GateCacheDTypeSize(options.c_dtype);
+
+    PinnedBuffer x_host(x_elements * sizeof(__half));
+    PinnedBuffer y_host(y_elements * sizeof(__half));
+    PinnedBuffer dY_host(y_elements * sizeof(__half));
+    PinnedBuffer gate_cache_h_host((gate_cache_device.h_ptr != nullptr && gate_cache_device.c_ptr != nullptr)
+                                   ? checkpoint_h_bytes : 0);
+    PinnedBuffer gate_cache_c_host((gate_cache_device.h_ptr != nullptr && gate_cache_device.c_ptr != nullptr)
+                                   ? checkpoint_c_bytes : 0);
+    PinnedBuffer dx_host(dx_tensor_device != nullptr ? x_elements * sizeof(__half) : 0);
+
+    if (x_elements > 0) {
+        CheckCuda(cudaMemcpyAsync(
+                      x_host.ptr,
+                      x_tensor_device,
+                      x_elements * sizeof(__half),
+                      cudaMemcpyDeviceToHost,
+                      d2h_stream),
+                  "copy x device -> host");
+    }
+    if (y_elements > 0) {
+        CheckCuda(cudaMemcpyAsync(
+                      y_host.ptr,
+                      y_tensor_device,
+                      y_elements * sizeof(__half),
+                      cudaMemcpyDeviceToHost,
+                      d2h_stream),
+                  "copy y device -> host");
+        CheckCuda(cudaMemcpyAsync(
+                      dY_host.ptr,
+                      dY_tensor_device,
+                      y_elements * sizeof(__half),
+                      cudaMemcpyDeviceToHost,
+                      d2h_stream),
+                  "copy dY device -> host");
+    }
+    if (gate_cache_device.h_ptr != nullptr && gate_cache_device.c_ptr != nullptr &&
+        gate_cache_h_host.ptr != nullptr && gate_cache_c_host.ptr != nullptr) {
+        CheckCuda(cudaMemcpyAsync(
+                      gate_cache_h_host.ptr,
+                      gate_cache_device.h_ptr,
+                      checkpoint_h_bytes,
+                      cudaMemcpyDeviceToHost,
+                      d2h_stream),
+                  "copy gate cache h -> host");
+        CheckCuda(cudaMemcpyAsync(
+                      gate_cache_c_host.ptr,
+                      gate_cache_device.c_ptr,
+                      checkpoint_c_bytes,
+                      cudaMemcpyDeviceToHost,
+                      d2h_stream),
+                  "copy gate cache c -> host");
+    }
+    CheckCuda(cudaStreamSynchronize(d2h_stream), "sync pre-backward copies");
+
+    GateCacheHost local_cache{
+        gate_cache_h_host.ptr,
+        gate_cache_c_host.ptr,
+    };
+
+    StreamingLstmBackward(
+        time_steps,
+        batch_size,
+        input_size,
+        hidden_size,
+        recompute_interval,
+        weight_set_count,
+        reinterpret_cast<const __half *>(x_host.ptr),
+        reinterpret_cast<const __half *>(y_host.ptr),
+        local_cache,
+        options,
+        reinterpret_cast<const __half *>(dY_host.ptr),
+        d_hn_device,
+        d_cn_device,
+        h0_device,
+        c0_device,
+        weights_ih,
+        weights_hh,
+        bias_ih,
+        bias_hh,
+        reinterpret_cast<__half *>(dx_host.ptr),
+        dW_ih,
+        dW_hh,
+        db_ih,
+        db_hh,
+        dh0_out,
+        dc0_out,
+        compute_stream,
+        h2d_stream,
+        d2h_stream
+    );
+
+    if (dx_tensor_device != nullptr && dx_host.ptr != nullptr) {
+        CheckCuda(cudaMemcpyAsync(
+                      dx_tensor_device,
+                      dx_host.ptr,
+                      x_elements * sizeof(__half),
+                      cudaMemcpyHostToDevice,
+                      h2d_stream),
+                  "copy dx host -> device");
+    }
+    CheckCuda(cudaStreamSynchronize(h2d_stream), "sync dx copy");
+}
+
 } // namespace flstm
 
 extern "C" void flstm_StreamingLstmBackward(
@@ -1381,6 +1561,95 @@ extern "C" void flstm_StreamingLstmBackward(
         std::abort();
     } catch (...) {
         fprintf(stderr, "flstm_StreamingLstmBackward failed: unknown exception\n");
+        fflush(stderr);
+        std::abort();
+    }
+}
+
+extern "C" void flstm_LstmBackward(
+    const size_t time_steps,
+    const size_t batch_size,
+    const size_t input_size,
+    const size_t hidden_size,
+    const size_t recompute_interval,
+    const size_t weight_set_count,
+
+    const __half *x_tensor_device,
+    const __half *y_tensor_device,
+    flstm_GateCacheHost gate_cache_device,
+
+    const __half *dY_tensor_device,
+    const __half *d_hn_device,
+    const __half *d_cn_device,
+    const __half *h0_device,
+    const __half *c0_device,
+
+    const float *weights_ih,
+    const float *weights_hh,
+    const float *bias_ih,
+    const float *bias_hh,
+
+    __half *dx_tensor_device,
+    float *dW_ih,
+    float *dW_hh,
+    float *db_ih,
+    float *db_hh,
+    float *dh0_out,
+    float *dc0_out,
+
+    const cudaStream_t compute_stream,
+    const cudaStream_t h2d_stream,
+    const cudaStream_t d2h_stream,
+    const flstm_StreamingLstmOptions *options
+) {
+    try {
+        flstm::GateCacheHost cache_device{
+            gate_cache_device.h_ptr,
+            gate_cache_device.c_ptr,
+        };
+        flstm::StreamingLstmOptions opts;
+        if (options != nullptr) {
+            opts.h_dtype = static_cast<flstm::GateCacheDType>(options->h_dtype);
+            opts.c_dtype = static_cast<flstm::GateCacheDType>(options->c_dtype);
+            opts.time_oversample = (options->time_oversample != 0);
+        }
+        flstm::LstmBackward(
+            time_steps,
+            batch_size,
+            input_size,
+            hidden_size,
+            recompute_interval,
+            weight_set_count,
+            x_tensor_device,
+            y_tensor_device,
+            cache_device,
+            dY_tensor_device,
+            d_hn_device,
+            d_cn_device,
+            h0_device,
+            c0_device,
+            weights_ih,
+            weights_hh,
+            bias_ih,
+            bias_hh,
+            dx_tensor_device,
+            dW_ih,
+            dW_hh,
+            db_ih,
+            db_hh,
+            dh0_out,
+            dc0_out,
+            compute_stream,
+            h2d_stream,
+            d2h_stream,
+            opts
+        );
+    } catch (const std::exception &exc) {
+        fprintf(stderr, "flstm_LstmBackward failed: %s\n", exc.what());
+        fflush(stderr);
+        std::abort();
+    } catch (...) {
+        fprintf(stderr, "flstm_LstmBackward failed: unknown exception\n");
         fflush(stderr);
         std::abort();
     }

@@ -23,6 +23,77 @@ struct StreamingLstmOptions {
 };
 
 /**
+ * Convenience wrappers that mirror the streaming APIs but operate on
+ * device-resident tensors. Internally these reuse the streaming kernels to
+ * maintain identical numerics while staging inputs/outputs as needed.
+ */
+void LstmForward(
+    size_t time_steps,
+    size_t batch_size,
+    size_t input_size,
+    size_t hidden_size,
+    size_t recompute_interval,
+    size_t weight_set_count,
+
+    const __half *x_tensor_device,
+    const __half *h0_device,
+    const __half *c0_device,
+
+    const float *weights_ih,
+    const float *weights_hh,
+    const float *bias_ih,
+    const float *bias_hh,
+
+    __half *y_tensor_device,
+
+    GateCacheHost gate_cache_device,
+    StreamingLstmOptions options,
+    __half *hy_device,
+    __half *cy_device,
+
+    cudaStream_t compute_stream,
+    cudaStream_t h2d_stream,
+    cudaStream_t d2h_stream
+);
+
+void LstmBackward(
+    size_t time_steps,
+    size_t batch_size,
+    size_t input_size,
+    size_t hidden_size,
+    size_t recompute_interval,
+    size_t weight_set_count,
+
+    const __half *x_tensor_device,
+    const __half *y_tensor_device,
+    GateCacheHost gate_cache_device,
+
+    const __half *dY_tensor_device,
+    const __half *d_hn_device,
+    const __half *d_cn_device,
+    const __half *h0_device,
+    const __half *c0_device,
+
+    const float *weights_ih,
+    const float *weights_hh,
+    const float *bias_ih,
+    const float *bias_hh,
+
+    __half *dx_tensor_device,
+    float *dW_ih,
+    float *dW_hh,
+    float *db_ih,
+    float *db_hh,
+    float *dh0_out,
+    float *dc0_out,
+
+    cudaStream_t compute_stream,
+    cudaStream_t h2d_stream,
+    cudaStream_t d2h_stream,
+    StreamingLstmOptions options
+);
+
+/**
  * Forward pass for a single-layer LSTM operating entirely on CUDA buffers.
  *
  * Inputs:
@@ -205,6 +276,72 @@ void flstm_StreamingLstmBackward(
     const float *bias_hh,
 
     __half *dx_tensor_host,
+    float *dW_ih,
+    float *dW_hh,
+    float *db_ih,
+    float *db_hh,
+    float *dh0_out,
+    float *dc0_out,
+
+    cudaStream_t compute_stream,
+    cudaStream_t h2d_stream,
+    cudaStream_t d2h_stream,
+    const flstm_StreamingLstmOptions *options
+);
+
+void flstm_LstmForward(
+    size_t time_steps,
+    size_t batch_size,
+    size_t input_size,
+    size_t hidden_size,
+    size_t recompute_interval,
+    size_t weight_set_count,
+
+    const __half *x_tensor_device,
+    const __half *h0_device,
+    const __half *c0_device,
+
+    const float *weights_ih,
+    const float *weights_hh,
+    const float *bias_ih,
+    const float *bias_hh,
+
+    __half *y_tensor_device,
+
+    flstm_GateCacheHost gate_cache_device,
+    const flstm_StreamingLstmOptions *options,
+    __half *hy_device,
+    __half *cy_device,
+
+    cudaStream_t compute_stream,
+    cudaStream_t h2d_stream,
+    cudaStream_t d2h_stream
+);
+
+void flstm_LstmBackward(
+    size_t time_steps,
+    size_t batch_size,
+    size_t input_size,
+    size_t hidden_size,
+    size_t recompute_interval,
+    size_t weight_set_count,
+
+    const __half *x_tensor_device,
+    const __half *y_tensor_device,
+    flstm_GateCacheHost gate_cache_device,
+
+    const __half *dY_tensor_device,
+    const __half *d_hn_device,
+    const __half *d_cn_device,
+    const __half *h0_device,
+    const __half *c0_device,
+
+    const float *weights_ih,
+    const float *weights_hh,
+    const float *bias_ih,
+    const float *bias_hh,
+
+    __half *dx_tensor_device,
     float *dW_ih,
     float *dW_hh,
     float *db_ih,

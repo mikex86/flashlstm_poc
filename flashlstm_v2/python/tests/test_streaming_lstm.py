@@ -2,6 +2,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from flashlstm import FlashLstm
 from flashlstm.streaming_lstm import StreamingLSTM
 
 
@@ -9,6 +10,13 @@ def _random_pinned_half(shape):
     tensor = torch.empty(shape, dtype=torch.float16, pin_memory=True)
     tensor.copy_(torch.randn_like(tensor, dtype=torch.float16))
     return tensor
+
+
+def _copy_params(src, dst):
+    dst.weight_ih.data.copy_(src.weight_ih.data)
+    dst.weight_hh.data.copy_(src.weight_hh.data)
+    dst.bias_ih.data.copy_(src.bias_ih.data)
+    dst.bias_hh.data.copy_(src.bias_hh.data)
 
 
 def _alternating_reference(
@@ -236,6 +244,81 @@ def test_streaming_lstm_alternating_weights():
         rtol=1e-3,
         atol=5e-3,
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
+def test_flashlstm_matches_streaming_outputs_and_grads():
+    torch.manual_seed(23)
+
+    time_steps = 6
+    batch_size = 3
+    input_size = 4
+    hidden_size = 5
+
+    streaming_mod = StreamingLSTM(input_size, hidden_size)
+    flash_mod = FlashLstm(input_size, hidden_size)
+    _copy_params(streaming_mod, flash_mod)
+
+    x_host = _random_pinned_half((time_steps, batch_size, input_size)).contiguous()
+    x_device = x_host.to(device="cuda")
+
+    h0 = torch.randn(batch_size, hidden_size, device="cuda", dtype=torch.float16)
+    c0 = torch.randn(batch_size, hidden_size, device="cuda", dtype=torch.float16)
+
+    streaming_mod.zero_grad(set_to_none=True)
+    flash_mod.zero_grad(set_to_none=True)
+
+    y_host, _, (hy_s, cy_s) = streaming_mod(x_host, h0, c0)
+    y_stream = y_host.to(device="cuda", dtype=torch.float32)
+
+    y_device, _, (hy_f, cy_f) = flash_mod(x_device, h0, c0)
+    y_flash = y_device.to(dtype=torch.float32)
+
+    torch.testing.assert_close(y_stream, y_flash, rtol=1e-3, atol=2e-3)
+    torch.testing.assert_close(hy_s.to(dtype=torch.float32), hy_f.to(dtype=torch.float32), rtol=1e-3, atol=2e-3)
+    torch.testing.assert_close(cy_s.to(dtype=torch.float32), cy_f.to(dtype=torch.float32), rtol=1e-3, atol=2e-3)
+
+    loss_stream = y_stream.pow(2).mean() + hy_s.float().pow(2).mean() + cy_s.float().pow(2).mean()
+    loss_flash = y_flash.pow(2).mean() + hy_f.float().pow(2).mean() + cy_f.float().pow(2).mean()
+
+    loss_stream.backward()
+    loss_flash.backward()
+
+    torch.testing.assert_close(streaming_mod.weight_ih.grad, flash_mod.weight_ih.grad, rtol=1e-3, atol=5e-3)
+    torch.testing.assert_close(streaming_mod.weight_hh.grad, flash_mod.weight_hh.grad, rtol=1e-3, atol=5e-3)
+    torch.testing.assert_close(streaming_mod.bias_ih.grad, flash_mod.bias_ih.grad, rtol=1e-3, atol=5e-3)
+    torch.testing.assert_close(streaming_mod.bias_hh.grad, flash_mod.bias_hh.grad, rtol=1e-3, atol=5e-3)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
+def test_flashlstm_time_oversample_matches_streaming():
+    torch.manual_seed(29)
+
+    time_steps = 4
+    batch_size = 2
+    input_size = 3
+    hidden_size = 4
+    weight_sets = 2
+
+    streaming_mod = StreamingLSTM(input_size, hidden_size, weight_set_count=weight_sets, time_oversample=True)
+    flash_mod = FlashLstm(input_size, hidden_size, weight_set_count=weight_sets, time_oversample=True)
+    _copy_params(streaming_mod, flash_mod)
+
+    x_host = _random_pinned_half((time_steps, batch_size, input_size)).contiguous()
+    x_device = x_host.to(device="cuda")
+
+    h0 = torch.randn(batch_size, hidden_size, device="cuda", dtype=torch.float16)
+    c0 = torch.randn(batch_size, hidden_size, device="cuda", dtype=torch.float16)
+
+    y_host, _, (hy_s, cy_s) = streaming_mod(x_host, h0, c0)
+    y_stream = y_host.to(device="cuda", dtype=torch.float32)
+
+    y_device, _, (hy_f, cy_f) = flash_mod(x_device, h0, c0)
+    y_flash = y_device.to(dtype=torch.float32)
+
+    torch.testing.assert_close(y_stream, y_flash, rtol=1e-3, atol=2e-3)
+    torch.testing.assert_close(hy_s.to(dtype=torch.float32), hy_f.to(dtype=torch.float32), rtol=1e-3, atol=2e-3)
+    torch.testing.assert_close(cy_s.to(dtype=torch.float32), cy_f.to(dtype=torch.float32), rtol=1e-3, atol=2e-3)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")

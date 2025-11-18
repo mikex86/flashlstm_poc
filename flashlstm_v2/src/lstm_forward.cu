@@ -40,6 +40,24 @@ inline size_t GateCacheDTypeSize(flstm::GateCacheDType dtype) {
     throw std::runtime_error("Unsupported gate cache dtype");
 }
 
+struct PinnedBuffer {
+    void *ptr{nullptr};
+    PinnedBuffer() = default;
+    explicit PinnedBuffer(size_t bytes) {
+        if (bytes > 0) {
+            CheckCuda(cudaMallocHost(&ptr, bytes), "cudaMallocHost");
+        }
+    }
+    PinnedBuffer(const PinnedBuffer &) = delete;
+    PinnedBuffer &operator=(const PinnedBuffer &) = delete;
+    ~PinnedBuffer() {
+        if (ptr != nullptr) {
+            cudaFreeHost(ptr);
+            ptr = nullptr;
+        }
+    }
+};
+
 inline void ValidateGateCacheOptions(const flstm::StreamingLstmOptions &options) {
     auto validate = [](flstm::GateCacheDType dtype, const char *label) {
         switch (dtype) {
@@ -1012,6 +1030,125 @@ void StreamingLstmForward(
     profiler.Finish();
 }
 
+void LstmForward(
+    const size_t time_steps,
+    const size_t batch_size,
+    const size_t input_size,
+    const size_t hidden_size,
+    const size_t recompute_interval,
+    const size_t weight_set_count,
+
+    const __half *x_tensor_device,
+    const __half *h0_device,
+    const __half *c0_device,
+
+    const float *weights_ih,
+    const float *weights_hh,
+    const float *bias_ih,
+    const float *bias_hh,
+
+    __half *y_tensor_device,
+
+    GateCacheHost gate_cache_device,
+    StreamingLstmOptions options,
+    __half *hy_device,
+    __half *cy_device,
+
+    cudaStream_t compute_stream,
+    cudaStream_t h2d_stream,
+    cudaStream_t d2h_stream
+) {
+    GPUTX_RANGE("LstmForward");
+    if (time_steps == 0 || batch_size == 0 || input_size == 0 || hidden_size == 0) {
+        return;
+    }
+    ValidateGateCacheOptions(options);
+
+    const size_t x_elements = time_steps * batch_size * input_size;
+    const size_t y_elements = time_steps * batch_size * hidden_size;
+    const size_t bh_elements = batch_size * hidden_size;
+    const size_t checkpoint_stride = recompute_interval;
+    const size_t checkpoint_count = (time_steps + checkpoint_stride - 1) / checkpoint_stride;
+    const size_t checkpoint_elements = checkpoint_count * bh_elements;
+    const size_t checkpoint_h_bytes = checkpoint_elements * GateCacheDTypeSize(options.h_dtype);
+    const size_t checkpoint_c_bytes = checkpoint_elements * GateCacheDTypeSize(options.c_dtype);
+
+    PinnedBuffer x_host(x_elements * sizeof(__half));
+    PinnedBuffer y_host(y_tensor_device != nullptr ? y_elements * sizeof(__half) : 0);
+    PinnedBuffer gate_cache_h_host((gate_cache_device.h_ptr != nullptr && gate_cache_device.c_ptr != nullptr)
+                                   ? checkpoint_h_bytes : 0);
+    PinnedBuffer gate_cache_c_host((gate_cache_device.h_ptr != nullptr && gate_cache_device.c_ptr != nullptr)
+                                   ? checkpoint_c_bytes : 0);
+
+    if (x_elements > 0) {
+        CheckCuda(cudaMemcpyAsync(
+                      x_host.ptr,
+                      x_tensor_device,
+                      x_elements * sizeof(__half),
+                      cudaMemcpyDeviceToHost,
+                      d2h_stream),
+                  "copy x device -> host");
+    }
+    CheckCuda(cudaStreamSynchronize(d2h_stream), "sync x copy");
+
+    GateCacheHost local_cache{
+        gate_cache_h_host.ptr,
+        gate_cache_c_host.ptr,
+    };
+
+    StreamingLstmForward(
+        time_steps,
+        batch_size,
+        input_size,
+        hidden_size,
+        recompute_interval,
+        weight_set_count,
+        reinterpret_cast<const __half *>(x_host.ptr),
+        h0_device,
+        c0_device,
+        weights_ih,
+        weights_hh,
+        bias_ih,
+        bias_hh,
+        reinterpret_cast<__half *>(y_host.ptr),
+        local_cache,
+        options,
+        hy_device,
+        cy_device,
+        compute_stream,
+        h2d_stream,
+        d2h_stream
+    );
+
+    if (y_tensor_device != nullptr && y_host.ptr != nullptr) {
+        CheckCuda(cudaMemcpyAsync(
+                      y_tensor_device,
+                      y_host.ptr,
+                      y_elements * sizeof(__half),
+                      cudaMemcpyHostToDevice,
+                      h2d_stream),
+                  "copy y host -> device");
+    }
+    if (gate_cache_device.h_ptr != nullptr && gate_cache_device.c_ptr != nullptr &&
+        gate_cache_h_host.ptr != nullptr && gate_cache_c_host.ptr != nullptr) {
+        CheckCuda(cudaMemcpyAsync(
+                      gate_cache_device.h_ptr,
+                      gate_cache_h_host.ptr,
+                      checkpoint_h_bytes,
+                      cudaMemcpyHostToDevice,
+                      h2d_stream),
+                  "copy gate cache h -> device");
+        CheckCuda(cudaMemcpyAsync(
+                      gate_cache_device.c_ptr,
+                      gate_cache_c_host.ptr,
+                      checkpoint_c_bytes,
+                      cudaMemcpyHostToDevice,
+                      h2d_stream),
+                  "copy gate cache c -> device");
+    }
+    CheckCuda(cudaStreamSynchronize(h2d_stream), "final device copy sync");
+}
+
 } // namespace flstm
 
 extern "C" void flstm_StreamingLstmForward(
@@ -1082,6 +1219,79 @@ extern "C" void flstm_StreamingLstmForward(
         std::abort();
     } catch (...) {
         fprintf(stderr, "flstm_StreamingLstmForward failed: unknown exception\n");
+        fflush(stderr);
+        std::abort();
+    }
+}
+
+extern "C" void flstm_LstmForward(
+    const size_t time_steps,
+    const size_t batch_size,
+    const size_t input_size,
+    const size_t hidden_size,
+    const size_t recompute_interval,
+    const size_t weight_set_count,
+
+    const __half *x_tensor_device,
+    const __half *h0_device,
+    const __half *c0_device,
+
+    const float *weights_ih,
+    const float *weights_hh,
+    const float *bias_ih,
+    const float *bias_hh,
+
+    __half *y_tensor_device,
+
+    flstm_GateCacheHost gate_cache_device,
+    const flstm_StreamingLstmOptions *options,
+    __half *hy_device,
+    __half *cy_device,
+
+    const cudaStream_t compute_stream,
+    const cudaStream_t h2d_stream,
+    const cudaStream_t d2h_stream
+) {
+    try {
+        flstm::GateCacheHost cache_device{
+            gate_cache_device.h_ptr,
+            gate_cache_device.c_ptr,
+        };
+        flstm::StreamingLstmOptions opts;
+        if (options != nullptr) {
+            opts.h_dtype = static_cast<flstm::GateCacheDType>(options->h_dtype);
+            opts.c_dtype = static_cast<flstm::GateCacheDType>(options->c_dtype);
+            opts.time_oversample = (options->time_oversample != 0);
+        }
+        flstm::LstmForward(
+            time_steps,
+            batch_size,
+            input_size,
+            hidden_size,
+            recompute_interval,
+            weight_set_count,
+            x_tensor_device,
+            h0_device,
+            c0_device,
+            weights_ih,
+            weights_hh,
+            bias_ih,
+            bias_hh,
+            y_tensor_device,
+            cache_device,
+            opts,
+            hy_device,
+            cy_device,
+            compute_stream,
+            h2d_stream,
+            d2h_stream
+        );
+    } catch (const std::exception &exc) {
+        fprintf(stderr, "flstm_LstmForward failed: %s\n", exc.what());
+        fflush(stderr);
+        std::abort();
+    } catch (...) {
+        fprintf(stderr, "flstm_LstmForward failed: unknown exception\n");
         fflush(stderr);
         std::abort();
     }

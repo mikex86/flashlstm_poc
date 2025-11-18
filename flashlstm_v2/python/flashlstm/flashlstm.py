@@ -149,7 +149,8 @@ class _LstmFunction(Function):
             gate_cache_c_enum,
             time_oversample,
         )
-        return y_device, GateCache(gate_cache_h, gate_cache_c), hy_device, cy_device
+        ctx.mark_non_differentiable(gate_cache_h, gate_cache_c)
+        return y_device, gate_cache_h, gate_cache_c, hy_device, cy_device
 
     @staticmethod
     def backward(  # type: ignore[override]
@@ -277,9 +278,10 @@ class _LstmFunction(Function):
             db_ih,
             db_hh,
             None,
-            None,
-            None,
-            None,
+            None,  # gate_cache_h
+            None,  # gate_cache_c
+            None,  # hy
+            None,  # cy
         )
 
 
@@ -296,8 +298,8 @@ def flashlstm(
     gate_cache_dtypes: Tuple[torch.dtype, torch.dtype] = (torch.float32, torch.float32),
     weight_set_count: Optional[int] = None,
     time_oversample: bool = False,
-) -> Tuple[torch.Tensor, GateCache, torch.Tensor, torch.Tensor]:
-    outputs = _LstmFunction.apply(
+    ) -> Tuple[torch.Tensor, GateCache, torch.Tensor, torch.Tensor]:
+    y, gate_cache_h, gate_cache_c, hy, cy = _LstmFunction.apply(
         x,
         h0,
         c0,
@@ -310,8 +312,7 @@ def flashlstm(
         weight_set_count,
         time_oversample,
     )
-    y, gate_cache, hy, cy = outputs
-    return y, gate_cache, hy, cy
+    return y, GateCache(gate_cache_h, gate_cache_c), hy, cy
 
 
 class FlashLstm(nn.Module):

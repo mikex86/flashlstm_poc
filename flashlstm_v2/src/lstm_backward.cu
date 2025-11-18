@@ -480,6 +480,7 @@ namespace {
         const __half *x_tensor_host;
         const __half *y_tensor_host;
         const __half *dY_tensor_host;
+        cudaMemcpyKind copy_kind;
         DeviceBuffer<float> *checkpoint_half;
         DeviceBuffer<__half> *checkpoint_h_half_quantized;
         DeviceBuffer<__half> *checkpoint_c_half_quantized;
@@ -533,7 +534,7 @@ namespace {
                           params.x_chunk_half[slot].ptr,
                           x_src,
                           x_elems * sizeof(__half),
-                          cudaMemcpyHostToDevice,
+                          params.copy_kind,
                           params.h2d_stream),
                       "copy x chunk (recompute span)");
         }
@@ -544,7 +545,7 @@ namespace {
                           params.y_chunk_half[slot].ptr,
                           params.y_tensor_host + chunk_start * params.bh_elements,
                           y_elems * sizeof(__half),
-                          cudaMemcpyHostToDevice,
+                          params.copy_kind,
                           params.h2d_stream),
                       "copy y chunk");
         }
@@ -553,7 +554,7 @@ namespace {
                           params.dY_chunk_half[slot].ptr,
                           params.dY_tensor_host + chunk_start * params.bh_elements,
                           y_elems * sizeof(__half),
-                          cudaMemcpyHostToDevice,
+                          params.copy_kind,
                           params.h2d_stream),
                       "copy dY chunk");
         }
@@ -563,7 +564,7 @@ namespace {
                           params.y_prev_half[slot].ptr,
                           params.y_tensor_host + (chunk_start - 1) * params.bh_elements,
                           params.bh_elements * sizeof(__half),
-                          cudaMemcpyHostToDevice,
+                          params.copy_kind,
                           params.h2d_stream),
                       "copy y_prev");
         }
@@ -581,7 +582,7 @@ namespace {
                               checkpoint_dst_h,
                               checkpoint_src_h,
                               params.bh_elements * sizeof(float),
-                              cudaMemcpyHostToDevice,
+                              params.copy_kind,
                               params.h2d_stream),
                           "copy checkpoint h state");
             } else {
@@ -592,7 +593,7 @@ namespace {
                               quantized,
                               checkpoint_src_h,
                               params.bh_elements * sizeof(__half),
-                              cudaMemcpyHostToDevice,
+                              params.copy_kind,
                               params.h2d_stream),
                           "copy checkpoint h state half");
                 const int convert_blocks = BlocksFor(params.bh_elements, params.threads);
@@ -611,7 +612,7 @@ namespace {
                               checkpoint_dst_c,
                               checkpoint_src_c,
                               params.bh_elements * sizeof(float),
-                              cudaMemcpyHostToDevice,
+                              params.copy_kind,
                               params.h2d_stream),
                           "copy checkpoint c state");
             } else {
@@ -622,7 +623,7 @@ namespace {
                               quantized,
                               checkpoint_src_c,
                               params.bh_elements * sizeof(__half),
-                              cudaMemcpyHostToDevice,
+                              params.copy_kind,
                               params.h2d_stream),
                           "copy checkpoint c state half");
                 const int convert_blocks = BlocksFor(params.bh_elements, params.threads);
@@ -644,7 +645,7 @@ namespace {
 } // namespace
 
 namespace flstm {
-void StreamingLstmBackward(
+static void LstmBackwardImpl(
     size_t time_steps,
     size_t batch_size,
     size_t input_size,
@@ -657,29 +658,32 @@ void StreamingLstmBackward(
     GateCacheHost gate_cache_host,
     StreamingLstmOptions options,
 
-        const __half *dY_tensor_host,
-        const __half *d_hn_device,
-        const __half *d_cn_device,
-        const __half *h0_device,
-        const __half *c0_device,
+    const __half *dY_tensor_host,
+    const __half *d_hn_device,
+    const __half *d_cn_device,
+    const __half *h0_device,
+    const __half *c0_device,
 
-        const float *weights_ih,
-        const float *weights_hh,
-        const float *bias_ih,
-        const float *bias_hh,
+    const float *weights_ih,
+    const float *weights_hh,
+    const float *bias_ih,
+    const float *bias_hh,
 
-        __half *dx_tensor_host,
-        float *dW_ih,
-        float *dW_hh,
-        float *db_ih,
-        float *db_hh,
-        float *dh0_out,
-        float *dc0_out,
+    __half *dx_tensor_host,
+    float *dW_ih,
+    float *dW_hh,
+    float *db_ih,
+    float *db_hh,
+    float *dh0_out,
+    float *dc0_out,
 
-        cudaStream_t compute_stream,
-        cudaStream_t h2d_stream,
-        cudaStream_t d2h_stream
-    ) {
+    cudaStream_t compute_stream,
+    cudaStream_t h2d_stream,
+    cudaStream_t d2h_stream,
+    cudaMemcpyKind h2d_copy_kind,
+    cudaMemcpyKind dx_copy_kind,
+    bool enforce_distinct_streams
+) {
         GPUTX_RANGE("StreamingLstmBackward");
         mfu::Profiler profiler("backward");
         if (time_steps == 0 || batch_size == 0 || input_size == 0 || hidden_size == 0) {
@@ -702,7 +706,7 @@ void StreamingLstmBackward(
 
         (void) c0_device;
 
-        if (compute_stream == h2d_stream || compute_stream == d2h_stream || h2d_stream == d2h_stream) {
+        if (enforce_distinct_streams && (compute_stream == h2d_stream || compute_stream == d2h_stream || h2d_stream == d2h_stream)) {
             throw std::runtime_error("StreamingLstmBackward requires distinct compute/h2d/d2h streams");
         }
 
@@ -906,6 +910,7 @@ void StreamingLstmBackward(
             .x_tensor_host = x_tensor_host,
             .y_tensor_host = y_tensor_host,
             .dY_tensor_host = dY_tensor_host,
+            .copy_kind = h2d_copy_kind,
             .checkpoint_half = checkpoint_half,
             .checkpoint_h_half_quantized = checkpoint_h_half_quantized,
             .checkpoint_c_half_quantized = checkpoint_c_half_quantized,
@@ -1242,7 +1247,7 @@ void StreamingLstmBackward(
                               dx_tensor_host + chunk_start_step * batch_size * input_size,
                               dx_chunk_half[slot].ptr,
                               dx_chunk_elems * sizeof(__half),
-                              cudaMemcpyDeviceToHost,
+                              dx_copy_kind,
                               d2h_stream),
                           "copy dx chunk -> host");
             }
@@ -1295,6 +1300,151 @@ void StreamingLstmBackward(
         CheckCuda(cudaStreamSynchronize(compute_stream), "final backward sync");
         profiler.Finish();
     }
+
+void StreamingLstmBackward(
+    size_t time_steps,
+    size_t batch_size,
+    size_t input_size,
+    size_t hidden_size,
+    size_t recompute_interval,
+    size_t weight_set_count,
+
+    const __half *x_tensor_host,
+    const __half *y_tensor_host,
+    GateCacheHost gate_cache_host,
+    StreamingLstmOptions options,
+
+    const __half *dY_tensor_host,
+    const __half *d_hn_device,
+    const __half *d_cn_device,
+    const __half *h0_device,
+    const __half *c0_device,
+
+    const float *weights_ih,
+    const float *weights_hh,
+    const float *bias_ih,
+    const float *bias_hh,
+
+    __half *dx_tensor_host,
+    float *dW_ih,
+    float *dW_hh,
+    float *db_ih,
+    float *db_hh,
+    float *dh0_out,
+    float *dc0_out,
+
+    cudaStream_t compute_stream,
+    cudaStream_t h2d_stream,
+    cudaStream_t d2h_stream
+) {
+    LstmBackwardImpl(
+        time_steps,
+        batch_size,
+        input_size,
+        hidden_size,
+        recompute_interval,
+        weight_set_count,
+        x_tensor_host,
+        y_tensor_host,
+        gate_cache_host,
+        options,
+        dY_tensor_host,
+        d_hn_device,
+        d_cn_device,
+        h0_device,
+        c0_device,
+        weights_ih,
+        weights_hh,
+        bias_ih,
+        bias_hh,
+        dx_tensor_host,
+        dW_ih,
+        dW_hh,
+        db_ih,
+        db_hh,
+        dh0_out,
+        dc0_out,
+        compute_stream,
+        h2d_stream,
+        d2h_stream,
+        cudaMemcpyHostToDevice,
+        cudaMemcpyDeviceToHost,
+        /*enforce_distinct_streams=*/true
+    );
+}
+
+void LstmBackward(
+    size_t time_steps,
+    size_t batch_size,
+    size_t input_size,
+    size_t hidden_size,
+    size_t recompute_interval,
+    size_t weight_set_count,
+
+    const __half *x_tensor_device,
+    const __half *y_tensor_device,
+    GateCacheHost gate_cache_device,
+    StreamingLstmOptions options,
+
+    const __half *dY_tensor_device,
+    const __half *d_hn_device,
+    const __half *d_cn_device,
+    const __half *h0_device,
+    const __half *c0_device,
+
+    const float *weights_ih,
+    const float *weights_hh,
+    const float *bias_ih,
+    const float *bias_hh,
+
+    __half *dx_tensor_device,
+    float *dW_ih,
+    float *dW_hh,
+    float *db_ih,
+    float *db_hh,
+    float *dh0_out,
+    float *dc0_out,
+
+    cudaStream_t compute_stream,
+    cudaStream_t h2d_stream,
+    cudaStream_t d2h_stream
+) {
+    LstmBackwardImpl(
+        time_steps,
+        batch_size,
+        input_size,
+        hidden_size,
+        recompute_interval,
+        weight_set_count,
+        x_tensor_device,
+        y_tensor_device,
+        gate_cache_device,
+        options,
+        dY_tensor_device,
+        d_hn_device,
+        d_cn_device,
+        h0_device,
+        c0_device,
+        weights_ih,
+        weights_hh,
+        bias_ih,
+        bias_hh,
+        dx_tensor_device,
+        dW_ih,
+        dW_hh,
+        db_ih,
+        db_hh,
+        dh0_out,
+        dc0_out,
+        compute_stream,
+        h2d_stream,
+        d2h_stream,
+        cudaMemcpyDeviceToDevice,
+        cudaMemcpyDeviceToDevice,
+        /*enforce_distinct_streams=*/false
+    );
+}
+
 } // namespace flstm
 
 extern "C" void flstm_StreamingLstmBackward(
@@ -1381,6 +1531,95 @@ extern "C" void flstm_StreamingLstmBackward(
         std::abort();
     } catch (...) {
         fprintf(stderr, "flstm_StreamingLstmBackward failed: unknown exception\n");
+        fflush(stderr);
+        std::abort();
+    }
+}
+
+extern "C" void flstm_LstmBackward(
+    const size_t time_steps,
+    const size_t batch_size,
+    const size_t input_size,
+    const size_t hidden_size,
+    const size_t recompute_interval,
+    const size_t weight_set_count,
+
+    const __half *x_tensor_device,
+    const __half *y_tensor_device,
+    flstm_GateCacheHost gate_cache_device,
+
+    const __half *dY_tensor_device,
+    const __half *d_hn_device,
+    const __half *d_cn_device,
+    const __half *h0_device,
+    const __half *c0_device,
+
+    const float *weights_ih,
+    const float *weights_hh,
+    const float *bias_ih,
+    const float *bias_hh,
+
+    __half *dx_tensor_device,
+    float *dW_ih,
+    float *dW_hh,
+    float *db_ih,
+    float *db_hh,
+    float *dh0_out,
+    float *dc0_out,
+
+    const cudaStream_t compute_stream,
+    const cudaStream_t h2d_stream,
+    const cudaStream_t d2h_stream,
+    const flstm_StreamingLstmOptions *options
+) {
+    try {
+        flstm::GateCacheHost cache_host{
+            gate_cache_device.h_ptr,
+            gate_cache_device.c_ptr,
+        };
+        flstm::StreamingLstmOptions opts;
+        if (options != nullptr) {
+            opts.h_dtype = static_cast<flstm::GateCacheDType>(options->h_dtype);
+            opts.c_dtype = static_cast<flstm::GateCacheDType>(options->c_dtype);
+            opts.time_oversample = (options->time_oversample != 0);
+        }
+        flstm::LstmBackward(
+            time_steps,
+            batch_size,
+            input_size,
+            hidden_size,
+            recompute_interval,
+            weight_set_count,
+            x_tensor_device,
+            y_tensor_device,
+            cache_host,
+            opts,
+            dY_tensor_device,
+            d_hn_device,
+            d_cn_device,
+            h0_device,
+            c0_device,
+            weights_ih,
+            weights_hh,
+            bias_ih,
+            bias_hh,
+            dx_tensor_device,
+            dW_ih,
+            dW_hh,
+            db_ih,
+            db_hh,
+            dh0_out,
+            dc0_out,
+            compute_stream,
+            h2d_stream,
+            d2h_stream
+        );
+    } catch (const std::exception &exc) {
+        fprintf(stderr, "flstm_LstmBackward failed: %s\n", exc.what());
+        fflush(stderr);
+        std::abort();
+    } catch (...) {
+        fprintf(stderr, "flstm_LstmBackward failed: unknown exception\n");
         fflush(stderr);
         std::abort();
     }

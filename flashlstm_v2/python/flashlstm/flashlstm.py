@@ -97,6 +97,10 @@ class _LSTMFunction(Function):
         compute_stream = torch.cuda.Stream()
         h2d_stream = torch.cuda.Stream()
         d2h_stream = torch.cuda.Stream()
+        current_stream = torch.cuda.current_stream()
+        compute_stream.wait_stream(current_stream)
+        h2d_stream.wait_stream(current_stream)
+        d2h_stream.wait_stream(current_stream)
 
         _lstm_forward(
             time_steps,
@@ -233,6 +237,10 @@ class _LSTMFunction(Function):
         compute_stream = torch.cuda.Stream()
         h2d_stream = torch.cuda.Stream()
         d2h_stream = torch.cuda.Stream()
+        current_stream = torch.cuda.current_stream()
+        compute_stream.wait_stream(current_stream)
+        h2d_stream.wait_stream(current_stream)
+        d2h_stream.wait_stream(current_stream)
 
         _lstm_backward(
             time_steps,

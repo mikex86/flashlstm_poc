@@ -412,8 +412,7 @@ struct ForwardChunkCopyParams {
     size_t chunk_capacity;
     size_t batch_size;
     size_t input_size;
-    const __half *x_tensor;
-    cudaMemcpyKind copy_kind;
+    const __half *x_tensor_host;
     DeviceBuffer<__half> *x_chunk_buffers;
     CudaEvent *x_ready;
     cudaStream_t h2d_stream;
@@ -447,12 +446,12 @@ static size_t IssueChunkCopy(size_t chunk_index, int slot, const ForwardChunkCop
     if (bytes == 0) {
         return 0;
     }
-    const __half *src = params.x_tensor + chunk_start * params.batch_size * params.input_size;
+    const __half *src = params.x_tensor_host + chunk_start * params.batch_size * params.input_size;
     CheckCuda(cudaMemcpyAsync(
                   params.x_chunk_buffers[slot].ptr,
                   src,
                   bytes,
-                  params.copy_kind,
+                  cudaMemcpyHostToDevice,
                   params.h2d_stream),
               "async copy x chunk");
     CheckCuda(cudaEventRecord(params.x_ready[slot].evt, params.h2d_stream), "record x_ready");
@@ -490,42 +489,8 @@ void StreamingLstmForward(
     cudaStream_t compute_stream,
     cudaStream_t h2d_stream,
     cudaStream_t d2h_stream
-);
-
-static void LstmForwardImpl(
-    size_t time_steps,
-    size_t batch_size,
-    size_t input_size,
-    size_t hidden_size,
-    size_t recompute_interval,
-    size_t weight_set_count,
-
-    const __half *x_tensor_host,
-    const __half *h_0_device,
-    const __half *c_0_device,
-
-    const float *weights_ih,
-    const float *weights_hh,
-    const float *bias_ih,
-    const float *bias_hh,
-
-    __half *y_tensor_out,
-
-    GateCacheHost gate_cache_host,
-    StreamingLstmOptions options,
-    __half *hy_device,
-    __half *cy_device,
-
-    cudaStream_t compute_stream,
-    cudaStream_t h2d_stream,
-    cudaStream_t d2h_stream,
-    cudaMemcpyKind x_copy_kind,
-    cudaMemcpyKind y_copy_kind,
-    cudaMemcpyKind checkpoint_copy_kind,
-    bool register_io,
-    bool enforce_distinct_streams
 ) {
-    GPUTX_RANGE("LstmForward");
+    GPUTX_RANGE("StreamingLstmForward");
     mfu::Profiler profiler("forward");
     if (time_steps == 0 || batch_size == 0 || input_size == 0 || hidden_size == 0) {
         return;
@@ -539,7 +504,7 @@ static void LstmForwardImpl(
     }
     const bool time_oversample = options.time_oversample && weight_set_count > 1;
     const size_t weight_repeats = time_oversample ? weight_set_count : 1;
-    if (enforce_distinct_streams && (compute_stream == h2d_stream || compute_stream == d2h_stream || h2d_stream == d2h_stream)) {
+    if (compute_stream == h2d_stream || compute_stream == d2h_stream || h2d_stream == d2h_stream) {
         throw std::runtime_error("StreamingLstmForward requires distinct compute/h2d/d2h streams");
     }
 
@@ -559,7 +524,7 @@ static void LstmForwardImpl(
     const size_t chunk_input_capacity = chunk_capacity * batch_size * input_size;
     const size_t chunk_output_capacity = chunk_capacity * bh_elements;
     const bool store_checkpoints = (gate_cache_host.h_ptr != nullptr && gate_cache_host.c_ptr != nullptr);
-    const bool needs_y_fallback = (y_tensor_out != nullptr);
+    const bool needs_y_fallback = (y_tensor_host != nullptr);
 
     const int threads = 256;
     const int bh_blocks = BlocksFor(bh_elements, threads);
@@ -569,31 +534,29 @@ static void LstmForwardImpl(
     HostRegistration gate_h_host_registration;
     HostRegistration gate_c_host_registration;
 
-    if (register_io) {
-        x_host_registration.reset(
-            x_tensor_host,
-            time_steps * x_step_bytes,
-            "cudaHostRegister x_tensor_host"
+    x_host_registration.reset(
+        x_tensor_host,
+        time_steps * x_step_bytes,
+        "cudaHostRegister x_tensor_host"
+    );
+    if (y_tensor_host != nullptr) {
+        y_host_registration.reset(
+            y_tensor_host,
+            time_steps * y_step_bytes,
+            "cudaHostRegister y_tensor_host"
         );
-        if (y_tensor_out != nullptr && y_copy_kind == cudaMemcpyDeviceToHost) {
-            y_host_registration.reset(
-                y_tensor_out,
-                time_steps * y_step_bytes,
-                "cudaHostRegister y_tensor_host"
-            );
-        }
-        if (store_checkpoints && checkpoint_copy_kind == cudaMemcpyDeviceToHost) {
-            gate_h_host_registration.reset(
-                gate_cache_host.h_ptr,
-                checkpoint_h_bytes,
-                "cudaHostRegister checkpoint_cache_h_host"
-            );
-            gate_c_host_registration.reset(
-                gate_cache_host.c_ptr,
-                checkpoint_c_bytes,
-                "cudaHostRegister checkpoint_cache_c_host"
-            );
-        }
+    }
+    if (store_checkpoints) {
+        gate_h_host_registration.reset(
+            gate_cache_host.h_ptr,
+            checkpoint_h_bytes,
+            "cudaHostRegister checkpoint_cache_h_host"
+        );
+        gate_c_host_registration.reset(
+            gate_cache_host.c_ptr,
+            checkpoint_c_bytes,
+            "cudaHostRegister checkpoint_cache_c_host"
+        );
     }
 
     const size_t z_chunk_elements = z_rows * chunk_capacity * batch_size;
@@ -725,8 +688,7 @@ static void LstmForwardImpl(
     chunk_params.chunk_capacity = chunk_capacity;
     chunk_params.batch_size = batch_size;
     chunk_params.input_size = input_size;
-    chunk_params.x_tensor = x_tensor_host;
-    chunk_params.copy_kind = x_copy_kind;
+    chunk_params.x_tensor_host = x_tensor_host;
     chunk_params.x_chunk_buffers = x_chunk_buffers;
     chunk_params.x_ready = x_ready;
     chunk_params.h2d_stream = h2d_stream;
@@ -942,7 +904,7 @@ static void LstmForwardImpl(
         CheckCuda(cudaEventRecord(compute_done[slot].evt, compute_stream), "record compute_done");
         compute_done_valid[slot] = true;
 
-        CheckCuda(cudaStreamWaitEvent(d2h_stream, compute_done[slot].evt, 0), "wait compute_done on copy stream");
+        CheckCuda(cudaStreamWaitEvent(d2h_stream, compute_done[slot].evt, 0), "wait compute_done on d2h");
 
         if (store_checkpoints) {
             const size_t checkpoint_count_chunk = checkpoint_counts[slot];
@@ -956,7 +918,7 @@ static void LstmForwardImpl(
                                   dst,
                                   src,
                                   chunk_elements * sizeof(float),
-                                  checkpoint_copy_kind,
+                                  cudaMemcpyDeviceToHost,
                                   d2h_stream),
                               "copy checkpoint h chunk");
                 } else {
@@ -966,7 +928,7 @@ static void LstmForwardImpl(
                                   dst,
                                   src,
                                   chunk_elements * sizeof(__half),
-                                  checkpoint_copy_kind,
+                                  cudaMemcpyDeviceToHost,
                                   d2h_stream),
                               "copy checkpoint h chunk half");
                 }
@@ -978,7 +940,7 @@ static void LstmForwardImpl(
                                   dst,
                                   src,
                                   chunk_elements * sizeof(float),
-                                  checkpoint_copy_kind,
+                                  cudaMemcpyDeviceToHost,
                                   d2h_stream),
                               "copy checkpoint c chunk");
                 } else {
@@ -988,7 +950,7 @@ static void LstmForwardImpl(
                                   dst,
                                   src,
                                   chunk_elements * sizeof(__half),
-                                  checkpoint_copy_kind,
+                                  cudaMemcpyDeviceToHost,
                                   d2h_stream),
                               "copy checkpoint c chunk half");
                 }
@@ -998,16 +960,16 @@ static void LstmForwardImpl(
             }
         }
 
-        if (y_tensor_out != nullptr && y_chunk_half[slot].ptr != nullptr) {
+        if (y_tensor_host != nullptr && y_chunk_half[slot].ptr != nullptr) {
             const size_t y_elements_chunk = steps_in_chunk * bh_elements;
             if (y_elements_chunk > 0) {
-                __half *dst = y_tensor_out + chunk_start_step * bh_elements;
+                __half *dst = y_tensor_host + chunk_start_step * bh_elements;
                 const __half *src = y_chunk_half[slot].ptr;
                 CheckCuda(cudaMemcpyAsync(
                               dst,
                               src,
                               y_elements_chunk * sizeof(__half),
-                              y_copy_kind,
+                              cudaMemcpyDeviceToHost,
                               d2h_stream),
                           "copy y chunk");
                 CheckCuda(cudaEventRecord(y_copy_done[slot].evt, d2h_stream), "record y_copy_done");
@@ -1048,122 +1010,6 @@ static void LstmForwardImpl(
     CheckCuda(cudaStreamSynchronize(d2h_stream), "final d2h transfer sync");
     CheckCuda(cudaStreamSynchronize(compute_stream), "final compute sync");
     profiler.Finish();
-}
-
-void StreamingLstmForward(
-    const size_t time_steps,
-    const size_t batch_size,
-    const size_t input_size,
-    const size_t hidden_size,
-    const size_t recompute_interval,
-    const size_t weight_set_count,
-
-    const __half *x_tensor_host,
-    const __half *h_0_device,
-    const __half *c_0_device,
-
-    const float *weights_ih,
-    const float *weights_hh,
-    const float *bias_ih,
-    const float *bias_hh,
-
-    __half *y_tensor_host,
-
-    GateCacheHost gate_cache_host,
-    StreamingLstmOptions options,
-    __half *hy_device,
-    __half *cy_device,
-
-    const cudaStream_t compute_stream,
-    const cudaStream_t h2d_stream,
-    const cudaStream_t d2h_stream
-) {
-    LstmForwardImpl(
-        time_steps,
-        batch_size,
-        input_size,
-        hidden_size,
-        recompute_interval,
-        weight_set_count,
-        x_tensor_host,
-        h_0_device,
-        c_0_device,
-        weights_ih,
-        weights_hh,
-        bias_ih,
-        bias_hh,
-        y_tensor_host,
-        gate_cache_host,
-        options,
-        hy_device,
-        cy_device,
-        compute_stream,
-        h2d_stream,
-        d2h_stream,
-        cudaMemcpyHostToDevice,
-        cudaMemcpyDeviceToHost,
-        cudaMemcpyDeviceToHost,
-        /*register_io=*/true,
-        /*enforce_distinct_streams=*/true
-    );
-}
-
-void LstmForward(
-    const size_t time_steps,
-    const size_t batch_size,
-    const size_t input_size,
-    const size_t hidden_size,
-    const size_t recompute_interval,
-    const size_t weight_set_count,
-
-    const __half *x_tensor_device,
-    const __half *h_0_device,
-    const __half *c_0_device,
-
-    const float *weights_ih,
-    const float *weights_hh,
-    const float *bias_ih,
-    const float *bias_hh,
-
-    __half *y_tensor_device,
-
-    GateCacheHost gate_cache_device,
-    StreamingLstmOptions options,
-    __half *hy_device,
-    __half *cy_device,
-
-    const cudaStream_t compute_stream,
-    const cudaStream_t h2d_stream,
-    const cudaStream_t d2h_stream
-) {
-    LstmForwardImpl(
-        time_steps,
-        batch_size,
-        input_size,
-        hidden_size,
-        recompute_interval,
-        weight_set_count,
-        x_tensor_device,
-        h_0_device,
-        c_0_device,
-        weights_ih,
-        weights_hh,
-        bias_ih,
-        bias_hh,
-        y_tensor_device,
-        gate_cache_device,
-        options,
-        hy_device,
-        cy_device,
-        compute_stream,
-        h2d_stream,
-        d2h_stream,
-        cudaMemcpyDeviceToDevice,
-        cudaMemcpyDeviceToDevice,
-        cudaMemcpyDeviceToDevice,
-        /*register_io=*/false,
-        /*enforce_distinct_streams=*/false
-    );
 }
 
 } // namespace flstm
@@ -1236,79 +1082,6 @@ extern "C" void flstm_StreamingLstmForward(
         std::abort();
     } catch (...) {
         fprintf(stderr, "flstm_StreamingLstmForward failed: unknown exception\n");
-        fflush(stderr);
-        std::abort();
-    }
-}
-
-extern "C" void flstm_LstmForward(
-    const size_t time_steps,
-    const size_t batch_size,
-    const size_t input_size,
-    const size_t hidden_size,
-    const size_t recompute_interval,
-    const size_t weight_set_count,
-
-    const __half *x_tensor_device,
-    const __half *h0_device,
-    const __half *c0_device,
-
-    const float *weights_ih,
-    const float *weights_hh,
-    const float *bias_ih,
-    const float *bias_hh,
-
-    __half *y_tensor_device,
-
-    flstm_GateCacheHost gate_cache_device,
-    const flstm_StreamingLstmOptions *options,
-    __half *hy_device,
-    __half *cy_device,
-
-    const cudaStream_t compute_stream,
-    const cudaStream_t h2d_stream,
-    const cudaStream_t d2h_stream
-) {
-    try {
-        flstm::GateCacheHost cache_host{
-            gate_cache_device.h_ptr,
-            gate_cache_device.c_ptr,
-        };
-        flstm::StreamingLstmOptions opts;
-        if (options != nullptr) {
-            opts.h_dtype = static_cast<flstm::GateCacheDType>(options->h_dtype);
-            opts.c_dtype = static_cast<flstm::GateCacheDType>(options->c_dtype);
-            opts.time_oversample = (options->time_oversample != 0);
-        }
-        flstm::LstmForward(
-            time_steps,
-            batch_size,
-            input_size,
-            hidden_size,
-            recompute_interval,
-            weight_set_count,
-            x_tensor_device,
-            h0_device,
-            c0_device,
-            weights_ih,
-            weights_hh,
-            bias_ih,
-            bias_hh,
-            y_tensor_device,
-            cache_host,
-            opts,
-            hy_device,
-            cy_device,
-            compute_stream,
-            h2d_stream,
-            d2h_stream
-        );
-    } catch (const std::exception &exc) {
-        fprintf(stderr, "flstm_LstmForward failed: %s\n", exc.what());
-        fflush(stderr);
-        std::abort();
-    } catch (...) {
-        fprintf(stderr, "flstm_LstmForward failed: unknown exception\n");
         fflush(stderr);
         std::abort();
     }
